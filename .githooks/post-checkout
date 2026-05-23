@@ -1,0 +1,122 @@
+#!/bin/sh
+# Provision gitignored dev files from the main repo into linked worktrees so
+# `pnpm dev` works directly from any worktree.
+#
+# Triggered by `git worktree add` and any subsequent `git checkout` of a
+# branch. Idempotent: skips files that already exist locally or are absent in
+# the main repo.
+#
+# Files are split into two categories:
+#   FILES_TO_COPY  — independent copy per worktree. Edits don't propagate.
+#                    Use for env files: a worktree should be able to change
+#                    `.env` without affecting the running main app.
+#   FILES_TO_LINK  — symlink to main repo. Use for shared state where
+#                    worktree-local divergence would be confusing (SQLite
+#                    DB, shared task docs) and for the node_modules build
+#                    artifact (linked to avoid a 1.1GB per-worktree
+#                    install — treat as read-only; see the list below).
+#
+# Hook args (from git): $1 = previous HEAD, $2 = new HEAD, $3 = flag (1 if
+# branch checkout, 0 if file checkout).
+
+set -eu
+
+[ "${3:-0}" = "1" ] || exit 0
+
+GIT_DIR=$(git rev-parse --git-dir)
+GIT_COMMON_DIR=$(git rev-parse --git-common-dir)
+
+# Run only inside linked worktrees, never in the main checkout.
+[ "$GIT_DIR" = "$GIT_COMMON_DIR" ] && exit 0
+
+MAIN_REPO=$(cd "$GIT_COMMON_DIR/.." && pwd)
+WORKTREE=$(git rev-parse --show-toplevel)
+
+# The app lives under reference/ (repo root holds SPEC.md). Provision dev
+# files into the worktree's reference/ subdir.
+FILES_TO_COPY="
+reference/.env
+reference/.env.local
+reference/.env.development.local
+reference/.env.test.local
+reference/.env.production.local
+reference/CLAUDE.local.md
+"
+
+FILES_TO_LINK="
+reference/server/database/bottega.db
+reference/.bottega
+reference/node_modules
+"
+# reference/node_modules is symlinked (not installed per worktree) so
+# `pnpm test:run` / a dev server work instantly — no 1.1GB install and no
+# rebuilding native modules (better-sqlite3, bcrypt, node-pty, sharp, …).
+# Treat it as READ-ONLY: do NOT `pnpm install` inside a worktree — it
+# follows the symlink and mutates the main checkout's deps. If a branch
+# changes dependencies, `rm reference/node_modules` and run a real
+# `pnpm install` in the worktree.
+
+provisioned_any=0
+
+provision_file() {
+    src="$1"
+    dest="$2"
+    mode="$3"  # "copy" or "link"
+
+    [ -e "$src" ] || return 0
+    # Real file or working symlink → leave it alone. -e follows symlinks, so
+    # this is true only when the target actually exists.
+    if [ -e "$dest" ]; then
+        return 0
+    fi
+    # Dangling symlink (the target was renamed/deleted, e.g. when main moved
+    # auth.db → bottega.db). Replace it.
+    if [ -L "$dest" ]; then
+        rm "$dest"
+    fi
+
+    dest_parent=$(dirname "$dest")
+    [ -d "$dest_parent" ] || mkdir -p "$dest_parent"
+
+    if [ "$mode" = "copy" ]; then
+        cp -p "$src" "$dest"
+        printf '[bottega worktree] copied %s\n' "$dest"
+    else
+        ln -s "$src" "$dest"
+        printf '[bottega worktree] linked %s -> %s\n' "$dest" "$src"
+    fi
+    provisioned_any=1
+}
+
+for f in $FILES_TO_COPY; do
+    [ -n "$f" ] || continue
+    provision_file "$MAIN_REPO/$f" "$WORKTREE/$f" copy
+done
+
+# DB symlink: prefer bottega.db; fall back to legacy auth.db during the
+# rename transition (between this PR merging and the main app restarting).
+# Either way, link as bottega.db locally — the migration in
+# server/database/db.ts will reconcile names on first server start.
+db_dest="$WORKTREE/reference/server/database/bottega.db"
+if [ ! -e "$db_dest" ]; then
+    [ -L "$db_dest" ] && rm "$db_dest"
+    if [ -f "$MAIN_REPO/reference/server/database/bottega.db" ]; then
+        provision_file "$MAIN_REPO/reference/server/database/bottega.db" "$db_dest" link
+    elif [ -f "$MAIN_REPO/reference/server/database/auth.db" ]; then
+        provision_file "$MAIN_REPO/reference/server/database/auth.db" "$db_dest" link
+    fi
+fi
+
+for f in $FILES_TO_LINK; do
+    [ -n "$f" ] || continue
+    # bottega.db is handled above with the auth.db fallback.
+    [ "$f" = "reference/server/database/bottega.db" ] && continue
+    provision_file "$MAIN_REPO/$f" "$WORKTREE/$f" link
+done
+
+if [ "$provisioned_any" = "1" ]; then
+    printf '[bottega worktree] ready — node_modules is linked from main; run `pnpm test:run` or a dev server on a free port directly.\n'
+    printf '[bottega worktree] do NOT `pnpm install` here (it mutates main); if you change deps, `rm reference/node_modules` then install.\n'
+fi
+
+exit 0

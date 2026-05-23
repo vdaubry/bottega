@@ -1,0 +1,25 @@
+# Root-level ignores. The reference implementation keeps its own, fuller
+# .gitignore under reference/. This file only covers things that may show
+# up at the repository root (agent/editor scratch dirs, OS cruft).
+
+# AI / agent scratch dirs
+.claude/
+.cursor/
+.roo/
+.cline/
+.windsurf/
+.serena/
+.mcp.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
