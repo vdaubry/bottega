@@ -133,7 +133,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.6.0",
     "jiti": "^2.7.0",
-    "jsdom": "^27.3.0",
+    "jsdom": "^29.1.1",
     "node-gyp": "^10.0.0",
     "postcss": "^8.4.32",
     "release-it": "^19.0.5",
