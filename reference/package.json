@@ -139,7 +139,7 @@
     "release-it": "^19.0.5",
     "sharp": "^0.34.2",
     "supertest": "^7.1.4",
-    "tailwindcss": "^3.4.0",
+    "tailwindcss": "^4.3.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.2",
