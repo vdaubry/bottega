@@ -70,7 +70,7 @@
     "@uiw/react-md-editor": "^4.0.11",
     "bcrypt": "^6.0.0",
     "better-sqlite3": "^12.2.0",
-    "chokidar": "^4.0.3",
+    "chokidar": "^5.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cors": "^2.8.5",
