@@ -1,0 +1,59 @@
+# Bottega — local / infra-specific instructions (EXAMPLE TEMPLATE)
+
+Copy this file to `CLAUDE.local.md` (which is **gitignored**) and fill in the
+values for YOUR environment:
+
+```bash
+cp CLAUDE.local.md.example CLAUDE.local.md
+```
+
+`CLAUDE.local.md` loads automatically alongside `CLAUDE.md` every session and
+holds machine/operator-specific context that should never be committed: dev-box
+URLs, deploy layout, manual-test fixtures, and auth tokens. The committed
+`CLAUDE.md` stays generic and public; anything specific to how *your* box runs
+Bottega goes here instead.
+
+> Using git worktrees / claude-squad? A gitignored `CLAUDE.local.md` only exists
+> in the worktree where you created it. This repo's `.githooks/post-checkout`
+> copies `CLAUDE.local.md` into each new worktree automatically (alongside
+> `.env`), so create it once in your main checkout.
+
+## Development environment
+
+- Where does your instance run? (local only, or a VPS / dev box)
+- Public or reverse-proxy URL, if any: `https://<your-domain>` — note whether it
+  is real production or a proxy to the same dev server.
+- Local URLs: frontend `http://localhost:5173`, backend `http://localhost:3001`.
+
+## Deployment
+
+- How the app is started (e.g. systemd user service `bottega.service` under user
+  `<user>`, managed with `systemctl --user`; or a process manager of your choice).
+- Any other services it orchestrates via the "switch server" feature.
+- Redeploy mechanism — how a push to `main` reaches the server (CI/CD, or a
+  manual `git pull` + restart).
+- Restart/stop commands and health check for your setup.
+
+## Manual-test fixtures
+
+- A dedicated test project id to use for throwaway manual tasks: `<id>`
+  (so you don't pollute real projects — creating a task also creates a git
+  worktree and branch on the target repo).
+
+## Auth token for Playwright / MCP testing
+
+- `AUTH_TOKEN` in `.env` is a per-user API key. Note which user it resolves to.
+- Seed it into the MCP browser's localStorage to skip the login form:
+  ```js
+  localStorage.setItem('auth-token', '<AUTH_TOKEN value from .env>');
+  ```
+- **Never paste the token value into a file checked into git** — keep it in
+  `.env` only.
+
+## Worktree workflow (if you use git worktrees / claude-squad)
+
+- Your canonical checkout path, and the rule: edit in the worktree, never in the
+  canonical checkout that runs the live service.
+- `node_modules` is symlinked from the main checkout by `.githooks/post-checkout`
+  — do NOT `pnpm install` inside a worktree (it mutates main's deps); `rm
+  node_modules` first if your branch changes dependencies.

@@ -1,0 +1,20 @@
+name: Spec proposal
+description: Propose a new or improved spec (extra/ feature, core/ clarification)
+labels: [spec]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the spec?
+      options:
+        - SPEC.md
+        - core/
+        - "extra/ (new feature)"
+        - "extra/ (improvement)"
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should the spec say, and why?
+      description: Describe the behavior. Remember — the reference takes bug fixes only; features land as specs.
+    validations: { required: true }

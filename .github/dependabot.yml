@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Reference implementation deps (the "npm" ecosystem reads pnpm-lock.yaml)
+  - package-ecosystem: npm
+    directory: /reference
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:        # batch low-risk bumps into one PR to cut noise
+        update-types: [minor, patch]
+
+  # GitHub Actions used by the CI workflow
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

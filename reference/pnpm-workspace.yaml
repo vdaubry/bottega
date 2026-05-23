@@ -1,0 +1,8 @@
+allowBuilds:
+  bcrypt: true
+  better-sqlite3: true
+  esbuild: true
+  ffmpeg-static: true
+  node-pty: true
+  sharp: true
+  sqlite3: true

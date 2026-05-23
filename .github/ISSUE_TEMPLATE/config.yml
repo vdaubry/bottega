@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions, ideas & show-and-tell
+    url: https://github.com/vdaubry/bottega/discussions
+    about: Anything that isn't a bug report or a spec proposal belongs in Discussions.
