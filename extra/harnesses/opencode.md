@@ -1,44 +1,58 @@
-# Harness — OpenCode
+# Harness — OpenCode Zen and OpenCode Go
 
-The OpenCode provider implements the [harness contract](../../core/harness-contract.md)
-against the `@opencode-ai/sdk`. Read that contract first: `LlmProvider`, the
+The OpenCode Zen and OpenCode Go providers implements the [harness contract](../../core/harness-contract.md)
+against the `@opencode-ai/sdk`. Read the harness contract first: `LlmProvider`, the
 unified vocabulary, and the streaming runtime are core; this doc covers only
 what is *OpenCode-specific*. The shared spine — registration, mapper layer,
 transcript mirroring as a pattern, per-user credentials, the capability matrix
 mechanism — is written once in [`overview.md`](./overview.md); here we call out
 where OpenCode diverges.
 
-> Naming: the user sometimes calls this harness "OpenClaw." The repo, the
+Bottega supports _both_ OpenCode Zen and OpenCode Go, with identical keys, but
+differing Provider dropdowns. In terms of OpenCode provider config JSON, this
+means there's a provider named `"opencode"` _and_ a provider named `"opencode-go"`.
+Both provider's json config should have the same API key. For simplicity, both
+the `opencode` and `opencode-go` entries can can be stored in the same `auth.json`.
+
+> Naming: the user sometimes calls these harnesses "OpenClaw." The repo, the
 > provider name, the credential key, and the on-the-wire `Provider` union all
-> use **`opencode`**. Use that everywhere.
+> use **`opencode`** (for the OpenCode Zen provider path) and **`opencode-go`**
+> (for the OpenCode Go provider path). They should be separate `bottega`-level
+> providers, **with separate model lists**.
 
 ## What it adds
 
-A third concrete harness, registered under the provider name `opencode`. It is
-the contract's hardest stress test because, unlike Claude and Codex (which spawn
-a fresh subprocess per turn), OpenCode talks to a **long-lived `opencode serve`
-HTTP server, one per user**. That single structural difference cascades into
-every other concern: server pooling and teardown, a first-class session resource
-that *is* the `provider_session_id`, an SSE event stream instead of a subprocess
-stdout, a workspace-routing hazard that affects prompts/subscribes/aborts alike,
-and a two-step abort that must stop both a local listener and an out-of-process
-turn. Auth is a single per-user Zen-billing API key. Capabilities are all
+A third and fourth concrete harness, registered under the provider names `opencode` and
+`opencode-go`. It is the contract's hardest stress test because, unlike Claude
+and Codex (which spawn a fresh subprocess per turn), OpenCode talks to a
+**long-lived `opencode serve` HTTP server, one per user**. That single structural
+difference cascades into every other concern: server pooling and teardown, a first-class
+session resource that *is* the `provider_session_id`, an SSE event stream instead
+of a subprocess stdout, a workspace-routing hazard that affects prompts/subscribes/
+aborts alike, and a two-step abort that must stop both a local listener and an out-
+of-process turn. Auth is a single per-user API key for both Zen (`opencode`) and
+OpenCode Go (`opencode-go`). The `auth.json` will contain entries for each (with
+the same API key, collected once in the UI). Capabilities are all
 `false`, plus one documented review-agent degradation. Every one of these is a
 solved problem below.
 
-## Authentication — per-user Zen API key
+## Authentication — per-user Zen + Go API key
 
 OpenCode auth is the simplest of the three: a **single API key** that bills
-through OpenCode Zen, persisted per user. There is no OAuth dance and no
-device-code PTY — just a key the user pastes in the settings panel.
+through OpenCode Zen _or_ OpenCode Go (depending on the contents you pass in the
+`provider` field when starting a turn/session with the OpenCode server: `opencode`
+will start a Zen session, and `opencode-go` will start a Go session), persisted per
+user. There is no OAuth dance and no device-code PTY — just a key the user pastes
+in the settings panel and the runtime `provider` arg to `@opencode-ai/sdk` that covers
+both OpenCode Zen and OpenCode Go.
 
 The store
 ([`openCodeCredentials.ts`](../../reference/server/services/openCodeCredentials.ts))
 writes the key in the exact on-disk shape `opencode serve` reads natively —
-`{ "opencode": { "type": "api", "key": "<zen-key>" } }` — at
-`~/.config/bottega/users/<userId>/opencode-data/opencode/auth.json` (mode `0600`,
-ownership- and mode-checked on read, same posture as Claude/Codex). Because the
-spawned server resolves this path itself via `XDG_DATA_HOME`, no token
+`{ "opencode": { "type": "api", "key": "<opencode-key>" }, "opencode-go": { "type": "api",
+"key": "<opencode-key>" } }` — at `~/.config/bottega/users/<userId>/opencode-data/opencode/auth.json`
+(mode `0600`, ownership- and mode-checked on read, same posture as Claude/Codex).
+Because the spawned server resolves this path itself via `XDG_DATA_HOME`, no token
 translation is needed. `isOpenCodeAuthJson` is strict by design: it rejects any
 file carrying more than the single `opencode` record, so a stale multi-provider
 auth.json from an earlier draft can't route a turn through the wrong path.
@@ -129,12 +143,14 @@ cleanly onto them:
   (which **is** the OpenCode session id). On resume the orchestrator re-reads
   the explicit `(provider, model)` off the conversation row — never inferred —
   so `parseOpenCodeModel` always has a value. OpenCode has **no effort
-  dimension**, so `effort` is always `null`.
-- Each turn is one `session.promptAsync` call on that id. The model is passed as
-  `{ providerID: 'opencode', modelID }` — parsed from the canonical persisted
-  form `opencode/<modelID>` by `parseOpenCodeModel`, which fails loud on a
-  missing or malformed identifier (`InvalidOpenCodeModelError`) rather than
-  letting the SDK default.
+  dimension**, so `effort` is always `null`
+- Each turn is one `session.promptAsync` call on that id. Depending on whether
+  the Bottega provider is OpenCode Zen or OpenCode Go, the model data is passed as
+  `{ providerID: 'opencode', modelID }` (OpenCode Zen) OR `{ providerID: 'opencode-go',
+  modelID }` (for OpenCode Go) — parsed from the canonical persisted
+  form `opencode/<modelid>`/`opencode-go/<modelid>` by `parseOpenCodeModel`, which
+  fails loud on a missing or malformed identifier (`InvalidOpenCodeModelError`) rather
+  than letting the SDK default.
 
 Three turn-shaping decisions deserve attention, all found live:
 
@@ -238,14 +254,15 @@ shape is Claude's, `loadTranscript` reuses Claude's reader
 (`loadAnthropicTranscript`) wholesale and just **re-stamps `provider: 'opencode'`
 on the way out** — there is no OpenCode-specific reader, and reloaded OpenCode
 conversations render through the same `/api/conversations/:id/messages` path as
-Claude and Codex. The `assistant` `model` is re-prefixed to the canonical
-`opencode/<modelID>` so context-usage attribution stays unambiguous.
+Claude and Codex. Based on whether we are using OpenCode Zen or OpenCode Go providers,
+`assistant` `model` is re-prefixed to the canonical `opencode/<modelID>` OR
+`opencode-go/<modelID>` so context-usage attribution stays unambiguous.
 
 Per the store-side subtlety noted in [`overview.md`](./overview.md), the
-`provider: 'opencode'` tag on the append key keeps the session-summary fold off
-these rows (the fold is typed for Claude's entry shape). The mirror is invoked
-from the OpenCode conversation orchestrator's stream loop, not from inside the
-provider — see
+`provider: 'opencode'`/`provider: 'opencode-go'` tag on the append key keeps the
+session-summary fold off these rows (the fold is typed for Claude's entry shape).
+The mirror is invoked from the OpenCode conversation orchestrator's stream loop,
+not from inside the provider — see
 [`startOpenCodeConversation.ts`](../../reference/server/services/conversation/startOpenCodeConversation.ts)
 (start path ~L451–554, resume path `sendOpenCodeMessage` ~L307–325). That
 orchestrator also broadcasts each event over WS as `ai-response` (plus a
