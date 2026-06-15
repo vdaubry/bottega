@@ -29,7 +29,7 @@ import type {
   OpenCodeEffort,
 } from './models.js';
 
-export type Provider = 'anthropic' | 'openai' | 'opencode';
+export type Provider = 'anthropic' | 'openai' | 'opencode' | 'opencode-go';
 
 export type ProviderModel = AnthropicModel | OpenAIModel | OpenCodeModel;
 

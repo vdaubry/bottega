@@ -53,9 +53,9 @@ writes the key in the exact on-disk shape `opencode serve` reads natively —
 "key": "<opencode-key>" } }` — at `~/.config/bottega/users/<userId>/opencode-data/opencode/auth.json`
 (mode `0600`, ownership- and mode-checked on read, same posture as Claude/Codex).
 Because the spawned server resolves this path itself via `XDG_DATA_HOME`, no token
-translation is needed. `isOpenCodeAuthJson` is strict by design: it rejects any
-file carrying more than the single `opencode` record, so a stale multi-provider
-auth.json from an earlier draft can't route a turn through the wrong path.
+translation is needed. `isOpenCodeAuthJson` (line 187) is strict by design: it requires
+exactly both `opencode` and `opencode-go` keys with the same API key structure, rejecting
+any file that doesn't match the dual-provider shape.
 
 The `ProviderCredentialStore` adapter
 ([`credentials/opencode.ts`](../../reference/server/services/credentials/opencode.ts))
@@ -80,14 +80,16 @@ wraps those helpers. Two pieces of its `buildSdkEnv` are load-bearing:
 Auth routes
 ([`routes/openCodeAuth.ts`](../../reference/server/routes/openCodeAuth.ts)) are
 plain CRUD on the key: `GET /status`, `PUT /key`, `DELETE /key`, plus
-`GET /models`. The contract subtlety is that **every mutation calls
+**two model endpoints**: `GET /models` (line 144) and `GET /models-go` (line 167).
+The contract subtlety is that **every mutation calls
 `invalidateOpenCodeServer(userId)`** — a running server cached the old auth.json
 at startup, so writing or clearing the key must tear it down (see the pool's
-staleness handling). `GET /models` proxies the running server's
-`GET /config/providers` so the settings UI never hardcodes Zen model IDs;
-`listOpenCodeModels` spawns/reuses the user's server, reads the live `opencode`
-catalog, and returns each model in the canonical persisted form
-`opencode/<bareModelID>`.
+staleness handling). Both model endpoints proxy the running server's
+`GET /config/providers` so the settings UI never hardcodes model IDs;
+`listOpenCodeModels(userId, providerName)` spawns/reuses the user's server, reads
+the live catalog for the specified provider (`'opencode'` or `'opencode-go'`), and
+returns each model in the canonical persisted form `opencode/<bareModelID>` or
+`opencode-go/<bareModelID>`.
 
 ## The server pool — why long-lived, and its lifecycle
 
@@ -123,10 +125,12 @@ The pool's responsibilities:
   isn't load-bearing for data integrity — it's just good citizenship on a
   shared box.
 
-How a turn talks to the server: `OpenCodeProvider`
+How a turn talks to the server: The factory `createOpenCodeProvider(name)` (where
+`name` is `'opencode'` or `'opencode-go'`) produces provider instances
 ([`opencode/index.ts`](../../reference/server/services/providers/opencode/index.ts))
-resolves the user id from `BOTTEGA_USER_ID` (`extractUserIdFromEnv`), grabs the
-handle, and drives the session over HTTP.
+that resolve the user id from `BOTTEGA_USER_ID` (`extractUserIdFromEnv`, line 83),
+grab the handle, and drive the session over HTTP. Both `openCodeProvider` and
+`openCodeGoProvider` are registered separately, sharing the same server pool.
 
 ## The session model
 
@@ -148,7 +152,7 @@ cleanly onto them:
   the Bottega provider is OpenCode Zen or OpenCode Go, the model data is passed as
   `{ providerID: 'opencode', modelID }` (OpenCode Zen) OR `{ providerID: 'opencode-go',
   modelID }` (for OpenCode Go) — parsed from the canonical persisted
-  form `opencode/<modelid>`/`opencode-go/<modelid>` by `parseOpenCodeModel`, which
+  form `opencode/<modelid>`/`opencode-go/<modelid>` by `parseOpenCodeModel` (line 69), which
   fails loud on a missing or malformed identifier (`InvalidOpenCodeModelError`) rather
   than letting the SDK default.
 
@@ -191,13 +195,14 @@ This is why `ActiveOpenCodeSession` stores the turn's `directory`.
 
 ## Event mapping — OpenCode events → `UnifiedMessage`
 
-`createOpenCodeEventMapper(sessionId)`
+`createOpenCodeEventMapper(sessionId, providerName)`
 ([`opencode/mapEvent.ts`](../../reference/server/services/providers/opencode/mapEvent.ts))
 is the only file allowed to import OpenCode SDK event types. It is a **stateful
-factory** (one mapper per session) because OpenCode interleaves many
-`message.part.updated` events per assistant turn — unlike Codex, where one
-`item.completed` carries the final text. The mapper keeps per-`messageID` buffers
-and coalesces:
+factory** (one mapper per session) that accepts the provider name (`'opencode'` or
+`'opencode-go'`) and stamps all emitted `UnifiedMessage` objects with the correct
+`provider` field. The mapper keeps per-`messageID` buffers and coalesces OpenCode
+events because OpenCode interleaves many `message.part.updated` events per assistant
+turn — unlike Codex, where one `item.completed` carries the final text:
 
 | OpenCode event/part | Unified output |
 |---|---|
@@ -245,18 +250,20 @@ the same `messages` table by hand. The contract's rule holds: SQLite is the
 single source of truth; OpenCode's own copy under `XDG_DATA_HOME` is private
 scratch the runtime never reads.
 
-`mirrorOpenCodeEvent`
+`mirrorOpenCodeEvent(sessionInfo, unified, providerName)`
 ([`opencode/messageMirror.ts`](../../reference/server/services/providers/opencode/messageMirror.ts))
 converts each unified message back into the **Claude `SDKMessage` on-the-wire
 entry shape** (`{ type, uuid, message: { id, content, usage? }, … }`) and appends
-it via `sqliteSessionStore.append` — idempotent on `uuid`. Because the entry
+it via `sqliteSessionStore.append` — idempotent on `uuid`. The function accepts
+a `providerName` parameter (`'opencode'` or `'opencode-go'`) and uses it to
+correctly re-prefix assistant models and stamp the provider field. Because the entry
 shape is Claude's, `loadTranscript` reuses Claude's reader
-(`loadAnthropicTranscript`) wholesale and just **re-stamps `provider: 'opencode'`
+(`loadAnthropicTranscript`) wholesale and just **re-stamps the provider field
 on the way out** — there is no OpenCode-specific reader, and reloaded OpenCode
 conversations render through the same `/api/conversations/:id/messages` path as
-Claude and Codex. Based on whether we are using OpenCode Zen or OpenCode Go providers,
-`assistant` `model` is re-prefixed to the canonical `opencode/<modelID>` OR
-`opencode-go/<modelID>` so context-usage attribution stays unambiguous.
+Claude and Codex. The `unifiedToTranscriptEntry` function (line 57) handles both
+`opencode/<modelID>` and `opencode-go/<modelID>` prefixes correctly, avoiding
+double-prefixing, so context-usage attribution stays unambiguous.
 
 Per the store-side subtlety noted in [`overview.md`](./overview.md), the
 `provider: 'opencode'`/`provider: 'opencode-go'` tag on the append key keeps the
@@ -264,13 +271,13 @@ session-summary fold off these rows (the fold is typed for Claude's entry shape)
 The mirror is invoked from the OpenCode conversation orchestrator's stream loop,
 not from inside the provider — see
 [`startOpenCodeConversation.ts`](../../reference/server/services/conversation/startOpenCodeConversation.ts)
-(start path ~L451–554, resume path `sendOpenCodeMessage` ~L307–325). That
-orchestrator also broadcasts each event over WS as `ai-response` (plus a
-back-compat `claude-response`), drives `activeSessions`, and runs the
-agent-run completion handler.
+(start path mirror loop ~L543–570, resume path `sendOpenCodeMessage` starts at
+line 224 with mirror loop ~L328–343). That orchestrator also broadcasts each event
+over WS as `ai-response` (plus a back-compat `claude-response`), drives
+`activeSessions`, and runs the agent-run completion handler.
 
 > One OpenCode-specific orchestration detail worth copying:
-> `failLinkedAgentRunIfRunning` (~L183) pre-marks the linked agent run `failed`
+> `failLinkedAgentRunIfRunning` (line 199) pre-marks the linked agent run `failed`
 > the instant a `result` with `isError: true` streams. OpenCode reports model
 > errors as **SSE events, not HTTP errors**, so the stream ends *normally*;
 > without this pre-mark the completion handler would see `running` → mark
@@ -298,9 +305,10 @@ aborting, so the completion handler won't chain.
 
 ## Capabilities and the review-agent degradation
 
-OpenCode sets **every** optional capability to `false`
+Both `opencode` and `opencode-go` set **every** optional capability to `false`
 ([`capabilities.ts`](../../reference/shared/providers/capabilities.ts), the
-`opencode` block), each gated via the guards in
+`opencode` entry at line 27 and `opencode-go` entry at line 52), each gated via
+the guards in
 [`featureGuards.ts`](../../reference/server/services/providers/featureGuards.ts):
 
 - `supportsAskUserQuestion: false` — no `canUseTool` hook; agents ask in plain
@@ -318,57 +326,60 @@ There is also one degradation **outside** the capability matrix, because it is a
 property of the *agent role*, not the provider's wire features: the **review
 agent runs in degraded mode under OpenCode — no Playwright MCP, no video
 recording.** Bottega normally builds a `videoConfig` for review agents (Playwright
-MCP browser capture); the agent runner skips it when the provider is `opencode`
-(`agentType === 'review' && provider !== 'opencode'`), because Playwright capture
-isn't wired through OpenCode's worktree reflection — see
-[`agentRunner.ts`](../../reference/server/services/agentRunner.ts) ~L154–169.
+MCP browser capture); the agent runner skips it when the provider is `opencode` or
+`opencode-go` (line 158: `agentType === 'review' && provider !== 'opencode' && provider !== 'opencode-go'`),
+because Playwright capture isn't wired through OpenCode's worktree reflection — see
+[`agentRunner.ts`](../../reference/server/services/agentRunner.ts) lines 154–169.
 The OpenCode conversation orchestrator likewise drops `videoConfig` for these
 turns. Review agents still *run* under OpenCode; they just lack browser video.
 
 ## What to build
 
-- [ ] An `OpenCodeProvider` implementing `LlmProvider`, registered as
-      `opencode`, resolving the user id from `BOTTEGA_USER_ID` and driving the
-      session over the per-user `opencode serve` via the pool.
-- [ ] A per-user server pool (`getOrSpawnOpenCodeServer`): lazy spawn, password
+- [x] A factory `createOpenCodeProvider(name)` producing `LlmProvider` instances,
+      registered as both `opencode` and `opencode-go`, resolving the user id from
+      `BOTTEGA_USER_ID` and driving sessions over the shared per-user `opencode serve`
+      via the pool.
+- [x] A per-user server pool (`getOrSpawnOpenCodeServer`): lazy spawn, password
       gating, stdout-grep readiness, free-port + `EADDRINUSE` retry, idle reaping,
       LRU eviction, stale-on-invalidate with await-shutdown-before-respawn, and
       process-group teardown.
-- [ ] A session model: `session.create` once on start (id → `provider_session_id`,
+- [x] A session model: `session.create` once on start (id → `provider_session_id`,
       resolved synchronously), `promptAsync` per turn over an SSE subscription
       opened first, `query.directory` on every workspace-scoped call, a synthetic
       user message yielded first, and `tools: { question: false }`.
-- [ ] A stateful event mapper (one per session) coalescing text/reasoning parts,
-      emitting tool_use/tool_result pairs, terminating on `session.idle`/
-      `session.error`, with a session-id filter and a non-dropping default.
-- [ ] **Explicit transcript mirroring** into the shared `messages` table in
-      Claude's entry shape (idempotent on `uuid`), with `loadTranscript` reusing
-      the Claude reader and re-stamping `provider: 'opencode'`; plus the
-      pre-mark-failed-on-isError guard against the auto-chain runaway loop.
-- [ ] A two-step, workspace-scoped `abortTurn` (local controller + server-side
+- [x] A stateful event mapper (one per session, parameterized by provider name)
+      coalescing text/reasoning parts, emitting tool_use/tool_result pairs, terminating
+      on `session.idle`/`session.error`, with a session-id filter and a non-dropping default.
+- [x] **Explicit transcript mirroring** into the shared `messages` table in
+      Claude's entry shape (idempotent on `uuid`), parameterized by provider name,
+      with `loadTranscript` reusing the Claude reader and re-stamping the provider field;
+      plus the pre-mark-failed-on-isError guard against the auto-chain runaway loop.
+- [x] A two-step, workspace-scoped `abortTurn` (local controller + server-side
       `session.abort` with `query.directory`) and an in-memory active-turn map.
-- [ ] A single-Zen-key credential store whose `buildSdkEnv` strips global
-      `OPENCODE_*`, pins per-user XDG paths, sets `OPENCODE_CONFIG=/dev/null`, and
-      tags `BOTTEGA_USER_ID`; auth routes that `invalidate` the pooled server on
-      every mutation; a `/models` proxy of the live Zen catalog.
-- [ ] Capabilities all `false` with the corresponding runtime paths gated off,
-      plus the review-agent video degradation when the provider is `opencode`.
+- [x] A dual-entry credential store (`opencode` + `opencode-go` with same API key)
+      whose `buildSdkEnv` strips global `OPENCODE_*`, pins per-user XDG paths, sets
+      `OPENCODE_CONFIG=/dev/null`, and tags `BOTTEGA_USER_ID`; auth routes that
+      `invalidate` the pooled server on every mutation; **two model endpoints**
+      (`/models` for Zen, `/models-go` for Go) proxying the live catalogs.
+- [x] Capabilities all `false` for both `opencode` and `opencode-go` with the
+      corresponding runtime paths gated off, plus the review-agent video degradation
+      when the provider is `opencode` or `opencode-go`.
 
 ## Reference map
 
-| Concern | File |
-|---|---|
-| Provider (session loop, SSE consume, abort, loadTranscript, model parse, model list) | `reference/server/services/providers/opencode/index.ts` |
-| Per-user server pool (spawn/reuse/invalidate/reap/evict/teardown) | `reference/server/services/openCodeServerPool.ts` |
-| Event mapper (stateful, part coalescing) | `reference/server/services/providers/opencode/mapEvent.ts` |
-| Transcript mirror into `messages` | `reference/server/services/providers/opencode/messageMirror.ts` |
-| Conversation orchestrator (mirror wiring, WS broadcast, isError pre-mark) | `reference/server/services/conversation/startOpenCodeConversation.ts` |
-| Per-user Zen credentials + spawn env | `reference/server/services/openCodeCredentials.ts` |
-| Credential-store adapter (`buildSdkEnv`, `BOTTEGA_USER_ID` tag) | `reference/server/services/credentials/opencode.ts` |
-| Auth routes (`/status`, `/key`, `/models`; invalidate-on-mutation) | `reference/server/routes/openCodeAuth.ts` |
-| Capability matrix (`opencode` flags all false) | `reference/shared/providers/capabilities.ts` |
-| Feature guards | `reference/server/services/providers/featureGuards.ts` |
-| Review-agent video degradation | `reference/server/services/agentRunner.ts` (~L154–169) |
+| Concern | File | Key Lines |
+|---|---|---|
+| Provider factory, model parsing, model listing | `reference/server/services/providers/opencode/index.ts` | `parseOpenCodeModel` (69), `createOpenCodeProvider` (519), `listOpenCodeModels` (557), exports (523-524) |
+| Per-user server pool (spawn/reuse/invalidate/reap/evict/teardown) | `reference/server/services/openCodeServerPool.ts` | `getOrSpawnOpenCodeServer` (455), `invalidateOpenCodeServer` (471) |
+| Event mapper (stateful, part coalescing, provider-stamped) | `reference/server/services/providers/opencode/mapEvent.ts` | `createOpenCodeEventMapper` (73) |
+| Transcript mirror (provider-parameterized) | `reference/server/services/providers/opencode/messageMirror.ts` | `mirrorOpenCodeEvent` (156), `unifiedToTranscriptEntry` (57) |
+| Conversation orchestrator (mirror wiring, WS broadcast, isError pre-mark) | `reference/server/services/conversation/startOpenCodeConversation.ts` | `failLinkedAgentRunIfRunning` (199), `sendOpenCodeMessage` (224), `startOpenCodeConversation` (373) |
+| Dual-provider credentials (auth.json with both keys) | `reference/server/services/openCodeCredentials.ts` | `OpenCodeAuthJson` interface (182), `isOpenCodeAuthJson` (187), `setOpenCodeKey` (246) |
+| Credential-store adapter (`buildSdkEnv`, `BOTTEGA_USER_ID` tag) | `reference/server/services/credentials/opencode.ts` | `buildSdkEnv` implementation |
+| Auth routes (`/status`, `/key`, `/models`, `/models-go`) | `reference/server/routes/openCodeAuth.ts` | `/models` (144), `/models-go` (167), `/key` (82), `/status` (64) |
+| Capability matrix (both providers all false) | `reference/shared/providers/capabilities.ts` | `CAPABILITIES_BY_PROVIDER` (16), `opencode` (27), `opencode-go` (52) |
+| Feature guards | `reference/server/services/providers/featureGuards.ts` | Capability-based guards |
+| Review-agent video degradation | `reference/server/services/agentRunner.ts` | Line 158: dual-provider check |
 
 ## Boundaries (not in this spec)
 

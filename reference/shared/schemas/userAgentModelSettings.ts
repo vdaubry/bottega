@@ -17,7 +17,7 @@ import type { AgentType } from '../types/db.js';
 // boundary. effort is null when the provider has no reasoning dimension.
 const AgentModelSettingSchema = z
   .object({
-    provider: z.enum(['anthropic', 'openai', 'opencode']),
+    provider: z.enum(['anthropic', 'openai', 'opencode', 'opencode-go']),
     model: z.string().min(1),
     effort: z.string().nullable(),
   })

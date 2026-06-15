@@ -38,7 +38,12 @@ import { getWorktreeProjectPath, worktreeExists } from '../worktree.js';
 import { generateConversationTitle } from '../titleGenerator.js';
 import { createContextUsageTracker } from '../contextUsageTracker.js';
 import { getCredentialStore } from '../credentials/registry.js';
-import { openCodeProvider } from '../providers/opencode/index.js';
+import {
+  openCodeProvider,
+  openCodeGoProvider,
+  parseOpenCodeModel,
+  type OpenCodeProviderName,
+} from '../providers/opencode/index.js';
 import { mirrorOpenCodeEvent } from '../providers/opencode/messageMirror.js';
 import { activeSessions } from './sessionState.js';
 import { validateAndNormalizeOptions } from './sdkOptions.js';
@@ -70,7 +75,17 @@ function unifiedToWireMessage(unified: UnifiedMessage): Record<string, unknown> 
         session_id: unified.providerSessionId,
         message: { role: 'user', content: unified.content },
       };
-    case 'assistant':
+    case 'assistant': {
+      // Model may already be prefixed with `opencode/` or `opencode-go/`
+      let canonicalModel = null;
+      if (unified.model) {
+        if (unified.model.startsWith('opencode/') || unified.model.startsWith('opencode-go/')) {
+          canonicalModel = unified.model;
+        } else {
+          // Bare model — shouldn't happen, but default to opencode prefix for safety
+          canonicalModel = `opencode/${unified.model}`;
+        }
+      }
       return {
         type: 'assistant',
         uuid: unified.id,
@@ -78,11 +93,12 @@ function unifiedToWireMessage(unified: UnifiedMessage): Record<string, unknown> 
         parent_tool_use_id: unified.isSubAgent ? '__opencode_subagent__' : null,
         message: {
           id: unified.id,
-          model: unified.model ? `opencode/${unified.model.replace(/^opencode\//, '')}` : null,
+          model: canonicalModel,
           ...(unified.usage ? { usage: unified.usage } : {}),
           content: [{ type: 'text', text: unified.text }],
         },
       };
+    }
     case 'tool_use':
       return {
         type: 'assistant',
@@ -247,9 +263,6 @@ export async function sendOpenCodeMessage(
     }
   }
 
-  const openCodeEnv = getCredentialStore('opencode').buildSdkEnv(userId);
-  const promptText = message ?? '';
-
   // Resume on an explicit model — re-resolved from the RESUMING user's per-user
   // agent settings (same provider only), falling back to the stamped row value.
   // OpenCode has no effort. Explicit options only win for internal callers.
@@ -262,8 +275,15 @@ export async function sendOpenCodeMessage(
     conversationsDb.updateModelEffort(conversationId, model, conversation.effort);
   }
 
+  // Extract provider name from model prefix
+  const { providerID } = parseOpenCodeModel(model);
+  const provider = providerID === 'opencode' ? openCodeProvider : openCodeGoProvider;
+  
+  const openCodeEnv = getCredentialStore(providerID).buildSdkEnv(userId);
+  const promptText = message ?? '';
+
   const abortController = new AbortController();
-  const run = await openCodeProvider.sendTurnMessage({
+  const run = await provider.sendTurnMessage({
     cwd: projectPath,
     prompt: promptText,
     resumeSessionId,
@@ -310,6 +330,7 @@ export async function sendOpenCodeMessage(
       await mirrorOpenCodeEvent(
         { projectFolderPath: projectPath, providerSessionId: resumeSessionId },
         unified,
+        providerID,
       ).catch((err) => {
         console.warn('[ConversationAdapter] OpenCode resume mirror failed:', err);
       });
@@ -319,7 +340,7 @@ export async function sendOpenCodeMessage(
         }
         await contextUsageTracker.onResult({
           type: 'result',
-          ...(unified.usage ? { modelUsage: { opencode: unified.usage } } : {}),
+          ...(unified.usage ? { modelUsage: { [providerID]: unified.usage } } : {}),
         } as never);
       }
     }
@@ -365,12 +386,16 @@ export async function startOpenCodeConversation(
     videoConfig,
   } = normalizedOptions;
 
-  // OpenCode turns always run on an explicit `opencode/<id>` model. OpenCode
-  // has no effort dimension (D6), so effort is always null.
+  // OpenCode turns always run on an explicit `opencode/<id>` or `opencode-go/<id>` model.
+  // OpenCode has no effort dimension (D6), so effort is always null.
   const model = normalizedOptions.model;
   if (!model) {
     throw new Error('startOpenCodeConversation requires an explicit model');
   }
+
+  // Extract provider name from model prefix
+  const { providerID } = parseOpenCodeModel(model);
+  const provider = providerID === 'opencode' ? openCodeProvider : openCodeGoProvider;
 
   const taskWithProject = tasksDb.getWithProject(taskId);
   if (!taskWithProject) {
@@ -384,14 +409,14 @@ export async function startOpenCodeConversation(
 
   // Per-user OpenCode env (Zen API key). Throws if the user has no
   // provisioned auth.json, matching Claude/Codex fail-closed posture.
-  const openCodeEnv = getCredentialStore('opencode').buildSdkEnv(userId);
+  const openCodeEnv = getCredentialStore(providerID).buildSdkEnv(userId);
 
   let conversationId = options.conversationId;
   if (!conversationId) {
-    const conversation = conversationsDb.create(taskId, 'opencode', model, null);
+    const conversation = conversationsDb.create(taskId, providerID, model, null);
     conversationId = conversation.id;
     console.log(
-      `[ConversationAdapter] Created OpenCode conversation ${conversationId} for task ${taskId} (model=${model})`,
+      `[ConversationAdapter] Created OpenCode conversation ${conversationId} for task ${taskId} (provider=${providerID}, model=${model})`,
     );
   }
 
@@ -407,7 +432,7 @@ export async function startOpenCodeConversation(
 
   const abortController = new AbortController();
 
-  const run = await openCodeProvider.startTurn({
+  const run = await provider.startTurn({
     cwd: projectPath,
     prompt: promptText,
     model,
@@ -523,6 +548,7 @@ export async function startOpenCodeConversation(
                 await mirrorOpenCodeEvent(
                   { projectFolderPath: projectPath, providerSessionId: sid },
                   patched,
+                  providerID,
                 ).catch((err) => {
                   console.warn('[ConversationAdapter] OpenCode mirror failed (buffered):', err);
                 });
@@ -535,6 +561,7 @@ export async function startOpenCodeConversation(
                 providerSessionId: ctx.claudeSessionId,
               },
               unified,
+              providerID,
             ).catch((err) => {
               console.warn('[ConversationAdapter] OpenCode mirror failed:', err);
             });
@@ -548,7 +575,7 @@ export async function startOpenCodeConversation(
             }
             await contextUsageTracker.onResult({
               type: 'result',
-              ...(unified.usage ? { modelUsage: { opencode: unified.usage } } : {}),
+              ...(unified.usage ? { modelUsage: { [providerID]: unified.usage } } : {}),
             } as never);
           }
         }

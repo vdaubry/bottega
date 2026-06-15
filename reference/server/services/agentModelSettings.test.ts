@@ -111,6 +111,29 @@ describe('loadAgentModelSettings (per-user)', () => {
     const result = loadAgentModelSettings(USER);
     expect(result.implementation).toEqual({ provider: 'anthropic', model: 'opus', effort: 'high' });
   });
+
+  it('migrates corrupt opencode-go entries that have an opencode/ prefixed model', () => {
+    // The original opencode-go UI had a stale-closure bug: when switching a
+    // phase to opencode-go, it picked the first Zen model (opencode/...) from
+    // the stale closure and saved it under the opencode-go provider. The new
+    // strict validator rejects opencode/ models for opencode-go, so we re-
+    // prefix them on load to opencode-go/<bareModelId>.
+    vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(
+      fullBlob({ provider: 'opencode-go', model: 'opencode/kimi-k2.6', effort: null }),
+    );
+    const result = loadAgentModelSettings(USER);
+    expect(result.planification).toEqual({
+      provider: 'opencode-go',
+      model: 'opencode-go/kimi-k2.6',
+      effort: null,
+    });
+    // All six agents should be migrated.
+    expect(result.yolo).toEqual({
+      provider: 'opencode-go',
+      model: 'opencode-go/kimi-k2.6',
+      effort: null,
+    });
+  });
 });
 
 describe('ensureUserAgentModelSettings', () => {

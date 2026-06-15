@@ -16,6 +16,7 @@ import {
   isOpenAIModel,
   isOpenAIEffort,
   isOpenCodeModel,
+  isOpenCodeGoModel,
   isOpenCodeEffort,
   isModelForProvider,
   isEffortForProvider,
@@ -54,8 +55,8 @@ describe('shared/providers/models', () => {
       expect([...OPENCODE_EFFORTS]).toEqual([]);
     });
 
-    it('enumerates all three providers', () => {
-      expect([...PROVIDERS]).toEqual(['anthropic', 'openai', 'opencode']);
+    it('enumerates all four providers', () => {
+      expect([...PROVIDERS]).toEqual(['anthropic', 'openai', 'opencode', 'opencode-go']);
     });
   });
 
@@ -75,16 +76,18 @@ describe('shared/providers/models', () => {
     it('effortsForProvider returns the OpenAI list', () => {
       expect(effortsForProvider('openai')).toEqual(OPENAI_EFFORTS);
     });
-    it('effortsForProvider returns an empty list for OpenCode', () => {
+    it('effortsForProvider returns an empty list for OpenCode (both Zen and Go)', () => {
       expect(effortsForProvider('opencode')).toEqual([]);
+      expect(effortsForProvider('opencode-go')).toEqual([]);
     });
   });
 
   describe('type guards', () => {
-    it('isProvider accepts anthropic/openai/opencode and rejects bogus values', () => {
+    it('isProvider accepts anthropic/openai/opencode/opencode-go and rejects bogus values', () => {
       expect(isProvider('anthropic')).toBe(true);
       expect(isProvider('openai')).toBe(true);
       expect(isProvider('opencode')).toBe(true);
+      expect(isProvider('opencode-go')).toBe(true);
       expect(isProvider('claude')).toBe(false);
       expect(isProvider('')).toBe(false);
       expect(isProvider(undefined)).toBe(false);
@@ -135,6 +138,19 @@ describe('shared/providers/models', () => {
       expect(isOpenCodeModel('opencode')).toBe(false);
     });
 
+    it('isOpenCodeGoModel accepts anything with the opencode-go/ prefix — Go owns the namespace', () => {
+      expect(isOpenCodeGoModel('opencode-go/qwen3.7-plus')).toBe(true);
+      expect(isOpenCodeGoModel('opencode-go/deepseek-v5')).toBe(true);
+      expect(isOpenCodeGoModel('opencode-go/some-future-model')).toBe(true);
+      // Must not accept the Zen prefix.
+      expect(isOpenCodeGoModel('opencode/kimi-k2.6')).toBe(false);
+      // Bare modelID is not the Bottega-persisted shape.
+      expect(isOpenCodeGoModel('qwen3.7-plus')).toBe(false);
+      // Empty bare ID is invalid.
+      expect(isOpenCodeGoModel('opencode-go/')).toBe(false);
+      expect(isOpenCodeGoModel('opencode-go')).toBe(false);
+    });
+
     it('isOpenCodeEffort always returns false (OpenCode has no effort dimension)', () => {
       expect(isOpenCodeEffort('high')).toBe(false);
       expect(isOpenCodeEffort('minimal')).toBe(false);
@@ -149,12 +165,22 @@ describe('shared/providers/models', () => {
       expect(isModelForProvider('openai', 'gpt-5.4-mini')).toBe(true);
       expect(isModelForProvider('openai', 'opus')).toBe(false);
       expect(isModelForProvider('openai', null)).toBe(false);
+      // Zen: any opencode/ prefix passes — Zen owns the catalog.
       expect(isModelForProvider('opencode', 'opencode/kimi-k2.6')).toBe(true);
-      // Any opencode/ prefix passes — Zen owns the catalog.
       expect(isModelForProvider('opencode', 'opencode/some-future-model')).toBe(true);
       expect(isModelForProvider('opencode', 'kimi-k2.6')).toBe(false);
       expect(isModelForProvider('opencode', 'opus')).toBe(false);
+      // opencode-go/ models must NOT pass the Zen check.
+      expect(isModelForProvider('opencode', 'opencode-go/qwen3.7-plus')).toBe(false);
+      // Go: any opencode-go/ prefix passes.
+      expect(isModelForProvider('opencode-go', 'opencode-go/qwen3.7-plus')).toBe(true);
+      expect(isModelForProvider('opencode-go', 'opencode-go/deepseek-v5')).toBe(true);
+      expect(isModelForProvider('opencode-go', 'opencode-go/some-future-model')).toBe(true);
+      // Zen models must NOT pass the Go check.
+      expect(isModelForProvider('opencode-go', 'opencode/kimi-k2.6')).toBe(false);
+      expect(isModelForProvider('opencode-go', 'qwen3.7-plus')).toBe(false);
       expect(isModelForProvider('anthropic', 'opencode/kimi-k2.6')).toBe(false);
+      expect(isModelForProvider('anthropic', 'opencode-go/qwen3.7-plus')).toBe(false);
     });
 
     it('isEffortForProvider rejects cross-provider efforts', () => {

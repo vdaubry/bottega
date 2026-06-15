@@ -31,27 +31,52 @@ function AgentModelsTab() {
   const [settings, setSettings] = useState<AgentModelSettings | null>(null);
   const [needsSeeding, setNeedsSeeding] = useState(false);
   const [connected, setConnected] = useState<Provider[]>([]);
-  const [openCodeModels, setOpenCodeModels] = useState<OpenCodeModelEntry[] | null>(null);
-  const [isLoadingOpenCodeModels, setLoadingOpenCodeModels] = useState(false);
+  // Separate catalog slots so switching one provider variant doesn't overwrite
+  // the other. Each row receives the catalog that matches its own provider.
+  const [openCodeZenModels, setOpenCodeZenModels] = useState<OpenCodeModelEntry[] | null>(null);
+  const [openCodeGoModels, setOpenCodeGoModels] = useState<OpenCodeModelEntry[] | null>(null);
+  const [isLoadingZenModels, setLoadingZenModels] = useState(false);
+  const [isLoadingGoModels, setLoadingGoModels] = useState(false);
   const [isLoading, setLoading] = useState(true);
   const [isSaving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
-  const loadOpenCodeModels = useCallback(async () => {
-    setLoadingOpenCodeModels(true);
+  const loadOpenCodeZenModels = useCallback(async (): Promise<OpenCodeModelEntry[]> => {
+    setLoadingZenModels(true);
     try {
       const res = await api.openCodeAuth.models();
       if (!res.ok) {
-        setOpenCodeModels([]);
-        return;
+        setOpenCodeZenModels([]);
+        return [];
       }
       const body = await res.json();
-      setOpenCodeModels(body.models);
+      setOpenCodeZenModels(body.models);
+      return body.models as OpenCodeModelEntry[];
     } catch {
-      setOpenCodeModels([]);
+      setOpenCodeZenModels([]);
+      return [];
     } finally {
-      setLoadingOpenCodeModels(false);
+      setLoadingZenModels(false);
+    }
+  }, []);
+
+  const loadOpenCodeGoModels = useCallback(async (): Promise<OpenCodeModelEntry[]> => {
+    setLoadingGoModels(true);
+    try {
+      const res = await api.openCodeAuth.modelsGo();
+      if (!res.ok) {
+        setOpenCodeGoModels([]);
+        return [];
+      }
+      const body = await res.json();
+      setOpenCodeGoModels(body.models);
+      return body.models as OpenCodeModelEntry[];
+    } catch {
+      setOpenCodeGoModels([]);
+      return [];
+    } finally {
+      setLoadingGoModels(false);
     }
   }, []);
 
@@ -64,10 +89,16 @@ function AgentModelsTab() {
           api.userAgentModelSettings.connectedProviders(),
         ]);
         if (providersRes.ok) {
-          const body = await providersRes.json();
-          setConnected(body.connected);
-          if (body.connected.includes('opencode')) void loadOpenCodeModels();
-        }
+           const body = await providersRes.json();
+           setConnected(body.connected);
+           // Load each catalog independently so neither overwrites the other.
+           if (body.connected.includes('opencode')) {
+             void loadOpenCodeZenModels();
+           }
+           if (body.connected.includes('opencode-go')) {
+             void loadOpenCodeGoModels();
+           }
+         }
         if (settingsRes.ok) {
           const body = await settingsRes.json();
           if (body.needsSeeding) {
@@ -84,9 +115,9 @@ function AgentModelsTab() {
         setLoading(false);
       }
     })();
-  }, [loadOpenCodeModels]);
+  }, [loadOpenCodeZenModels, loadOpenCodeGoModels]);
 
-  const updateAgentSetting = useCallback(
+   const updateAgentSetting = useCallback(
     async (agent: AgentType, patch: Partial<AgentModelSetting>) => {
       if (!settings) return;
       const current = settings[agent];
@@ -96,11 +127,26 @@ function AgentModelsTab() {
       let merged: AgentModelSetting;
       if (patch.provider && patch.provider !== current.provider) {
         const p = patch.provider;
-        const nextModel =
-          p === 'opencode' ? (openCodeModels?.[0]?.id ?? null) : MODELS_FOR_UI[p][0]!;
+
+        // Ensure the target OpenCode variant's catalog is loaded before we try
+        // to pick its first model. Each loader writes to its own slot, so
+        // switching to Go never clobbers the Zen catalog (and vice versa).
+        // Loaders return the fetched list so we can use it immediately without
+        // relying on stale closure state.
+        let nextModel: string | null;
+        if (p === 'opencode') {
+          const catalog = openCodeZenModels ?? (await loadOpenCodeZenModels());
+          nextModel = catalog[0]?.id ?? null;
+        } else if (p === 'opencode-go') {
+          const catalog = openCodeGoModels ?? (await loadOpenCodeGoModels());
+          nextModel = catalog[0]?.id ?? null;
+        } else {
+          nextModel = MODELS_FOR_UI[p][0]!;
+        }
+
         if (nextModel === null) {
           setError(
-            'OpenCode catalog is still loading or no Zen key is configured. ' +
+            'OpenCode catalog is still loading or no key is configured. ' +
               'Connect OpenCode in Settings → Providers, then try again.',
           );
           return;
@@ -133,7 +179,7 @@ function AgentModelsTab() {
         setSaving(false);
       }
     },
-    [settings, openCodeModels],
+    [settings, openCodeZenModels, openCodeGoModels, loadOpenCodeZenModels, loadOpenCodeGoModels],
   );
 
   if (isLoading) {
@@ -179,19 +225,26 @@ function AgentModelsTab() {
       )}
 
       <div className="mt-2">
-        {AGENT_TYPES_WITH_SETTINGS.map((agent) => (
-          <AgentModelSettingRow
-            key={agent}
-            agentType={agent}
-            label={AGENT_LABELS[agent]}
-            setting={settings[agent]}
-            connectedProviders={connected}
-            openCodeModels={openCodeModels}
-            isLoadingOpenCodeModels={isLoadingOpenCodeModels}
-            disabled={isSaving}
-            onChange={updateAgentSetting}
-          />
-        ))}
+        {AGENT_TYPES_WITH_SETTINGS.map((agent) => {
+          const providerForRow = settings[agent].provider;
+          const openCodeModelsForRow =
+            providerForRow === 'opencode-go' ? openCodeGoModels : openCodeZenModels;
+          const isLoadingOpenCodeModelsForRow =
+            providerForRow === 'opencode-go' ? isLoadingGoModels : isLoadingZenModels;
+          return (
+            <AgentModelSettingRow
+              key={agent}
+              agentType={agent}
+              label={AGENT_LABELS[agent]}
+              setting={settings[agent]}
+              connectedProviders={connected}
+              openCodeModels={openCodeModelsForRow}
+              isLoadingOpenCodeModels={isLoadingOpenCodeModelsForRow}
+              disabled={isSaving}
+              onChange={updateAgentSetting}
+            />
+          );
+        })}
       </div>
     </div>
   );

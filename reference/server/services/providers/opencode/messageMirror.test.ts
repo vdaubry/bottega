@@ -31,7 +31,7 @@ describe('mirrorOpenCodeEvent', () => {
       isSubAgent: false,
       model: 'kimi-k2.6',
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     expect(sqliteSessionStore.append).toHaveBeenCalledTimes(1);
     const call = vi.mocked(sqliteSessionStore.append).mock.calls[0]!;
     expect(call[0]).toMatchObject({
@@ -61,7 +61,7 @@ describe('mirrorOpenCodeEvent', () => {
       isSubAgent: false,
       model: 'opencode/qwen3-coder',
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = (vi.mocked(sqliteSessionStore.append).mock.calls[0]![1]) as Array<{
       message?: { model?: string };
     }>;
@@ -77,7 +77,7 @@ describe('mirrorOpenCodeEvent', () => {
       raw: null,
       delta: {},
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     expect(sqliteSessionStore.append).not.toHaveBeenCalled();
   });
 
@@ -90,7 +90,7 @@ describe('mirrorOpenCodeEvent', () => {
       raw: null,
       content: 'hello',
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<{
       type?: string;
       message?: { role?: string; content?: unknown };
@@ -111,7 +111,7 @@ describe('mirrorOpenCodeEvent', () => {
       toolUseId: 'call-abc',
       toolInput: { command: 'ls' },
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<{
       type?: string;
       uuid?: string;
@@ -136,7 +136,7 @@ describe('mirrorOpenCodeEvent', () => {
       content: 'oops',
       isError: true,
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<{
       type?: string;
       uuid?: string;
@@ -159,7 +159,7 @@ describe('mirrorOpenCodeEvent', () => {
       raw: null,
       text: 'pondering',
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<{
       uuid?: string;
       message?: { content?: Array<{ type?: string; thinking?: string }> };
@@ -179,7 +179,7 @@ describe('mirrorOpenCodeEvent', () => {
       isError: false,
       usage: { input_tokens: 12, output_tokens: 34 },
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<Record<string, unknown>>;
     expect(entries[0]!['type']).toBe('result');
     expect(entries[0]!['is_error']).toBe(false);
@@ -194,7 +194,7 @@ describe('mirrorOpenCodeEvent', () => {
       providerSessionId: 'sess_oc_42',
       raw: null,
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<Record<string, unknown>>;
     expect(entries[0]!['type']).toBe('system');
     expect(entries[0]!['subtype']).toBe('opencode');
@@ -210,8 +210,71 @@ describe('mirrorOpenCodeEvent', () => {
       text: 'sub',
       isSubAgent: true,
     };
-    await mirrorOpenCodeEvent(CTX, msg);
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode');
     const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<Record<string, unknown>>;
     expect(entries[0]!['parent_tool_use_id']).toBe('__opencode_subagent__');
+  });
+
+  // OpenCode Go provider tests
+  it("appends with provider='opencode-go' and prefixes model correctly", async () => {
+    const msg: UnifiedMessage = {
+      type: 'assistant',
+      id: 'msg-go-1',
+      provider: 'opencode-go',
+      providerSessionId: 'sess_oc_go_42',
+      raw: null,
+      text: 'hello from go',
+      isSubAgent: false,
+      model: 'deepseek-r1',
+    };
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode-go');
+    expect(sqliteSessionStore.append).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(sqliteSessionStore.append).mock.calls[0]!;
+    expect(call[0]).toMatchObject({
+      provider: 'opencode-go',
+    });
+    const entries = call[1] as Array<Record<string, unknown>>;
+    expect(entries[0]!['type']).toBe('assistant');
+    // model is reprefixed to the canonical opencode-go/<modelID> form
+    expect(((entries[0]!['message'] as Record<string, unknown>)['model'])).toBe(
+      'opencode-go/deepseek-r1',
+    );
+  });
+
+  it("does NOT double-prefix when model is already 'opencode-go/<id>'", async () => {
+    const msg: UnifiedMessage = {
+      type: 'assistant',
+      id: 'msg-go-2',
+      provider: 'opencode-go',
+      providerSessionId: 'sess_oc_go_42',
+      raw: null,
+      text: 'hi',
+      isSubAgent: false,
+      model: 'opencode-go/qwen3-coder',
+    };
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode-go');
+    const entries = (vi.mocked(sqliteSessionStore.append).mock.calls[0]![1]) as Array<{
+      message?: { model?: string };
+    }>;
+    expect(entries[0]!.message?.model).toBe('opencode-go/qwen3-coder');
+  });
+
+  it('opencode-go provider persists user message correctly', async () => {
+    const msg: UnifiedMessage = {
+      type: 'user',
+      id: 'user-go-1',
+      provider: 'opencode-go',
+      providerSessionId: 'sess_oc_go_42',
+      raw: null,
+      content: 'hello go',
+    };
+    await mirrorOpenCodeEvent(CTX, msg, 'opencode-go');
+    const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<{
+      type?: string;
+      message?: { role?: string; content?: unknown };
+    }>;
+    expect(entries[0]!.type).toBe('user');
+    expect(entries[0]!.message?.role).toBe('user');
+    expect(entries[0]!.message?.content).toBe('hello go');
   });
 });

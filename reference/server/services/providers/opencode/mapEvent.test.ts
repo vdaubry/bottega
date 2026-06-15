@@ -146,7 +146,7 @@ function sessionError(message: string): EventSessionError {
 
 describe('opencode mapEvent', () => {
   it('text-only assistant: 3 text parts + final message.updated → 1 assistant with concatenated text', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     expect(m.map(textPart('p1', MSG_ID, 'Hello '))).toEqual([]);
     expect(m.map(textPart('p2', MSG_ID, 'world'))).toEqual([]);
     expect(m.map(textPart('p3', MSG_ID, '!'))).toEqual([]);
@@ -165,7 +165,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('does not flush before message.updated arrives with finish', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     m.map(textPart('p1', MSG_ID, 'hello'));
     // message.updated without finish does not flush.
     const interim = m.map(assistantMessageUpdated(MSG_ID, undefined));
@@ -176,7 +176,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('mixed text + reasoning collapses into one assistant + one assistant_thinking', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     m.map(reasoningPart('rp1', MSG_ID, 'Thinking step 1. '));
     m.map(textPart('tp1', MSG_ID, 'Answer: '));
     m.map(reasoningPart('rp2', MSG_ID, 'Thinking step 2.'));
@@ -193,7 +193,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('tool lifecycle: running → completed produces tool_use + tool_result with matching toolUseId', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const running = m.map(
       toolPart('tp_tool_1', MSG_ID, 'call_abc', 'Bash', {
         status: 'running',
@@ -219,18 +219,19 @@ describe('opencode mapEvent', () => {
         time: { start: 0, end: 1 },
       }),
     );
-    expect(completed).toHaveLength(2);
-    expect(completed[0]?.type).toBe('tool_use');
-    expect(completed[1]?.type).toBe('tool_result');
-    if (completed[1]?.type === 'tool_result') {
-      expect(completed[1].toolUseId).toBe('call_abc');
-      expect(completed[1].content).toBe('README.md\npackage.json');
-      expect(completed[1].isError).toBeUndefined();
+    // On the second call with the same part ID but 'completed' status,
+    // only emit tool_result (tool_use was already emitted when status was 'running').
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.type).toBe('tool_result');
+    if (completed[0]?.type === 'tool_result') {
+      expect(completed[0].toolUseId).toBe('call_abc');
+      expect(completed[0].content).toBe('README.md\npackage.json');
+      expect(completed[0].isError).toBeUndefined();
     }
   });
 
   it('tool lifecycle: error state surfaces isError + content message', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const out = m.map(
       toolPart('tp_err', MSG_ID, 'call_err', 'Edit', {
         status: 'error',
@@ -248,7 +249,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('pending tool state emits only tool_use (no tool_result)', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const out = m.map(
       toolPart('tp_pending', MSG_ID, 'call_p', 'Bash', {
         status: 'pending',
@@ -261,7 +262,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('file part emits a tool_result with file metadata', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const out = m.map(
       filePart('fp_1', MSG_ID, 'image/png', 'shot.png', 'opencode://attachments/abc'),
     );
@@ -278,7 +279,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('step-finish part yields a result with token totals', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const out = m.map(stepFinish('sf_1', MSG_ID, 7702, 41));
     expect(out).toHaveLength(1);
     expect(out[0]?.type).toBe('result');
@@ -289,7 +290,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('session.idle emits a result with isError=false', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const out = m.map(sessionIdle());
     expect(out).toHaveLength(1);
     expect(out[0]?.type).toBe('result');
@@ -297,7 +298,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('session.error emits a result with isError=true and the underlying error attached', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const out = m.map(sessionError('Provider auth failed'));
     expect(out).toHaveLength(1);
     expect(out[0]?.type).toBe('result');
@@ -309,7 +310,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('user message.updated does not produce a user UnifiedMessage (orchestrator emits the synthetic user)', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const userEvent: EventMessageUpdated = {
       type: 'message.updated',
       properties: {
@@ -327,7 +328,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('flush is idempotent across duplicate message.updated finals', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     m.map(textPart('p1', MSG_ID, 'Hello'));
     const first = m.map(assistantMessageUpdated(MSG_ID, 'stop'));
     expect(first).toHaveLength(1);
@@ -336,7 +337,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('does not leak state across messageIDs in the same conversation', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     m.map(textPart('p1', 'msg_A', 'A1 '));
     m.map(textPart('p2', 'msg_B', 'B1 '));
     m.map(textPart('p3', 'msg_A', 'A2'));
@@ -348,7 +349,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('unknown / unsupported event types return empty arrays (forward-compatible)', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     const unknown = {
       type: 'session.compacted',
       properties: { sessionID: SESSION_ID },
@@ -357,7 +358,7 @@ describe('opencode mapEvent', () => {
   });
 
   it('text part that arrives after final flush is ignored for that messageID (idempotent flush)', () => {
-    const m = createOpenCodeEventMapper(SESSION_ID);
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode');
     m.map(textPart('p1', MSG_ID, 'first'));
     m.map(assistantMessageUpdated(MSG_ID, 'stop'));
     m.map(textPart('p2', MSG_ID, 'late'));
@@ -367,5 +368,50 @@ describe('opencode mapEvent', () => {
 
   it('one-shot mapOpenCodeEvent helper handles a single event correctly', () => {
     expect(mapOpenCodeEvent(sessionIdle(), SESSION_ID)).toHaveLength(1);
+  });
+
+  // OpenCode Go provider tests
+  it('opencode-go provider stamps correct provider name on emitted messages', () => {
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode-go');
+    expect(m.map(textPart('p1', MSG_ID, 'Hello from Go'))).toEqual([]);
+    const out = m.map(assistantMessageUpdated(MSG_ID, 'stop'));
+    expect(out).toHaveLength(1);
+    expect(out[0]?.provider).toBe('opencode-go');
+    expect(out[0]?.providerSessionId).toBe(SESSION_ID);
+    if (out[0]?.type === 'assistant') {
+      expect(out[0].text).toBe('Hello from Go');
+    }
+  });
+
+  it('opencode-go provider emits correct provider on tool_use and tool_result', () => {
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode-go');
+    const tool1 = m.map(
+      toolPart('tool_p1', MSG_ID, 'call_bash_1', 'bash', {
+        status: 'running',
+        input: { command: 'ls' },
+      }),
+    );
+    expect(tool1).toHaveLength(1);
+    expect(tool1[0]?.type).toBe('tool_use');
+    expect(tool1[0]?.provider).toBe('opencode-go');
+    
+    const tool2 = m.map(
+      toolPart('tool_p1', MSG_ID, 'call_bash_1', 'bash', {
+        status: 'completed',
+        input: { command: 'ls' },
+        output: 'file1.txt',
+      }),
+    );
+    expect(tool2).toHaveLength(1);
+    expect(tool2[0]?.type).toBe('tool_result');
+    expect(tool2[0]?.provider).toBe('opencode-go');
+  });
+
+  it('opencode-go provider emits result event with correct provider', () => {
+    const m = createOpenCodeEventMapper(SESSION_ID, 'opencode-go');
+    const out = m.map(sessionIdle());
+    expect(out).toHaveLength(1);
+    expect(out[0]?.type).toBe('result');
+    expect(out[0]?.provider).toBe('opencode-go');
   });
 });

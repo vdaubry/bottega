@@ -49,6 +49,14 @@ export const CAPABILITIES_BY_PROVIDER: Record<Provider, ProviderCapabilities> = 
     supportsMcpServers: false,
     supportsImages: false,
   },
+  'opencode-go': {
+    // Same capability profile as OpenCode Zen — all features deferred.
+    supportsAskUserQuestion: false,
+    supportsThinkingDelta: false,
+    supportsContextUsageBreakdown: false,
+    supportsMcpServers: false,
+    supportsImages: false,
+  },
 };
 
 export function getCapabilities(provider: Provider): ProviderCapabilities {
