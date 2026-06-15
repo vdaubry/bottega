@@ -155,7 +155,7 @@ export async function startAgentRun(
   // Per docs/opencode/00-context-decisions.md § R1: OpenCode runs review
   // agents in degraded mode — no Playwright MCP, no recording temp dir.
   let videoConfig: VideoConfig | null = null;
-  if (agentType === 'review' && provider !== 'opencode') {
+  if (agentType === 'review' && provider !== 'opencode' && provider !== 'opencode-go') {
     const tempDir = `/tmp/bottega-video-${taskId}-${Date.now()}`;
     videoConfig = {
       tempDir,

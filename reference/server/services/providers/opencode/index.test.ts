@@ -10,6 +10,9 @@ import {
   listOpenCodeModels,
   OpenCodeProvider,
   parseOpenCodeModel,
+  createOpenCodeProvider,
+  openCodeProvider,
+  openCodeGoProvider,
 } from './index.js';
 
 interface FakeClient {
@@ -99,6 +102,32 @@ describe('parseOpenCodeModel', () => {
   it('throws on the bare prefix with no modelID', () => {
     expect(() => parseOpenCodeModel('opencode/')).toThrow(InvalidOpenCodeModelError);
   });
+
+  // OpenCode Go prefix tests
+  it("returns { providerID: 'opencode-go', modelID } for canonical opencode-go model", () => {
+    expect(parseOpenCodeModel('opencode-go/kimi-k2.6')).toEqual({
+      providerID: 'opencode-go',
+      modelID: 'kimi-k2.6',
+    });
+  });
+
+  it('parses opencode-go/qwen3-coder', () => {
+    expect(parseOpenCodeModel('opencode-go/qwen3-coder')).toEqual({
+      providerID: 'opencode-go',
+      modelID: 'qwen3-coder',
+    });
+  });
+
+  it('keeps a multi-segment modelID intact for opencode-go prefix', () => {
+    expect(parseOpenCodeModel('opencode-go/claude-opus-4-7')).toEqual({
+      providerID: 'opencode-go',
+      modelID: 'claude-opus-4-7',
+    });
+  });
+
+  it('throws on the bare opencode-go prefix with no modelID', () => {
+    expect(() => parseOpenCodeModel('opencode-go/')).toThrow(InvalidOpenCodeModelError);
+  });
 });
 
 describe('OpenCodeProvider', () => {
@@ -111,7 +140,7 @@ describe('OpenCodeProvider', () => {
   });
 
   it("name is 'opencode' and capabilities match the D8 matrix (all false)", () => {
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     expect(p.name).toBe('opencode');
     const caps = p.getCapabilities();
     expect(caps.supportsAskUserQuestion).toBe(false);
@@ -139,7 +168,7 @@ describe('OpenCodeProvider', () => {
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
 
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo/worktree',
       prompt: 'ping',
@@ -175,7 +204,7 @@ describe('OpenCodeProvider', () => {
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
 
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.sendTurnMessage({
       cwd: '/repo/worktree',
       prompt: 'follow up',
@@ -202,7 +231,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -219,7 +248,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hello world',
@@ -240,7 +269,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -259,7 +288,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -277,7 +306,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/home/ubuntu/misc/hello_world-worktrees/task-1036',
       prompt: 'hi',
@@ -298,7 +327,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -319,7 +348,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_existing_42' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.sendTurnMessage({
       cwd: '/repo',
       prompt: 'follow-up message',
@@ -342,7 +371,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/home/ubuntu/misc/hello_world-worktrees/task-1036',
       prompt: 'hi',
@@ -378,7 +407,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -411,7 +440,7 @@ describe('OpenCodeProvider', () => {
       },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -429,7 +458,7 @@ describe('OpenCodeProvider', () => {
   });
 
   it('abortTurn returns false for an unknown session id', () => {
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     expect(p.abortTurn('not-a-real-session')).toBe(false);
   });
 
@@ -438,7 +467,7 @@ describe('OpenCodeProvider', () => {
       { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
     ]);
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
@@ -467,7 +496,7 @@ describe('OpenCodeProvider', () => {
   });
 
   it('throws when the env does not carry BOTTEGA_USER_ID', async () => {
-    const p = new OpenCodeProvider();
+    const p = createOpenCodeProvider('opencode');
     await expect(
       p.startTurn({
         cwd: '/repo',
@@ -477,6 +506,36 @@ describe('OpenCodeProvider', () => {
         env: { XDG_DATA_HOME: '/tmp/x' },
       }),
     ).rejects.toThrow(/BOTTEGA_USER_ID/);
+  });
+});
+
+describe('createOpenCodeProvider factory', () => {
+  it("creates an opencode provider with name 'opencode'", () => {
+    const provider = createOpenCodeProvider('opencode');
+    expect(provider.name).toBe('opencode');
+    const caps = provider.getCapabilities();
+    expect(caps.supportsAskUserQuestion).toBe(false);
+    expect(caps.supportsThinkingDelta).toBe(false);
+  });
+
+  it("creates an opencode-go provider with name 'opencode-go'", () => {
+    const provider = createOpenCodeProvider('opencode-go');
+    expect(provider.name).toBe('opencode-go');
+    const caps = provider.getCapabilities();
+    expect(caps.supportsAskUserQuestion).toBe(false);
+    expect(caps.supportsThinkingDelta).toBe(false);
+  });
+
+  it('exported openCodeProvider has correct name and capabilities', () => {
+    expect(openCodeProvider.name).toBe('opencode');
+    const caps = openCodeProvider.getCapabilities();
+    expect(caps.supportsAskUserQuestion).toBe(false);
+  });
+
+  it('exported openCodeGoProvider has correct name and capabilities', () => {
+    expect(openCodeGoProvider.name).toBe('opencode-go');
+    const caps = openCodeGoProvider.getCapabilities();
+    expect(caps.supportsAskUserQuestion).toBe(false);
   });
 });
 
@@ -524,7 +583,7 @@ describe('listOpenCodeModels', () => {
       },
     });
 
-    const result = await listOpenCodeModels(7);
+    const result = await listOpenCodeModels(7, 'opencode');
     expect(result.map((m) => m.id)).toEqual([
       'opencode/glm-5',
       'opencode/kimi-k2.6',
@@ -557,7 +616,7 @@ describe('listOpenCodeModels', () => {
         ],
       },
     });
-    const result = await listOpenCodeModels(7);
+    const result = await listOpenCodeModels(7, 'opencode');
     expect(result).toEqual([]);
   });
 
@@ -573,7 +632,7 @@ describe('listOpenCodeModels', () => {
         },
       ],
     });
-    const result = await listOpenCodeModels(7);
+    const result = await listOpenCodeModels(7, 'opencode');
     expect(result.map((m) => m.id)).toEqual(['opencode/kimi-k2.6']);
   });
 
@@ -591,8 +650,73 @@ describe('listOpenCodeModels', () => {
         ],
       },
     });
-    const result = await listOpenCodeModels(7);
+    const result = await listOpenCodeModels(7, 'opencode');
     expect(result[0]?.name).toBe('oddly-unnamed-model');
     expect(result[0]?.status).toBe('unknown');
+  });
+
+  it("returns only the opencode-go provider's models with opencode-go/ prefix, alpha-sorted", async () => {
+    const { handle, client } = makeFakeHandle([]);
+    vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
+    client.config.providers.mockResolvedValueOnce({
+      data: {
+        providers: [
+          {
+            id: 'anthropic',
+            name: 'Anthropic',
+            models: { 'claude-opus-4-7': { id: 'claude-opus-4-7', name: 'Opus 4.7' } },
+          },
+          {
+            id: 'opencode-go',
+            name: 'OpenCode Go',
+            models: {
+              'deepseek-r1': {
+                id: 'deepseek-r1',
+                name: 'DeepSeek R1',
+                status: 'active',
+                limit: { context: 64000, output: 8000 },
+              },
+              'qwen3-coder': {
+                id: 'qwen3-coder',
+                name: 'Qwen3 Coder',
+                status: 'active',
+                limit: { context: 128000, output: 8000 },
+              },
+            },
+          },
+        ],
+      },
+    });
+
+    const result = await listOpenCodeModels(7, 'opencode-go');
+    expect(result.map((m) => m.id)).toEqual([
+      'opencode-go/deepseek-r1',
+      'opencode-go/qwen3-coder',
+    ]);
+    expect(result[0]).toMatchObject({
+      id: 'opencode-go/deepseek-r1',
+      bareModelId: 'deepseek-r1',
+      name: 'DeepSeek R1',
+      status: 'active',
+      contextWindow: 64000,
+    });
+  });
+
+  it("returns [] when the response carries no `opencode-go` provider entry", async () => {
+    const { handle, client } = makeFakeHandle([]);
+    vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
+    client.config.providers.mockResolvedValueOnce({
+      data: {
+        providers: [
+          {
+            id: 'opencode',
+            name: 'OpenCode',
+            models: { 'kimi-k2.6': { id: 'kimi-k2.6' } },
+          },
+        ],
+      },
+    });
+    const result = await listOpenCodeModels(7, 'opencode-go');
+    expect(result).toEqual([]);
   });
 });

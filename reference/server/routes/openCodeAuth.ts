@@ -151,12 +151,32 @@ router.get(
         res.json({ models: [] });
         return;
       }
-      const models = await listOpenCodeModels(userId);
+      const models = await listOpenCodeModels(userId, 'opencode');
       res.json({ models });
     } catch (error) {
       // Most likely cause: the user's auth.json is stale and the spawn
       // failed validation. Return 500 with the OpenCode message so the
       // settings UI can surface it.
+      authErrorResponse(res as Response<OpenCodeAuthErrorBody | ApiError>, error);
+    }
+  },
+);
+
+// Proxy the live Go catalog from the user's OpenCode server. Returns
+// an empty list (with 200 OK) when the user has no key configured.
+router.get(
+  '/models-go',
+  async (req: Request, res: Response<OpenCodeModelsResponse | OpenCodeAuthErrorBody>) => {
+    const userId = req.user!.id;
+    try {
+      const status = await getOpenCodeAuthStatus(userId);
+      if (!status.authenticated) {
+        res.json({ models: [] });
+        return;
+      }
+      const models = await listOpenCodeModels(userId, 'opencode-go');
+      res.json({ models });
+    } catch (error) {
       authErrorResponse(res as Response<OpenCodeAuthErrorBody | ApiError>, error);
     }
   },

@@ -181,28 +181,35 @@ export interface OpenCodeAuthRecord {
 
 export interface OpenCodeAuthJson {
   opencode: OpenCodeAuthRecord;
+  'opencode-go': OpenCodeAuthRecord;
 }
 
 function isOpenCodeAuthJson(value: unknown): value is OpenCodeAuthJson {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  // R15 defence-in-depth: under Zen billing the on-disk shape must be
-  // exactly one record under providerID 'opencode'. Reject files that
-  // carry stale per-sub-provider entries from an earlier draft of the
-  // plan, even if the 'opencode' field is well-formed — the spawned
-  // server would still see those extras and route through the wrong
-  // path.
-  const keys = Object.keys(value as Record<string, unknown>);
-  if (keys.length !== 1 || keys[0] !== 'opencode') return false;
-  const v = (value as { opencode?: unknown }).opencode;
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
-  const rec = v as { type?: unknown; key?: unknown };
-  return rec.type === 'api' && typeof rec.key === 'string' && rec.key.length > 0;
+  // Dual-provider shape: exactly two records under 'opencode' and 'opencode-go'
+  // with the same API key (Zen billing covers both).
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  if (keys.length !== 2 || keys[0] !== 'opencode' || keys[1] !== 'opencode-go') return false;
+  const v1 = (value as { opencode?: unknown }).opencode;
+  const v2 = (value as { 'opencode-go'?: unknown })['opencode-go'];
+  if (!v1 || typeof v1 !== 'object' || Array.isArray(v1)) return false;
+  if (!v2 || typeof v2 !== 'object' || Array.isArray(v2)) return false;
+  const rec1 = v1 as { type?: unknown; key?: unknown };
+  const rec2 = v2 as { type?: unknown; key?: unknown };
+  return (
+    rec1.type === 'api' &&
+    typeof rec1.key === 'string' &&
+    rec1.key.length > 0 &&
+    rec2.type === 'api' &&
+    typeof rec2.key === 'string' &&
+    rec2.key.length > 0
+  );
 }
 
 /**
  * Reads and validates the on-disk auth.json. Throws when missing /
  * malformed / insecure. Returns the parsed structure when the file holds
- * a non-empty Zen API key under providerID 'opencode'.
+ * a non-empty Zen API key under both 'opencode' and 'opencode-go' provider IDs.
  */
 export function readOpenCodeAuth(
   userId: number | string | undefined,
@@ -220,18 +227,21 @@ export function readOpenCodeAuth(
   }
   if (!isOpenCodeAuthJson(payload)) {
     throw new OpenCodeCredentialsError(
-      `OpenCode auth.json for user ${userId} does not carry a Zen API key under providerID 'opencode'`,
+      `OpenCode auth.json for user ${userId} does not carry Zen API keys under both 'opencode' and 'opencode-go' provider IDs`,
     );
   }
   return payload;
 }
 
 /**
- * Persist a Zen API key. The on-disk shape is single-record:
- *   { "opencode": { "type": "api", "key": apiKey } }
+ * Persist a Zen API key. The on-disk shape is dual-record:
+ *   {
+ *     "opencode": { "type": "api", "key": apiKey },
+ *     "opencode-go": { "type": "api", "key": apiKey }
+ *   }
  *
- * Overwrites any existing file wholesale — there is no merge logic and no
- * per-sub-provider editing under Zen billing (R15).
+ * Both entries use the same key (Zen billing covers both providers).
+ * Overwrites any existing file wholesale — there is no merge logic.
  */
 export function setOpenCodeKey(
   userId: number | string | undefined,
@@ -246,6 +256,7 @@ export function setOpenCodeKey(
   const authPath = resolveOpenCodeAuthPath(userId);
   const payload: OpenCodeAuthJson = {
     opencode: { type: 'api', key: apiKey },
+    'opencode-go': { type: 'api', key: apiKey },
   };
   fs.writeFileSync(authPath, JSON.stringify(payload), { mode: 0o600 });
   fs.chmodSync(authPath, 0o600);

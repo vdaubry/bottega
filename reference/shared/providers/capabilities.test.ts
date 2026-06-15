@@ -39,9 +39,19 @@ describe('shared/providers/capabilities', () => {
     expect(caps.supportsImages).toBe(false);
   });
 
+  it('OpenCode Go has identical capabilities to OpenCode (every flag off in v1)', () => {
+    const caps = CAPABILITIES_BY_PROVIDER['opencode-go'];
+    expect(caps.supportsAskUserQuestion).toBe(false);
+    expect(caps.supportsThinkingDelta).toBe(false);
+    expect(caps.supportsContextUsageBreakdown).toBe(false);
+    expect(caps.supportsMcpServers).toBe(false);
+    expect(caps.supportsImages).toBe(false);
+  });
+
   it('getCapabilities returns the same object as the matrix lookup', () => {
     expect(getCapabilities('anthropic')).toBe(CAPABILITIES_BY_PROVIDER.anthropic);
     expect(getCapabilities('openai')).toBe(CAPABILITIES_BY_PROVIDER.openai);
     expect(getCapabilities('opencode')).toBe(CAPABILITIES_BY_PROVIDER.opencode);
+    expect(getCapabilities('opencode-go')).toBe(CAPABILITIES_BY_PROVIDER['opencode-go']);
   });
 });

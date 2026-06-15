@@ -35,10 +35,14 @@ interface MirrorContext {
  *   - `parent_tool_use_id` synthesises to `'__opencode_subagent__'`
  *     when a sub-agent block is emitted (currently never, but the field
  *     is reserved for future `AgentPart`s).
- *   - `model` on `assistant` is the canonical `'opencode/<modelID>'`
- *     string so context-usage attribution stays unambiguous.
+ *   - `model` on `assistant` is the canonical `'opencode/<modelID>'` or
+ *     `'opencode-go/<modelID>'` string so context-usage attribution stays
+ *     unambiguous.
  */
-function unifiedToTranscriptEntry(unified: UnifiedMessage): {
+function unifiedToTranscriptEntry(
+  unified: UnifiedMessage,
+  providerName: 'opencode' | 'opencode-go',
+): {
   uuid: string;
   type: string;
   timestamp: string;
@@ -57,10 +61,11 @@ function unifiedToTranscriptEntry(unified: UnifiedMessage): {
     case 'assistant': {
       // OpenCode reports `modelID` (bare, like `kimi-k2.6`); we re-prefix
       // to the canonical persisted form for unambiguous attribution.
+      // Accept both `opencode/` and `opencode-go/` prefixes as already-canonical.
       const canonicalModel = unified.model
-        ? unified.model.startsWith('opencode/')
+        ? unified.model.startsWith('opencode/') || unified.model.startsWith('opencode-go/')
           ? unified.model
-          : `opencode/${unified.model}`
+          : `${providerName}/${unified.model}`
         : null;
       return {
         uuid: unified.id,
@@ -151,15 +156,16 @@ function unifiedToTranscriptEntry(unified: UnifiedMessage): {
 export async function mirrorOpenCodeEvent(
   ctx: MirrorContext,
   unified: UnifiedMessage,
+  providerName: 'opencode' | 'opencode-go',
 ): Promise<void> {
-  const entry = unifiedToTranscriptEntry(unified);
+  const entry = unifiedToTranscriptEntry(unified, providerName);
   if (!entry) return;
   await sqliteSessionStore.append(
     {
       projectKey: resolveProjectKey(ctx.projectFolderPath),
       sessionId: ctx.providerSessionId,
       subpath: '',
-      provider: 'opencode',
+      provider: providerName,
     },
     [entry],
   );
