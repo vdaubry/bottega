@@ -443,6 +443,44 @@ describe('Settings Component', () => {
       expect(screen.getByText('Download Export')).toBeInTheDocument();
     });
 
+    it('checkbox toggles project inclusion', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      const checkboxes = screen.getAllByRole('checkbox');
+      expect(checkboxes).toHaveLength(2);
+
+      const firstCheckbox = checkboxes[0];
+      expect(firstCheckbox).toBeChecked();
+
+      fireEvent.click(firstCheckbox);
+      expect(firstCheckbox).not.toBeChecked();
+    });
+
+    it('hides dropdown when project is unchecked', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      const checkboxes = screen.getAllByRole('checkbox');
+      expect(screen.getAllByRole('combobox')).toHaveLength(2);
+
+      fireEvent.click(checkboxes[0]);
+      const selects = screen.getAllByRole('combobox');
+      expect(selects).toHaveLength(1);
+    });
+
     it('calls API with correct params when download is clicked', async () => {
       const mockResponse = {
         ok: true,
@@ -468,7 +506,7 @@ describe('Settings Component', () => {
       fireEvent.click(screen.getByText('Download Export'));
 
       await waitFor(() => {
-        expect(corpusSpy).toHaveBeenCalled();
+        expect(corpusSpy).toHaveBeenCalledWith([], [1, 2]);
       });
 
       corpusSpy.mockRestore();

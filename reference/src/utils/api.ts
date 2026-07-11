@@ -718,10 +718,16 @@ export const api = {
 
   // Corpus export
   export: {
-    corpus: (includeMessageProjects: number[] = []): TypedFetch<ExportCorpusResponse> => {
+    corpus: (
+      includeMessageProjects: number[] = [],
+      projectIds?: number[],
+    ): TypedFetch<ExportCorpusResponse> => {
       const params = new URLSearchParams();
       if (includeMessageProjects.length > 0) {
         params.set('includeMessageProjects', includeMessageProjects.join(','));
+      }
+      if (projectIds && projectIds.length > 0) {
+        params.set('projectIds', projectIds.join(','));
       }
       return authenticatedFetch<ExportCorpusResponse>(
         `/api/export/corpus?${params.toString()}`

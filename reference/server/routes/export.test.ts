@@ -333,6 +333,36 @@ describe('GET /api/export/corpus', () => {
     expect(res.body.projects).toEqual([]);
   });
 
+  it('filters projects when projectIds param is provided', async () => {
+    mockProjectsDb.getAll.mockReturnValue([
+      {
+        id: 1,
+        user_id: testUserId,
+        name: 'Project 1',
+        repo_folder_path: '/home/proj1',
+        created_at: '2024-01-01T00:00:00.000Z',
+        updated_at: '2024-01-02T00:00:00.000Z',
+      },
+      {
+        id: 2,
+        user_id: testUserId,
+        name: 'Project 2',
+        repo_folder_path: '/home/proj2',
+        created_at: '2024-01-01T00:00:00.000Z',
+        updated_at: '2024-01-02T00:00:00.000Z',
+      },
+    ]);
+    mockTasksDb.getByProject.mockReturnValue([]);
+    mockConversationsDb.getByTask.mockReturnValue([]);
+
+    const res = await request(app).get('/api/export/corpus?projectIds=2');
+
+    expect(res.status).toBe(200);
+    expect(res.body.projects).toHaveLength(1);
+    expect(res.body.projects[0].id).toBe(2);
+    expect(res.body.projects[0].name).toBe('Project 2');
+  });
+
   it('returns 200 for a project with no tasks', async () => {
     mockProjectsDb.getAll.mockReturnValue([
       {

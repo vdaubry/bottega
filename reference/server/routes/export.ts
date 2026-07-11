@@ -30,7 +30,20 @@ router.get(
         }
       }
 
-      const projects = projectsDb.getAll(userId);
+      const rawProjectIds = req.query.projectIds as string | undefined;
+      let projectIdFilter: Set<number> | null = null;
+      if (rawProjectIds) {
+        projectIdFilter = new Set<number>();
+        for (const part of rawProjectIds.split(',')) {
+          const id = parseInt(part.trim(), 10);
+          if (!isNaN(id)) projectIdFilter.add(id);
+        }
+      }
+
+      let projects = projectsDb.getAll(userId);
+      if (projectIdFilter) {
+        projects = projects.filter((p) => projectIdFilter!.has(p.id));
+      }
       const exportProjects = projects.map((project) => {
         const projectKey = resolveProjectKey(project.repo_folder_path);
         const tasks = tasksDb.getByProject(project.id);

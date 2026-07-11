@@ -52,6 +52,7 @@ function Settings({
   const [projectSortOrder, setProjectSortOrder] = useState('name');
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [includeMessageProjects, setIncludeMessageProjects] = useState<Set<number>>(new Set());
+  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<number>>(new Set(projects.map(p => p.id)));
   const [isExporting, setIsExporting] = useState(false);
 
   // Code Editor settings
@@ -91,6 +92,8 @@ function Settings({
       void loadSettings();
       setActiveTab(initialTab);
       setProfileError(null);
+      setSelectedProjectIds(new Set(projects.map(p => p.id)));
+      setIncludeMessageProjects(new Set());
     }
      
   }, [isOpen, initialTab]);
@@ -144,7 +147,7 @@ function Settings({
   const handleExport = async () => {
     setIsExporting(true);
     try {
-      const res = await api.export.corpus(Array.from(includeMessageProjects));
+      const res = await api.export.corpus(Array.from(includeMessageProjects), Array.from(selectedProjectIds));
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as ApiError;
         throw new Error(body.error || `Export failed: ${res.status}`);
@@ -786,24 +789,44 @@ function Settings({
                 </p>
 
                 {projects.map((project) => (
-                  <div key={project.id} className="flex items-center justify-between bg-gray-50 dark:bg-gray-900/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                    <span className="font-medium text-foreground">{project.name}</span>
-                    <select
-                      value={includeMessageProjects.has(project.id) ? 'full' : 'metadata'}
-                      onChange={(e) => {
-                        const next = new Set(includeMessageProjects);
-                        if (e.target.value === 'full') {
-                          next.add(project.id);
-                        } else {
-                          next.delete(project.id);
-                        }
-                        setIncludeMessageProjects(next);
-                      }}
-                      className="text-sm bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 text-gray-900 dark:text-gray-100 rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2"
-                    >
-                      <option value="metadata">Metadata only</option>
-                      <option value="full">Include full messages</option>
-                    </select>
+                  <div key={project.id} className="bg-gray-50 dark:bg-gray-900/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                    <div className="flex items-center justify-between">
+                      <label className="flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedProjectIds.has(project.id)}
+                          onChange={() => {
+                            const next = new Set(selectedProjectIds);
+                            if (next.has(project.id)) {
+                              next.delete(project.id);
+                            } else {
+                              next.add(project.id);
+                            }
+                            setSelectedProjectIds(next);
+                          }}
+                          className="w-4 h-4 text-blue-600 bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600 rounded focus:ring-blue-500 focus:ring-2 checked:bg-blue-600 dark:checked:bg-blue-600"
+                        />
+                        <span className="font-medium text-foreground">{project.name}</span>
+                      </label>
+                      {selectedProjectIds.has(project.id) && (
+                        <select
+                          value={includeMessageProjects.has(project.id) ? 'full' : 'metadata'}
+                          onChange={(e) => {
+                            const next = new Set(includeMessageProjects);
+                            if (e.target.value === 'full') {
+                              next.add(project.id);
+                            } else {
+                              next.delete(project.id);
+                            }
+                            setIncludeMessageProjects(next);
+                          }}
+                          className="text-sm bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 text-gray-900 dark:text-gray-100 rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2"
+                        >
+                          <option value="metadata">Metadata only</option>
+                          <option value="full">Include full messages</option>
+                        </select>
+                      )}
+                    </div>
                   </div>
                 ))}
                 {projects.length === 0 && (
