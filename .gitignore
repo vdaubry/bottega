@@ -11,6 +11,9 @@
 .serena/
 .mcp.json
 
+# Playwright CLI testing artifacts
+.playwright-cli/
+
 # Editor
 .vscode/
 .idea/

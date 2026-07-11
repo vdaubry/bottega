@@ -136,6 +136,7 @@ import type {
   GetUserAgentModelSettingsResponse,
   UpdateUserAgentModelSettingsResponse,
 } from '../../shared/api/userAgentModelSettings';
+import type { ExportCorpusResponse } from '../../shared/api/export';
 import type { AgentModelSettings } from '../../shared/types/agentModelSettings';
 
 // `TypedFetch<T>` keeps all `Response` ergonomics (`.ok`, `.status`,
@@ -201,16 +202,6 @@ export const authenticatedFetch = <T = unknown>(
     return response;
   });
 };
-
-const createConversationWithMessage = (
-  kind: 'tasks',
-  id: number,
-  payload: CreateConversationRequest
-): TypedFetch<CreateConversationResponse> =>
-  authenticatedFetch<CreateConversationResponse>(`/api/${kind}/${id}/conversations`, {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
 
 // API endpoints
 export const api = {
@@ -518,12 +509,14 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ provider, model }),
       }),
-    // Create conversation with first message - returns conversation with real claude_conversation_id
     createWithMessage: (
       taskId: number,
       payload: CreateConversationRequest
     ): TypedFetch<CreateConversationResponse> =>
-      createConversationWithMessage('tasks', taskId, payload),
+      authenticatedFetch<CreateConversationResponse>(`/api/tasks/${taskId}/conversations`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
     get: (id: number): TypedFetch<GetConversationResponse> =>
       authenticatedFetch<GetConversationResponse>(`/api/conversations/${id}`),
     delete: (id: number): TypedFetch<DeleteConversationResponse> =>
@@ -721,6 +714,19 @@ export const api = {
       authenticatedFetch<ConnectedProvidersResponse>(
         '/api/user-agent-model-settings/connected-providers',
       ),
+  },
+
+  // Corpus export
+  export: {
+    corpus: (includeMessageProjects: number[] = []): TypedFetch<ExportCorpusResponse> => {
+      const params = new URLSearchParams();
+      if (includeMessageProjects.length > 0) {
+        params.set('includeMessageProjects', includeMessageProjects.join(','));
+      }
+      return authenticatedFetch<ExportCorpusResponse>(
+        `/api/export/corpus?${params.toString()}`
+      );
+    },
   },
 
   // Settings (global)
