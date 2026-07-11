@@ -55,7 +55,7 @@ vi.mock('./documentation.js', () => ({
 
 import { seedDemoProject, isDemoAlreadySeeded } from './demoSeeder.js';
 
-const TMP_PREFIX = path.join(os.tmpdir(), 'demoseeder-');
+const TMP_PREFIX = path.join(os.tmpdir(), 'demoseederXXXXXX');
 
 function mkTmpExample(): string {
   const dir = fs.mkdtempSync(TMP_PREFIX);
@@ -88,7 +88,7 @@ describe('demoSeeder', () => {
 
     sourceDir = mkTmpExample();
     targetDir = mkTmpTarget();
-    cleanup.push(path.dirname(sourceDir), path.dirname(targetDir));
+    cleanup.push(sourceDir, path.dirname(targetDir));
   });
 
   afterEach(() => {

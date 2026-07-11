@@ -57,28 +57,28 @@ export function ProviderModelPicker({
           ))}
         </select>
       </label>
-      <label className="flex items-center gap-2">
-        <span className="text-gray-500 dark:text-gray-400">Model</span>
-        <select
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          disabled={disabled || (provider === 'opencode' && loadingOpenCodeModels)}
-          data-testid={`${testIdPrefix}-model-select`}
-          className={SELECT_CLASS}
-        >
-          {provider === 'opencode' && modelOptions.length === 0 ? (
-            <option value="">
-              {loadingOpenCodeModels ? 'Loading models…' : 'No models — connect an OpenCode key'}
-            </option>
-          ) : (
-            modelOptions.map((m) => (
-              <option key={m.value} value={m.value}>
-                {m.label}
-              </option>
-            ))
-          )}
-        </select>
-      </label>
+       <label className="flex items-center gap-2">
+         <span className="text-gray-500 dark:text-gray-400">Model</span>
+         <select
+           value={model}
+           onChange={(e) => setModel(e.target.value)}
+           disabled={disabled || ((provider === 'opencode' || provider === 'opencode-go') && loadingOpenCodeModels)}
+           data-testid={`${testIdPrefix}-model-select`}
+           className={SELECT_CLASS}
+         >
+           {(provider === 'opencode' || provider === 'opencode-go') && modelOptions.length === 0 ? (
+             <option value="">
+               {loadingOpenCodeModels ? 'Loading models…' : 'No models — connect an OpenCode key'}
+             </option>
+           ) : (
+             modelOptions.map((m) => (
+               <option key={m.value} value={m.value}>
+                 {m.label}
+               </option>
+             ))
+           )}
+         </select>
+       </label>
     </div>
   );
 }

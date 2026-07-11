@@ -282,6 +282,8 @@ export const api = {
       }),
     models: (): TypedFetch<OpenCodeModelsResponse> =>
       authenticatedFetch<OpenCodeModelsResponse>('/api/opencode-auth/models'),
+    modelsGo: (): TypedFetch<OpenCodeModelsResponse> =>
+      authenticatedFetch<OpenCodeModelsResponse>('/api/opencode-auth/models-go'),
   },
 
   codexAuth: {

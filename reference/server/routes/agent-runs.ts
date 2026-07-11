@@ -119,7 +119,7 @@ router.post(
         const providerLabel =
           error.provider === 'openai'
             ? 'OpenAI'
-            : error.provider === 'opencode'
+            : error.provider === 'opencode' || error.provider === 'opencode-go'
               ? 'OpenCode'
               : 'Claude';
         res.status(403).json({

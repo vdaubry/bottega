@@ -46,9 +46,10 @@ export function _resetForTests(): void {
   STORES.clear();
 }
 
-// Default registration: all three stores are wired in at module load.
-// Anthropic is the legacy path; OpenAI / Codex and OpenCode are the
-// later tenants.
+// Default registration: all stores are wired in at module load.
+// Anthropic is the legacy path; OpenAI / Codex are later tenants.
+// OpenCode and OpenCode Go share the same credential store (single Zen API key).
 registerCredentialStore('anthropic', anthropicCredentialStore);
 registerCredentialStore('openai', codexCredentialStore);
 registerCredentialStore('opencode', openCodeCredentialStore);
+registerCredentialStore('opencode-go', openCodeCredentialStore);

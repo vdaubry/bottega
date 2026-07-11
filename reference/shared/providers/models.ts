@@ -60,7 +60,7 @@ export type OpenCodeModel = `opencode/${string}`;
 export const OPENCODE_EFFORTS = [] as const;
 export type OpenCodeEffort = never;
 
-export const PROVIDERS = ['anthropic', 'openai', 'opencode'] as const;
+export const PROVIDERS = ['anthropic', 'openai', 'opencode', 'opencode-go'] as const;
 
 /**
  * Return the model list for a provider. Used by the settings UI and
@@ -70,13 +70,13 @@ export const PROVIDERS = ['anthropic', 'openai', 'opencode'] as const;
 export function modelsForProvider(provider: Provider): readonly string[] {
   if (provider === 'anthropic') return ANTHROPIC_MODELS;
   if (provider === 'openai') return OPENAI_MODELS;
-  return OPENCODE_MODELS;
+  return OPENCODE_MODELS; // Both 'opencode' and 'opencode-go' use the live catalog
 }
 
 export function effortsForProvider(provider: Provider): readonly string[] {
   if (provider === 'anthropic') return ANTHROPIC_EFFORTS;
   if (provider === 'openai') return OPENAI_EFFORTS;
-  return OPENCODE_EFFORTS;
+  return OPENCODE_EFFORTS; // Both 'opencode' and 'opencode-go' have no efforts
 }
 
 export function isProvider(value: unknown): value is Provider {
@@ -107,6 +107,13 @@ export function isOpenCodeModel(value: unknown): value is OpenCodeModel {
   return typeof value === 'string' && value.startsWith('opencode/') && value.length > 'opencode/'.length;
 }
 
+// Prefix-only check for the Go provider catalog. Go models are stored as
+// `opencode-go/<bare-modelID>` — distinct from the Zen `opencode/<id>` shape.
+export type OpenCodeGoModel = `opencode-go/${string}`;
+export function isOpenCodeGoModel(value: unknown): value is OpenCodeGoModel {
+  return typeof value === 'string' && value.startsWith('opencode-go/') && value.length > 'opencode-go/'.length;
+}
+
 export function isOpenCodeEffort(value: unknown): value is OpenCodeEffort {
   // OpenCode has no efforts — nothing satisfies this guard.
   void value;
@@ -119,11 +126,11 @@ export function isModelForProvider(
   model: unknown,
 ): model is string {
   if (typeof model !== 'string') return false;
-  // OpenCode is the special case: the Zen catalog is owned upstream
-  // and fetched live, so we only enforce the `opencode/<id>` prefix
-  // shape. Anthropic and OpenAI use a static enum so we still gate
-  // against the canonical list.
+  // OpenCode providers use dynamic catalogs owned upstream; we only enforce
+  // the correct prefix shape for each variant rather than a static enum.
+  // Runtime validation of the bare model ID happens at the SDK boundary.
   if (provider === 'opencode') return isOpenCodeModel(model);
+  if (provider === 'opencode-go') return isOpenCodeGoModel(model);
   return modelsForProvider(provider).includes(model);
 }
 

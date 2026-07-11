@@ -54,6 +54,8 @@ interface MessageState {
   finished: boolean;
   /** Final AssistantMessage carried for usage at flush time. */
   final?: AssistantMessage;
+  /** Tracks which tool parts have already emitted their tool_use. */
+  toolsWithUseEmitted: Set<string>;
 }
 
 export interface OpenCodeEventMapper {
@@ -72,6 +74,7 @@ export interface OpenCodeEventMapper {
  */
 export function createOpenCodeEventMapper(
   providerSessionId: string,
+  providerName: 'opencode' | 'opencode-go',
 ): OpenCodeEventMapper {
   const messages = new Map<string, MessageState>();
 
@@ -84,6 +87,7 @@ export function createOpenCodeEventMapper(
         reasoningByPart: new Map(),
         reasoningPartOrder: [],
         finished: false,
+        toolsWithUseEmitted: new Set(),
       };
       messages.set(messageID, s);
     }
@@ -112,7 +116,7 @@ export function createOpenCodeEventMapper(
       const assistant: UnifiedAssistantMessage = {
         type: 'assistant',
         id: messageID,
-        provider: 'opencode',
+        provider: providerName,
         providerSessionId,
         raw,
         text,
@@ -127,7 +131,7 @@ export function createOpenCodeEventMapper(
       const thinking: UnifiedAssistantThinkingMessage = {
         type: 'assistant_thinking',
         id: `${messageID}:thinking`,
-        provider: 'opencode',
+        provider: providerName,
         providerSessionId,
         raw,
         text: reasoning,
@@ -160,53 +164,65 @@ export function createOpenCodeEventMapper(
   }
 
   function mapToolPart(part: ToolPart, raw: unknown): UnifiedMessage[] {
+    const messageState = stateFor(part.messageID);
     const toolUseId = part.callID;
     const toolName = part.tool;
     const state = part.state;
-    const toolUse: UnifiedToolUseMessage = {
-      type: 'tool_use',
-      id: `${part.id}:use`,
-      provider: 'opencode',
-      providerSessionId,
-      raw,
-      toolName,
-      toolUseId,
-      toolInput: 'input' in state ? state.input : {},
-    };
+    const messages: UnifiedMessage[] = [];
+
+    // Emit tool_use only if we haven't already emitted it for this part.
+    if (!messageState.toolsWithUseEmitted.has(part.id)) {
+      const toolUse: UnifiedToolUseMessage = {
+        type: 'tool_use',
+        id: `${part.id}:use`,
+        provider: providerName,
+        providerSessionId,
+        raw,
+        toolName,
+        toolUseId,
+        toolInput: 'input' in state ? state.input : {},
+      };
+      messages.push(toolUse);
+      // Mark that we've emitted the tool_use for this part.
+      messageState.toolsWithUseEmitted.add(part.id);
+    }
+
     if (state.status === 'pending' || state.status === 'running') {
-      return [toolUse];
+      return messages;
     }
     if (state.status === 'completed') {
       const result: UnifiedToolResultMessage = {
         type: 'tool_result',
         id: `${part.id}:result`,
-        provider: 'opencode',
+        provider: providerName,
         providerSessionId,
         raw,
         toolUseId,
         content: state.output,
       };
-      return [toolUse, result];
+      messages.push(result);
+      return messages;
     }
     // status === 'error'
     const errResult: UnifiedToolResultMessage = {
       type: 'tool_result',
       id: `${part.id}:result`,
-      provider: 'opencode',
+      provider: providerName,
       providerSessionId,
       raw,
       toolUseId,
       content: state.error,
       isError: true,
     };
-    return [toolUse, errResult];
+    messages.push(errResult);
+    return messages;
   }
 
   function mapFilePart(part: FilePart, raw: unknown): UnifiedMessage[] {
     const result: UnifiedToolResultMessage = {
       type: 'tool_result',
       id: `${part.id}:file`,
-      provider: 'opencode',
+      provider: providerName,
       providerSessionId,
       raw,
       toolUseId: part.id,
@@ -224,7 +240,7 @@ export function createOpenCodeEventMapper(
     const result: UnifiedResultMessage = {
       type: 'result',
       id: `${part.id}:step-finish`,
-      provider: 'opencode',
+      provider: providerName,
       providerSessionId,
       raw,
       isError: false,
@@ -280,7 +296,7 @@ export function createOpenCodeEventMapper(
       const err: UnifiedResultMessage = {
         type: 'result',
         id: `${assistant.id}:error`,
-        provider: 'opencode',
+        provider: providerName,
         providerSessionId,
         raw: event,
         isError: true,
@@ -295,7 +311,7 @@ export function createOpenCodeEventMapper(
     const result: UnifiedResultMessage = {
       type: 'result',
       id: `session-idle:${event.properties.sessionID}:${Math.random()}`,
-      provider: 'opencode',
+      provider: providerName,
       providerSessionId,
       raw: event,
       isError: false,
@@ -309,7 +325,7 @@ export function createOpenCodeEventMapper(
     const result: UnifiedResultMessage = {
       type: 'result',
       id: `session-error:${event.properties.sessionID ?? 'unknown'}:${Math.random()}`,
-      provider: 'opencode',
+      provider: providerName,
       providerSessionId,
       raw: event,
       isError: true,
@@ -347,8 +363,9 @@ export function createOpenCodeEventMapper(
 export function mapOpenCodeEvent(
   event: Event,
   providerSessionId: string,
+  providerName: 'opencode' | 'opencode-go' = 'opencode',
 ): UnifiedMessage[] {
-  return createOpenCodeEventMapper(providerSessionId).map(event);
+  return createOpenCodeEventMapper(providerSessionId, providerName).map(event);
 }
 
 /**
@@ -359,11 +376,12 @@ export function mapOpenCodeEvent(
 export function asUnifiedSystem(
   event: Event,
   providerSessionId: string,
+  providerName: 'opencode' | 'opencode-go' = 'opencode',
 ): UnifiedSystemMessage {
   return {
     type: 'system',
     id: `opencode_event:${event.type}:${Math.random()}`,
-    provider: 'opencode',
+    provider: providerName,
     providerSessionId,
     raw: event,
     subtype: event.type,

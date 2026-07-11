@@ -78,7 +78,7 @@ describe('useProviderModelSelection', () => {
     const { result } = renderHook(() => useProviderModelSelection());
 
     expect(result.current.provider).toBe('anthropic');
-    expect(result.current.availableProviders).toEqual(['anthropic', 'openai', 'opencode']);
+    expect(result.current.availableProviders).toEqual(['anthropic', 'openai', 'opencode', 'opencode-go']);
   });
 
   it('keeps a manual provider pick instead of snapping back to the connected default', async () => {
