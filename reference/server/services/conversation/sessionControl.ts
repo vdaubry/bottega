@@ -28,7 +28,12 @@ import type { Provider } from '@shared/providers/types';
 export async function abortSession(sessionId: string): Promise<boolean> {
   const session = activeSessions.get(sessionId);
   if (!session) {
-    console.log(`[ConversationAdapter] Session ${sessionId} not found`);
+    console.log(`[ConversationAdapter] Session ${sessionId} not found in activeSessions`);
+    // Clean up any stale streaming session entry for this ID
+    if (activeStreamingSessions.has(sessionId)) {
+      console.log(`[ConversationAdapter] Cleaning stale activeStreamingSessions entry for ${sessionId}`);
+      activeStreamingSessions.delete(sessionId);
+    }
     return false;
   }
 

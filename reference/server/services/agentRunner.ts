@@ -238,21 +238,33 @@ export async function startAgentRun(
   // Start conversation via adapter
   // The adapter handles all lifecycle events (streaming-started, streaming-ended,
   // agent status updates, notifications, and chaining)
-  const { claudeSessionId } = await startConversation(taskId, message, {
-    broadcastFn,
-    broadcastToTaskSubscribersFn,
-    userId: effectiveUserId,
-    customSystemPrompt: contextPrompt,
-    permissionMode: 'bypassPermissions',
-    conversationId: conversation.id,
-    provider,
-    model,
-    ...(effort !== null ? { effort } : {}),
-    disallowedTools,
-    videoConfig: videoConfig,
-  });
+  try {
+    const { claudeSessionId } = await startConversation(taskId, message, {
+      broadcastFn,
+      broadcastToTaskSubscribersFn,
+      userId: effectiveUserId,
+      customSystemPrompt: contextPrompt,
+      permissionMode: 'bypassPermissions',
+      conversationId: conversation.id,
+      provider,
+      model,
+      ...(effort !== null ? { effort } : {}),
+      disallowedTools,
+      videoConfig: videoConfig,
+    });
 
-  return { agentRun, conversation, claudeSessionId };
+    return { agentRun, conversation, claudeSessionId };
+  } catch (error) {
+    console.error(
+      `[AgentRunner] startConversation failed for task ${taskId}, agent run ${agentRun.id}:`,
+      error,
+    );
+    agentRunsDb.updateStatus(agentRun.id, 'failed');
+    console.log(
+      `[AgentRunner] Marked agent run ${agentRun.id} as failed after startConversation error`,
+    );
+    throw error;
+  }
 }
 
 /**

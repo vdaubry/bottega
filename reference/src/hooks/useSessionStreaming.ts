@@ -234,6 +234,8 @@ export function useSessionStreaming({
 
   const handleClaudeError = useCallback((error: unknown) => {
     console.error('[useSessionStreaming] Claude error:', error);
+    const message = typeof error === 'string' ? error : 'Chat error occurred';
+    onBusyRef.current?.(message);
     setIsStreaming(false);
     setIsSending(false);
     setClaudeStatus(null);
