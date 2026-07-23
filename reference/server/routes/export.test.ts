@@ -28,6 +28,10 @@ vi.mock('../services/conversationContentStore.js', () => ({
   }),
 }));
 
+vi.mock('../services/documentation.js', () => ({
+  readTaskDoc: vi.fn(() => '# Task description\n\nThis is the task description content.'),
+}));
+
 import exportRoutes from './export.js';
 
 describe('GET /api/export/corpus', () => {

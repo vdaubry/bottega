@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import { db, projectsDb, tasksDb, conversationsDb } from '../database/db.js';
 import { resolveProjectKey } from '../services/conversationContentStore.js';
+import { readTaskDoc } from '../services/documentation.js';
 import type { ApiError } from '../../shared/api/_common.js';
 import type { ExportCorpusResponse, ExportConversation } from '../../shared/api/export.js';
 
@@ -79,9 +80,12 @@ router.get(
             return base;
           });
 
+          const description = readTaskDoc(project.id, task.id);
+
           return {
             id: task.id,
             title: task.title,
+            description,
             status: task.status,
             completed_at: task.completed_at,
             created_at: task.created_at,

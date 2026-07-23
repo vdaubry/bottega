@@ -16,6 +16,7 @@ export interface ExportProject {
 export interface ExportTask {
   id: number;
   title: string | null;
+  description: string;
   status: string;
   completed_at: string | null;
   created_at: string;
