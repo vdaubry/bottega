@@ -68,7 +68,7 @@ export async function startConversation(
   if (options.provider === 'openai') {
     return startCodexConversation(taskId, message, options);
   }
-  if (options.provider === 'opencode') {
+  if (options.provider === 'opencode' || options.provider === 'opencode-go') {
     return startOpenCodeConversation(taskId, message, options);
   }
 
@@ -390,7 +390,7 @@ export async function sendMessage(
   if (resolvedProvider === 'openai') {
     return sendCodexMessage(conversationId, message, options);
   }
-  if (resolvedProvider === 'opencode') {
+  if (resolvedProvider === 'opencode' || resolvedProvider === 'opencode-go') {
     return sendOpenCodeMessage(conversationId, message, options);
   }
 

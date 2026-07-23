@@ -25,7 +25,7 @@ interface ActionResult {
 
 function DashboardPage() {
   const navigate = useNavigate();
-  const { createProject } = useTaskContext();
+  const { projects, createProject } = useTaskContext();
 
   // UI state
   const [isMobile, setIsMobile] = useState(false);
@@ -102,7 +102,7 @@ function DashboardPage() {
       <Settings
         isOpen={showSettings}
         onClose={() => setShowSettings(false)}
-        projects={[]}
+        projects={projects}
         initialTab={settingsInitialTab}
       />
 

@@ -98,6 +98,8 @@ temp/
 
 # Vite
 .vite/
+.vitest-tmp/
+.vitest-cache/
 
 # Local Netlify folder
 .netlify

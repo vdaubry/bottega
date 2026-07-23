@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import Settings from './Settings';
+import type { TypedResponse } from '../../shared/api/_common';
+import type { ExportCorpusResponse } from '../../shared/api/export';
 
 // Mock ThemeContext
 vi.mock('../contexts/ThemeContext', () => ({
@@ -29,6 +31,8 @@ vi.mock('lucide-react', () => ({
   AlertTriangle: () => <span data-testid="icon-alert" />,
   Moon: () => <span data-testid="icon-moon" />,
   Sun: () => <span data-testid="icon-sun" />,
+  User: () => <span data-testid="icon-user" />,
+  Download: () => <span data-testid="icon-download" />,
 }));
 
 import { useTheme } from '../contexts/ThemeContext';
@@ -335,6 +339,177 @@ describe('Settings Component', () => {
 
       expect(screen.getByText('Tool Pattern Examples:')).toBeInTheDocument();
       expect(screen.getByText(/"Bash\(git log:\*\)"/)).toBeInTheDocument();
+    });
+  });
+
+  describe('Export Tab', () => {
+    const mockProjects = [
+      {
+        id: 1,
+        user_id: 1,
+        name: 'Project Alpha',
+        repo_folder_path: '/path/alpha',
+        subproject_path: null,
+        active_worktree_task_id: null,
+        serve_symlink_path: null,
+        systemd_service_name: null,
+        app_url: null,
+        created_at: '2024-01-01T00:00:00.000Z',
+        updated_at: '2024-01-02T00:00:00.000Z',
+      },
+      {
+        id: 2,
+        user_id: 1,
+        name: 'Project Beta',
+        repo_folder_path: '/path/beta',
+        subproject_path: null,
+        active_worktree_task_id: null,
+        serve_symlink_path: null,
+        systemd_service_name: null,
+        app_url: null,
+        created_at: '2024-01-01T00:00:00.000Z',
+        updated_at: '2024-01-02T00:00:00.000Z',
+      },
+    ];
+
+    it('renders Export tab button', () => {
+      render(<Settings isOpen={true} onClose={vi.fn()} />);
+
+      expect(screen.getByTestId('settings-tab-export')).toBeInTheDocument();
+      expect(screen.getByText('Export')).toBeInTheDocument();
+    });
+
+    it('shows project list when Export tab is active', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      expect(screen.getByText('Export Data')).toBeInTheDocument();
+      expect(screen.getByText('Project Alpha')).toBeInTheDocument();
+      expect(screen.getByText('Project Beta')).toBeInTheDocument();
+    });
+
+    it('renders dropdown for each project', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      const selects = screen.getAllByRole('combobox');
+      expect(selects).toHaveLength(2);
+    });
+
+    it('toggles dropdown state when changed', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      const selects = screen.getAllByRole('combobox');
+      const firstSelect = selects[0];
+
+      expect(firstSelect).toHaveValue('metadata');
+
+      fireEvent.change(firstSelect, { target: { value: 'full' } });
+      expect(firstSelect).toHaveValue('full');
+
+      fireEvent.change(firstSelect, { target: { value: 'metadata' } });
+      expect(firstSelect).toHaveValue('metadata');
+    });
+
+    it('renders Download Export button', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      expect(screen.getByText('Download Export')).toBeInTheDocument();
+    });
+
+    it('checkbox toggles project inclusion', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      const checkboxes = screen.getAllByRole('checkbox');
+      expect(checkboxes).toHaveLength(2);
+
+      const firstCheckbox = checkboxes[0];
+      expect(firstCheckbox).toBeChecked();
+
+      fireEvent.click(firstCheckbox);
+      expect(firstCheckbox).not.toBeChecked();
+    });
+
+    it('hides dropdown when project is unchecked', () => {
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      const checkboxes = screen.getAllByRole('checkbox');
+      expect(screen.getAllByRole('combobox')).toHaveLength(2);
+
+      fireEvent.click(checkboxes[0]);
+      const selects = screen.getAllByRole('combobox');
+      expect(selects).toHaveLength(1);
+    });
+
+    it('calls API with correct params when download is clicked', async () => {
+      const mockResponse = {
+        ok: true,
+        json: () => Promise.resolve({
+          exported_at: '2024-01-01T00:00:00.000Z',
+          exported_by: { id: 1, username: 'testuser' },
+          projects: [],
+        } as ExportCorpusResponse),
+      } as TypedResponse<ExportCorpusResponse>;
+
+      const { api } = await import('../utils/api');
+      const corpusSpy = vi.spyOn(api.export, 'corpus').mockResolvedValue(mockResponse);
+
+      render(
+        <Settings
+          isOpen={true}
+          onClose={vi.fn()}
+          projects={mockProjects as any}
+          initialTab="export"
+        />
+      );
+
+      fireEvent.click(screen.getByText('Download Export'));
+
+      await waitFor(() => {
+        expect(corpusSpy).toHaveBeenCalledWith([], [1, 2]);
+      });
+
+      corpusSpy.mockRestore();
     });
   });
 });

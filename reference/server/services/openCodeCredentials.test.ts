@@ -91,25 +91,30 @@ describe('openCodeCredentials', () => {
     expect(() => resolveOpenCodeDataDir('foo')).toThrow(OpenCodeCredentialsError);
   });
 
-  it('writes auth.json with mode 0600 and the expected single-record shape', () => {
+  it('writes auth.json with mode 0600 and the expected dual-provider shape', () => {
     const authPath = provisionAuth(42, 'sk-zen-abc');
     const stat = fs.statSync(authPath);
     expect(stat.mode & 0o777).toBe(0o600);
     const parsed = JSON.parse(fs.readFileSync(authPath, 'utf8')) as unknown;
-    expect(parsed).toEqual({ opencode: { type: 'api', key: 'sk-zen-abc' } });
+    expect(parsed).toEqual({
+      opencode: { type: 'api', key: 'sk-zen-abc' },
+      'opencode-go': { type: 'api', key: 'sk-zen-abc' },
+    });
   });
 
-  it('readOpenCodeAuth round-trips the payload', () => {
+  it('readOpenCodeAuth round-trips the payload with both provider entries', () => {
     provisionAuth(42, 'sk-zen-roundtrip');
     const out = readOpenCodeAuth(42);
     expect(out.opencode.key).toBe('sk-zen-roundtrip');
     expect(out.opencode.type).toBe('api');
+    expect(out['opencode-go'].key).toBe('sk-zen-roundtrip');
+    expect(out['opencode-go'].type).toBe('api');
   });
 
   it('readOpenCodeAuth rejects an empty JSON object', () => {
     ensureOpenCodeDataDir(42);
     fs.writeFileSync(resolveOpenCodeAuthPath(42), JSON.stringify({}), { mode: 0o600 });
-    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry a Zen API key/);
+    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry.*API key/);
   });
 
   it('readOpenCodeAuth rejects an unrecognised provider record', () => {
@@ -119,22 +124,45 @@ describe('openCodeCredentials', () => {
       JSON.stringify({ moonshot: { type: 'api', key: 'bad' } }),
       { mode: 0o600 },
     );
-    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry a Zen API key/);
+    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry.*API key/);
   });
 
-  it('readOpenCodeAuth rejects a multi-key auth.json even when the opencode entry is valid (R15 defence-in-depth)', () => {
+  it('readOpenCodeAuth rejects when only opencode entry is present (requires both providers)', () => {
     ensureOpenCodeDataDir(42);
     fs.writeFileSync(
       resolveOpenCodeAuthPath(42),
       JSON.stringify({
         opencode: { type: 'api', key: 'sk-zen-ok' },
-        // Stray entry from an earlier draft of the plan that allowed
-        // per-sub-provider keys — must be refused.
+      }),
+      { mode: 0o600 },
+    );
+    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry.*API key/);
+  });
+
+  it('readOpenCodeAuth rejects when only opencode-go entry is present (requires both providers)', () => {
+    ensureOpenCodeDataDir(42);
+    fs.writeFileSync(
+      resolveOpenCodeAuthPath(42),
+      JSON.stringify({
+        'opencode-go': { type: 'api', key: 'sk-zen-ok' },
+      }),
+      { mode: 0o600 },
+    );
+    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry.*API key/);
+  });
+
+  it('readOpenCodeAuth rejects when extra keys are present beyond opencode and opencode-go', () => {
+    ensureOpenCodeDataDir(42);
+    fs.writeFileSync(
+      resolveOpenCodeAuthPath(42),
+      JSON.stringify({
+        opencode: { type: 'api', key: 'sk-zen-ok' },
+        'opencode-go': { type: 'api', key: 'sk-zen-ok' },
         moonshot: { type: 'api', key: 'stale' },
       }),
       { mode: 0o600 },
     );
-    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry a Zen API key/);
+    expect(() => readOpenCodeAuth(42)).toThrow(/does not carry.*API key/);
   });
 
   it('readOpenCodeAuth rejects a malformed JSON file', () => {
@@ -263,5 +291,35 @@ describe('openCodeCredentials', () => {
     } finally {
       (fs as { statSync: typeof fs.statSync }).statSync = original;
     }
+  });
+
+  // Dual-provider tests
+  it('setOpenCodeKey writes both opencode and opencode-go entries with the same key', () => {
+    const { authPath } = setOpenCodeKey(99, 'sk-dual-key');
+    const parsed = JSON.parse(fs.readFileSync(authPath, 'utf8')) as Record<string, unknown>;
+    expect(parsed).toHaveProperty('opencode');
+    expect(parsed).toHaveProperty('opencode-go');
+    expect((parsed['opencode'] as { key: string }).key).toBe('sk-dual-key');
+    expect((parsed['opencode-go'] as { key: string }).key).toBe('sk-dual-key');
+  });
+
+  it('clearOpenCodeKey removes auth.json file entirely', () => {
+    const authPath = provisionAuth(99, 'sk-to-be-cleared');
+    expect(fs.existsSync(authPath)).toBe(true);
+    const cleared = clearOpenCodeKey(99);
+    expect(cleared).toBe(true);
+    expect(fs.existsSync(authPath)).toBe(false);
+  });
+
+  it('clearOpenCodeKey returns false when no auth.json exists', () => {
+    ensureOpenCodeDataDir(99);
+    const cleared = clearOpenCodeKey(99);
+    expect(cleared).toBe(false);
+  });
+
+  it('readOpenCodeAuth accepts exactly both opencode and opencode-go keys (no more, no fewer)', () => {
+    provisionAuth(99, 'sk-both-keys');
+    const auth = readOpenCodeAuth(99);
+    expect(Object.keys(auth).sort()).toEqual(['opencode', 'opencode-go']);
   });
 });

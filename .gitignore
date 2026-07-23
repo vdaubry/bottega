@@ -11,6 +11,9 @@
 .serena/
 .mcp.json
 
+# Playwright CLI testing artifacts
+.playwright-cli/
+
 # Editor
 .vscode/
 .idea/
@@ -23,3 +26,6 @@
 ._*
 Thumbs.db
 ehthumbs.db
+
+node_modules
+reference/server/database/bottega.db

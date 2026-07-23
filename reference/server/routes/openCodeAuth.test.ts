@@ -227,7 +227,7 @@ describe('OpenCode auth routes', () => {
       expect(res.body.models).toHaveLength(2);
       expect(res.body.models[0].id).toBe('opencode/kimi-k2.6');
       expect(res.body.models[1].id).toBe('opencode/qwen3.6-plus');
-      expect(listOpenCodeModels).toHaveBeenCalledWith(42);
+      expect(listOpenCodeModels).toHaveBeenCalledWith(42, 'opencode');
     });
 
     it('returns 500 with the upstream message when listOpenCodeModels throws', async () => {
@@ -241,6 +241,66 @@ describe('OpenCode auth routes', () => {
         new Error('OpenCode server failed to spawn (no Zen credit)'),
       );
       const res = await request(app).get('/api/opencode-auth/models');
+      expect(res.status).toBe(500);
+      expect(res.body.error).toMatch(/spawn/i);
+    });
+  });
+
+  describe('GET /models-go', () => {
+    it('returns an empty list (200) when the user has no key — no error', async () => {
+      vi.mocked(getOpenCodeAuthStatus).mockResolvedValueOnce({
+        authenticated: false,
+        status: 'missing',
+        authPath: '/users/42/auth.json',
+      });
+      const res = await request(app).get('/api/opencode-auth/models-go');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ models: [] });
+      expect(listOpenCodeModels).not.toHaveBeenCalled();
+    });
+
+    it('proxies the live Go catalog when the user is authenticated', async () => {
+      vi.mocked(getOpenCodeAuthStatus).mockResolvedValueOnce({
+        authenticated: true,
+        status: 'authenticated',
+        authPath: '/users/42/auth.json',
+        tokenFingerprint: 'abc123',
+      });
+      vi.mocked(listOpenCodeModels).mockResolvedValueOnce([
+        {
+          id: 'opencode-go/deepseek-r1',
+          bareModelId: 'deepseek-r1',
+          name: 'DeepSeek R1',
+          status: 'active',
+          contextWindow: 64000,
+        },
+        {
+          id: 'opencode-go/qwen3-coder',
+          bareModelId: 'qwen3-coder',
+          name: 'Qwen3 Coder',
+          status: 'active',
+          contextWindow: 128000,
+        },
+      ]);
+      const res = await request(app).get('/api/opencode-auth/models-go');
+      expect(res.status).toBe(200);
+      expect(res.body.models).toHaveLength(2);
+      expect(res.body.models[0].id).toBe('opencode-go/deepseek-r1');
+      expect(res.body.models[1].id).toBe('opencode-go/qwen3-coder');
+      expect(listOpenCodeModels).toHaveBeenCalledWith(42, 'opencode-go');
+    });
+
+    it('returns 500 with the upstream message when listOpenCodeModels throws', async () => {
+      vi.mocked(getOpenCodeAuthStatus).mockResolvedValueOnce({
+        authenticated: true,
+        status: 'authenticated',
+        authPath: '/users/42/auth.json',
+        tokenFingerprint: 'abc123',
+      });
+      vi.mocked(listOpenCodeModels).mockRejectedValueOnce(
+        new Error('OpenCode server failed to spawn'),
+      );
+      const res = await request(app).get('/api/opencode-auth/models-go');
       expect(res.status).toBe(500);
       expect(res.body.error).toMatch(/spawn/i);
     });

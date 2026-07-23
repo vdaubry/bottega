@@ -15,7 +15,7 @@ import OpenCodeAuthPanel from './OpenCodeAuthPanel';
 import type { ProjectRow } from '../../shared/types/db';
 import type { ApiError } from '../../shared/api/_common';
 
-export type SettingsTab = 'tools' | 'appearance' | 'prompts' | 'agentModels' | 'account' | 'providers';
+export type SettingsTab = 'tools' | 'appearance' | 'prompts' | 'agentModels' | 'account' | 'export' | 'providers';
 type SaveStatus = 'success' | 'error' | null;
 
 export interface SettingsProps {
@@ -51,8 +51,9 @@ function Settings({
   const [saveStatus, setSaveStatus] = useState<SaveStatus>(null);
   const [projectSortOrder, setProjectSortOrder] = useState('name');
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
-
-  void projects;
+  const [includeMessageProjects, setIncludeMessageProjects] = useState<Set<number>>(new Set());
+  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<number>>(new Set(projects.map(p => p.id)));
+  const [isExporting, setIsExporting] = useState(false);
 
   // Code Editor settings
   const [codeEditorTheme, setCodeEditorTheme] = useState(() =>
@@ -91,6 +92,8 @@ function Settings({
       void loadSettings();
       setActiveTab(initialTab);
       setProfileError(null);
+      setSelectedProjectIds(new Set(projects.map(p => p.id)));
+      setIncludeMessageProjects(new Set());
     }
      
   }, [isOpen, initialTab]);
@@ -141,6 +144,32 @@ function Settings({
     }
   };
 
+  const handleExport = async () => {
+    setIsExporting(true);
+    try {
+      const res = await api.export.corpus(Array.from(includeMessageProjects), Array.from(selectedProjectIds));
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as ApiError;
+        throw new Error(body.error || `Export failed: ${res.status}`);
+      }
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `bottega-export-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Export failed';
+      console.error('Export error:', message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const handleToggleIsTechnical = async () => {
     const next = !isTechnical;
     setIsTechnical(next);
@@ -182,31 +211,22 @@ function Settings({
 
   const loadSettings = async () => {
     try {
-      
-      // Load Claude settings from localStorage
       const savedSettings = localStorage.getItem('claude-settings');
-      
       if (savedSettings) {
         const settings = JSON.parse(savedSettings);
         setAllowedTools(settings.allowedTools || []);
         setDisallowedTools(settings.disallowedTools || []);
         setSkipPermissions(settings.skipPermissions || false);
         setProjectSortOrder(settings.projectSortOrder || 'name');
-      } else {
-        // Set defaults
-        setAllowedTools([]);
-        setDisallowedTools([]);
-        setSkipPermissions(false);
-        setProjectSortOrder('name');
+        return;
       }
-
     } catch (error) {
       console.error('Error loading tool settings:', error);
-      setAllowedTools([]);
-      setDisallowedTools([]);
-      setSkipPermissions(false);
-      setProjectSortOrder('name');
     }
+    setAllowedTools([]);
+    setDisallowedTools([]);
+    setSkipPermissions(false);
+    setProjectSortOrder('name');
   };
 
   const saveSettings = () => {
@@ -339,6 +359,17 @@ function Settings({
                 Account
               </button>
               <button
+                onClick={() => setActiveTab('export')}
+                className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+                  activeTab === 'export'
+                    ? 'border-blue-600 text-blue-600 dark:text-blue-400'
+                    : 'border-transparent text-muted-foreground hover:text-foreground'
+                }`}
+                data-testid="settings-tab-export"
+              >
+                Export
+              </button>
+              <button
                 onClick={() => setActiveTab('providers')}
                 className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                   activeTab === 'providers'
@@ -356,8 +387,6 @@ function Settings({
             
             {/* Appearance Tab */}
             {activeTab === 'appearance' && (
-              <div className="space-y-6 md:space-y-8">
-               {activeTab === 'appearance' && (
   <div className="space-y-6 md:space-y-8">
     {/* Branding (instance-wide) */}
     <div className="space-y-4">
@@ -666,9 +695,6 @@ function Settings({
       </div>
     </div>
   </div>
-)}
-
-              </div>
             )}
 
             {/* Agent Prompts Tab */}
@@ -751,6 +777,67 @@ function Settings({
                 </div>
 
                 <ApiKeyPanel />
+              </div>
+            )}
+
+            {/* Export Tab */}
+            {activeTab === 'export' && (
+              <div className="space-y-6">
+                <h3 className="text-lg font-semibold text-foreground">Export Data</h3>
+                <p className="text-sm text-muted-foreground">
+                  Download all your projects, tasks, and conversations as JSON.
+                </p>
+
+                {projects.map((project) => (
+                  <div key={project.id} className="bg-gray-50 dark:bg-gray-900/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                    <div className="flex items-center justify-between">
+                      <label className="flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedProjectIds.has(project.id)}
+                          onChange={() => {
+                            const next = new Set(selectedProjectIds);
+                            if (next.has(project.id)) {
+                              next.delete(project.id);
+                            } else {
+                              next.add(project.id);
+                            }
+                            setSelectedProjectIds(next);
+                          }}
+                          className="w-4 h-4 text-blue-600 bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600 rounded focus:ring-blue-500 focus:ring-2 checked:bg-blue-600 dark:checked:bg-blue-600"
+                        />
+                        <span className="font-medium text-foreground">{project.name}</span>
+                      </label>
+                      {selectedProjectIds.has(project.id) && (
+                        <select
+                          value={includeMessageProjects.has(project.id) ? 'full' : 'metadata'}
+                          onChange={(e) => {
+                            const next = new Set(includeMessageProjects);
+                            if (e.target.value === 'full') {
+                              next.add(project.id);
+                            } else {
+                              next.delete(project.id);
+                            }
+                            setIncludeMessageProjects(next);
+                          }}
+                          className="text-sm bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 text-gray-900 dark:text-gray-100 rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2"
+                        >
+                          <option value="metadata">Metadata only</option>
+                          <option value="full">Include full messages</option>
+                        </select>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {projects.length === 0 && (
+                  <div className="text-center py-8 text-muted-foreground">
+                    No projects to export.
+                  </div>
+                )}
+
+                <Button onClick={handleExport} disabled={isExporting}>
+                  {isExporting ? 'Exporting...' : 'Download Export'}
+                </Button>
               </div>
             )}
 

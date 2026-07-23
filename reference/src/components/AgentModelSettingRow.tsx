@@ -15,7 +15,8 @@ import type { OpenCodeModelEntry } from '../../shared/api/openCodeAuth';
 export const PROVIDER_LABELS: Record<Provider, string> = {
   anthropic: 'Claude Code',
   openai: 'Codex',
-  opencode: 'OpenCode',
+  opencode: 'OpenCode Zen',
+  'opencode-go': 'OpenCode Go',
 };
 
 // Labels for the two static providers. OpenCode model labels are NOT
@@ -40,8 +41,8 @@ export const EFFORT_LABELS: Record<string, string> = {
 };
 
 /**
- * Build the model `<option>` list for a setting. For OpenCode the list is the
- * live Zen catalog (falling back to "current model only" so the dropdown is
+ * Build the model `<option>` list for a setting. For OpenCode (Zen or Go) the list is the
+ * live catalog (falling back to "current model only" so the dropdown is
  * never blank); the persisted model is appended if it's no longer in the
  * catalog. For the static providers it's the canonical enum.
  */
@@ -50,10 +51,11 @@ export function buildModelOptions(
   currentModel: string,
   openCodeModels: OpenCodeModelEntry[] | null,
 ): Array<{ value: string; label: string }> {
-  if (provider !== 'opencode') {
+  if (provider !== 'opencode' && provider !== 'opencode-go') {
     return MODELS_FOR_UI[provider].map((m) => ({ value: m, label: MODEL_LABELS[m] ?? m }));
   }
   const live = openCodeModels ?? [];
+  const catalogName = provider === 'opencode-go' ? 'Go' : 'Zen';
   const options: Array<{ value: string; label: string }> =
     live.length > 0
       ? live.map((m) => ({
@@ -62,7 +64,7 @@ export function buildModelOptions(
         }))
       : [{ value: currentModel, label: currentModel }];
   if (options.length > 0 && !options.some((o) => o.value === currentModel)) {
-    options.push({ value: currentModel, label: `${currentModel} (not in current Zen catalog)` });
+    options.push({ value: currentModel, label: `${currentModel} (not in current ${catalogName} catalog)` });
   }
   return options;
 }
@@ -118,25 +120,25 @@ function AgentModelSettingRow({
           ))}
         </select>
       </label>
-      <label className="flex items-center gap-2 w-full sm:w-auto">
-        <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Model</span>
-        <select
-          value={setting.model}
-          onChange={(e) => onChange(agentType, { model: e.target.value })}
-          disabled={disabled || (providerKey === 'opencode' && isLoadingOpenCodeModels)}
-          data-testid={`agent-model-select-${agentType}`}
-          className="flex-1 min-w-0 sm:flex-none bg-background border border-border rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
-        >
-          {modelOptions.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </select>
-        {providerKey === 'opencode' && isLoadingOpenCodeModels && (
-          <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
-        )}
-      </label>
+       <label className="flex items-center gap-2 w-full sm:w-auto">
+         <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Model</span>
+         <select
+           value={setting.model}
+           onChange={(e) => onChange(agentType, { model: e.target.value })}
+           disabled={disabled || ((providerKey === 'opencode' || providerKey === 'opencode-go') && isLoadingOpenCodeModels)}
+           data-testid={`agent-model-select-${agentType}`}
+           className="flex-1 min-w-0 sm:flex-none bg-background border border-border rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+         >
+           {modelOptions.map((m) => (
+             <option key={m.value} value={m.value}>
+               {m.label}
+             </option>
+           ))}
+         </select>
+         {(providerKey === 'opencode' || providerKey === 'opencode-go') && isLoadingOpenCodeModels && (
+           <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
+         )}
+       </label>
       {EFFORTS_FOR_UI[providerKey].length > 0 && (
         <label className="flex items-center gap-2 w-full sm:w-auto">
           <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Effort</span>

@@ -10,11 +10,11 @@ import type { Provider } from '@shared/providers/types';
 import type { LlmProvider } from './types.js';
 import { anthropicProvider } from './anthropic/index.js';
 import { codexProvider } from './openai/index.js';
-import { openCodeProvider } from './opencode/index.js';
+import { openCodeProvider, openCodeGoProvider } from './opencode/index.js';
 
 const PROVIDERS = new Map<Provider, LlmProvider>();
 
-// Default registration: all three providers are wired in unconditionally
+// Default registration: all four providers are wired in unconditionally
 // at module load. We register here (rather than from each provider's own
 // module) so the registry's import graph is finite — the provider
 // modules don't reach back into `registry.ts`.
@@ -23,6 +23,7 @@ const PROVIDERS = new Map<Provider, LlmProvider>();
 registerProvider('anthropic', anthropicProvider);
 registerProvider('openai', codexProvider);
 registerProvider('opencode', openCodeProvider);
+registerProvider('opencode-go', openCodeGoProvider);
 
 export function registerProvider(name: Provider, provider: LlmProvider): void {
   if (PROVIDERS.has(name)) {

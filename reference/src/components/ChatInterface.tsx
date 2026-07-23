@@ -468,6 +468,9 @@ function ChatInterface({
         console.error(
           '[ChatInterface] Cannot send message: no claude session ID',
         );
+        toast.error(
+          'This conversation has no active session. Try resuming or starting a new conversation.',
+        );
         return;
       }
 

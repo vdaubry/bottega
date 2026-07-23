@@ -22,7 +22,7 @@ export const CreateConversationBodySchema = z
     // Defaults to 'bypassPermissions' server-side.
     permissionMode: z.string().optional(),
     // Which backend runs this conversation. Always explicit.
-    provider: z.enum(['anthropic', 'openai', 'opencode']),
+    provider: z.enum(['anthropic', 'openai', 'opencode', 'opencode-go']),
     // Provider-specific model identifier (e.g. 'opus', 'gpt-5.5',
     // 'opencode/kimi-k2.6'). Always explicit.
     model: z.string().min(1),

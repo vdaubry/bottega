@@ -66,6 +66,15 @@ vi.mock('../providers/opencode/index.js', () => ({
     sendTurnMessage: vi.fn(),
     abortTurn: vi.fn(() => false),
   },
+  openCodeGoProvider: {
+    startTurn: vi.fn(),
+    sendTurnMessage: vi.fn(),
+    abortTurn: vi.fn(() => false),
+  },
+  parseOpenCodeModel: (model: string) => {
+    const [prefix, id] = model.split('/');
+    return { providerID: prefix === 'opencode-go' ? 'opencode-go' : 'opencode', modelID: id };
+  },
 }));
 
 vi.mock('../providers/opencode/messageMirror.js', () => ({

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Load environment variables from .env file
-import fs from 'fs';
+import fs, { promises as fsPromises } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -50,7 +50,6 @@ import express, { type Request, type Response } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
 import cors from 'cors';
-import { promises as fsPromises } from 'fs';
 
 import { getAllActiveStreamingSessions } from './services/conversationAdapter.js';
 import {
@@ -74,6 +73,7 @@ import adminRoutes from './routes/admin.js';
 import webhooksRoutes from './routes/webhooks.js';
 import settingsRoutes from './routes/settings.js';
 import appSettingsRoutes from './routes/appSettings.js';
+import exportRoutes from './routes/export.js';
 import userAgentModelSettingsRoutes from './routes/userAgentModelSettings.js';
 import { initializeDatabase, agentRunsDb } from './database/db.js';
 import { getProject } from './services/projectService.js';
@@ -200,6 +200,7 @@ app.use('/api', authenticateToken, conversationsRoutes);
 app.use('/api', authenticateToken, agentRunsRoutes);
 app.use('/api', authenticateToken, webServerRoutes);
 app.use('/api/settings', authenticateToken, settingsRoutes);
+app.use('/api/export', authenticateToken, exportRoutes);
 app.use('/api/user-agent-model-settings', authenticateToken, userAgentModelSettingsRoutes);
 
 app.use('/api/admin', authenticateToken, requireAdmin, adminRoutes);

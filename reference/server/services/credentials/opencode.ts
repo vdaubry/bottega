@@ -23,8 +23,10 @@ import type { ProviderCredentialStore } from './types.js';
 export const openCodeCredentialStore: ProviderCredentialStore = {
   read(userId) {
     const auth = readOpenCodeAuth(userId);
+    // Both `opencode` and `opencode-go` entries have the same key (Zen billing).
+    // Read from either — validation already ensures both are present and well-formed.
     return {
-      token: auth.opencode.key,
+      token: auth.opencode.key || auth['opencode-go'].key,
       tokenPath: resolveOpenCodeAuthPath(userId),
     };
   },

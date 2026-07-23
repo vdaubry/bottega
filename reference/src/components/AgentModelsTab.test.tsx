@@ -18,6 +18,7 @@ vi.mock('../utils/api', () => ({
     },
     openCodeAuth: {
       models: vi.fn(),
+      modelsGo: vi.fn(),
     },
   },
 }));
@@ -47,6 +48,13 @@ const zenCatalog = {
   ],
 };
 
+const goCatalog = {
+  models: [
+    { id: 'opencode-go/deepseek-v5', bareModelId: 'deepseek-v5', name: 'DeepSeek V5', status: 'active' as const, contextWindow: 128000 },
+    { id: 'opencode-go/qwen3-go', bareModelId: 'qwen3-go', name: 'Qwen3 Go', status: 'active' as const, contextWindow: 64000 },
+  ],
+};
+
 describe('AgentModelsTab', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -60,6 +68,7 @@ describe('AgentModelsTab', () => {
       ((settings: Record<string, AgentModelSetting>) => fakeRes(200, { settings })) as never,
     );
     vi.mocked(api.openCodeAuth.models).mockReturnValue(fakeRes(200, zenCatalog) as never);
+    vi.mocked(api.openCodeAuth.modelsGo).mockReturnValue(fakeRes(200, goCatalog) as never);
   });
 
   it('renders a row per agent', async () => {
@@ -106,5 +115,41 @@ describe('AgentModelsTab', () => {
     expect(saved.planification).toEqual({ provider: 'opencode', model: 'opencode/kimi-k2.6', effort: null });
     // Other agents are unchanged in the full-object save.
     expect(saved.review?.provider).toBe('anthropic');
+  });
+
+  it('switching one phase to opencode-go does not clobber the Zen catalog for other phases', async () => {
+    // Both providers connected; all phases start on anthropic.
+    vi.mocked(api.userAgentModelSettings.connectedProviders).mockReturnValue(
+      fakeRes(200, { connected: ['anthropic', 'opencode', 'opencode-go'] }) as never,
+    );
+    render(<AgentModelsTab />);
+    // Both catalogs should be loaded independently on mount.
+    await waitFor(() => expect(api.openCodeAuth.models).toHaveBeenCalled());
+    await waitFor(() => expect(api.openCodeAuth.modelsGo).toHaveBeenCalled());
+
+    // Switch planification to opencode-go.
+    const planificationProvider = await screen.findByTestId('agent-provider-select-planification');
+    fireEvent.change(planificationProvider, { target: { value: 'opencode-go' } });
+
+    // planification should pick the first Go model.
+    await waitFor(() => {
+      const model = screen.getByTestId('agent-model-select-planification') as HTMLSelectElement;
+      expect(model.value).toBe('opencode-go/deepseek-v5');
+    });
+
+    // Switch implementation to opencode (Zen).
+    const implementationProvider = screen.getByTestId('agent-provider-select-implementation');
+    fireEvent.change(implementationProvider, { target: { value: 'opencode' } });
+
+    // implementation should pick the first Zen model — NOT a Go model.
+    await waitFor(() => {
+      const model = screen.getByTestId('agent-model-select-implementation') as HTMLSelectElement;
+      expect(model.value).toBe('opencode/kimi-k2.6');
+    });
+
+    // Verify both catalogs fetched exactly once each (not re-fetched on switch
+    // because they were pre-loaded at mount).
+    expect(vi.mocked(api.openCodeAuth.models).mock.calls.length).toBe(1);
+    expect(vi.mocked(api.openCodeAuth.modelsGo).mock.calls.length).toBe(1);
   });
 });

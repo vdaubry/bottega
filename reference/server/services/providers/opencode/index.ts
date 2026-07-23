@@ -44,22 +44,27 @@ export class InvalidOpenCodeModelError extends Error {
   }
 }
 
+export type OpenCodeProviderName = 'opencode' | 'opencode-go';
+
 export interface ParsedOpenCodeModel {
-  providerID: 'opencode';
+  providerID: OpenCodeProviderName;
   modelID: string;
 }
 
+const OPENCODE_PREFIXES: ReadonlySet<string> = new Set(['opencode', 'opencode-go']);
+
 /**
- * Parse the canonical persisted form `'opencode/<modelID>'` into the
- * `{ providerID, modelID }` shape the OpenCode SDK requires for
- * `session.prompt`. Multi-segment modelIDs (e.g. `'opencode/claude-opus-4-7'`)
- * keep the full tail; only the first segment is consumed as the
- * providerID prefix.
+ * Parse the canonical persisted form `'opencode/<modelID>'` or
+ * `'opencode-go/<modelID>'` into the `{ providerID, modelID }` shape the
+ * OpenCode SDK requires for `session.prompt`. Multi-segment modelIDs
+ * (e.g. `'opencode/claude-opus-4-7'`) keep the full tail; only the first
+ * segment is consumed as the providerID prefix.
  *
  * `parseOpenCodeModel('opencode/kimi-k2.6')` → `{ providerID: 'opencode', modelID: 'kimi-k2.6' }`.
+ * `parseOpenCodeModel('opencode-go/kimi-k2.6')` → `{ providerID: 'opencode-go', modelID: 'kimi-k2.6' }`.
  *
  * @throws InvalidOpenCodeModelError if `model` is empty or does not start
- *  with the `'opencode/'` prefix.
+ *  with the `'opencode/'` or `'opencode-go/'` prefix.
  */
 export function parseOpenCodeModel(model: string): ParsedOpenCodeModel {
   if (!model) {
@@ -69,10 +74,10 @@ export function parseOpenCodeModel(model: string): ParsedOpenCodeModel {
   if (idx < 0) throw new InvalidOpenCodeModelError(model);
   const prefix = model.slice(0, idx);
   const tail = model.slice(idx + 1);
-  if (prefix !== 'opencode' || tail.length === 0) {
+  if (!OPENCODE_PREFIXES.has(prefix) || tail.length === 0) {
     throw new InvalidOpenCodeModelError(model);
   }
-  return { providerID: 'opencode', modelID: tail };
+  return { providerID: prefix as OpenCodeProviderName, modelID: tail };
 }
 
 function extractUserIdFromEnv(
@@ -93,11 +98,12 @@ function extractUserIdFromEnv(
 function buildSyntheticUser(
   prompt: string,
   providerSessionId: string | null,
+  providerName: OpenCodeProviderName,
 ): UnifiedUserMessage {
   return {
     type: 'user',
     id: `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    provider: 'opencode',
+    provider: providerName,
     providerSessionId,
     raw: { type: 'user', content: prompt },
     content: prompt,
@@ -224,6 +230,7 @@ async function* streamUnified(
   ctx: RunOnSessionContext,
   resolveSessionId: (id: string) => void,
   capturePid: (pid: number | null) => void,
+  providerName: OpenCodeProviderName,
 ): AsyncGenerator<UnifiedMessage, void, unknown> {
   const { handle, sessionId, options } = ctx;
   const abortController = options.abortController ?? new AbortController();
@@ -232,7 +239,7 @@ async function* streamUnified(
   //    as an SSE event, so without this the messages table has no
   //    user-side row for the turn (matches Codex's strategy).
   resolveSessionId(sessionId);
-  yield buildSyntheticUser(options.prompt ?? '', sessionId);
+  yield buildSyntheticUser(options.prompt ?? '', sessionId, providerName);
   capturePid(handle.pid);
 
   // Every turn — start or resume — carries an explicit model. On resume the
@@ -241,7 +248,7 @@ async function* streamUnified(
   // always deterministic and `parseOpenCodeModel` always has a value.
   const parsed = parseOpenCodeModel(options.model);
   const client = clientOf(handle);
-  const mapper = createOpenCodeEventMapper(sessionId);
+  const mapper = createOpenCodeEventMapper(sessionId, providerName);
 
   // 2. Subscribe to the SSE stream BEFORE firing the prompt so events
   //    emitted between the prompt response and the session.idle aren't
@@ -377,7 +384,7 @@ async function* streamUnified(
       yield {
         type: 'result',
         id: `opencode_stream_closed:${sessionId}:${Math.random()}`,
-        provider: 'opencode',
+        provider: providerName,
         providerSessionId: sessionId,
         raw: { type: 'session.closed' },
         isError: true,
@@ -388,10 +395,14 @@ async function* streamUnified(
 }
 
 export class OpenCodeProvider implements LlmProvider {
-  readonly name = 'opencode' as const;
+  readonly name: OpenCodeProviderName;
+
+  constructor(name: OpenCodeProviderName) {
+    this.name = name;
+  }
 
   getCapabilities(): ProviderCapabilities {
-    return getCapabilities('opencode');
+    return getCapabilities(this.name);
   }
 
   async startTurn(options: ProviderRunOptions): Promise<ProviderRunResult> {
@@ -451,6 +462,7 @@ export class OpenCodeProvider implements LlmProvider {
         { ...ctx, options: optionsWithController },
         resolveSessionId,
         capturePid,
+        this.name,
       ),
       providerSessionId$,
       abort: () => abortController.abort(),
@@ -496,22 +508,32 @@ export class OpenCodeProvider implements LlmProvider {
     // see 'anthropic' on rows that are actually OpenCode.
     const { loadAnthropicTranscript } = await import('../anthropic/sessionStore.js');
     const entries = await loadAnthropicTranscript(options);
-    return entries.map((e) => ({ ...e, provider: 'opencode' }));
+    return entries.map((e) => ({ ...e, provider: this.name }));
   }
 }
 
-export const openCodeProvider = new OpenCodeProvider();
+/**
+ * Factory function to create an OpenCode provider instance for either
+ * 'opencode' (Zen) or 'opencode-go' (Go).
+ */
+export function createOpenCodeProvider(name: OpenCodeProviderName): OpenCodeProvider {
+  return new OpenCodeProvider(name);
+}
+
+export const openCodeProvider = createOpenCodeProvider('opencode');
+export const openCodeGoProvider = createOpenCodeProvider('opencode-go');
 
 /**
  * Bottega-facing model record. Mirrors the subset of OpenCode's `Model`
  * type the settings UI needs (id, label, status, context window). The
  * `id` field is the *Bottega-persisted* shape `opencode/<bareModelID>`
- * — drop it straight into an agent_model_settings row.
+ * or `opencode-go/<bareModelID>` — drop it straight into an
+ * agent_model_settings row.
  */
 export interface OpenCodeModelListEntry {
-  /** Persistence form: `opencode/<bareModelID>`. */
+  /** Persistence form: `opencode/<bareModelID>` or `opencode-go/<bareModelID>`. */
   id: string;
-  /** Raw Zen ID without the `opencode/` prefix — what the SDK consumes. */
+  /** Raw model ID without the provider prefix — what the SDK consumes. */
   bareModelId: string;
   /** Human label as returned by OpenCode (e.g. "Kimi K2.6"). */
   name: string;
@@ -523,17 +545,18 @@ export interface OpenCodeModelListEntry {
 }
 
 /**
- * Fetch the live Zen catalog for the given user by spawning (or reusing)
+ * Fetch the live catalog for the given user by spawning (or reusing)
  * their OpenCode server and calling `GET /config/providers`. Returns the
- * `opencode` provider's models only — Zen's other providers are tied to
- * separate credentials Bottega doesn't manage.
+ * models for the specified provider (`'opencode'` for Zen, `'opencode-go'`
+ * for Go).
  *
- * Throws the same errors `getOrSpawnOpenCodeServer` does (missing Zen
+ * Throws the same errors `getOrSpawnOpenCodeServer` does (missing
  * key → typed error from the credential store); callers should surface
  * them as 401-ish responses rather than 5xx.
  */
 export async function listOpenCodeModels(
   userId: number,
+  providerName: OpenCodeProviderName = 'opencode',
 ): Promise<OpenCodeModelListEntry[]> {
   const handle = await getOrSpawnOpenCodeServer(userId);
   const client = clientOf(handle);
@@ -544,13 +567,13 @@ export async function listOpenCodeModels(
     (result as { data?: { providers?: OpenCodeProviderInfo[] } }).data?.providers ??
     (result as { providers?: OpenCodeProviderInfo[] }).providers ??
     [];
-  const opencode = providers.find((p) => p.id === 'opencode');
-  if (!opencode) return [];
+  const provider = providers.find((p) => p.id === providerName);
+  if (!provider) return [];
   const entries: OpenCodeModelListEntry[] = [];
-  for (const [bareModelId, m] of Object.entries(opencode.models ?? {})) {
+  for (const [bareModelId, m] of Object.entries(provider.models ?? {})) {
     const status = (m.status ?? 'unknown') as OpenCodeModelListEntry['status'];
     entries.push({
-      id: `opencode/${bareModelId}`,
+      id: `${providerName}/${bareModelId}`,
       bareModelId,
       name: m.name ?? bareModelId,
       status,
