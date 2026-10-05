@@ -18,10 +18,10 @@ describe('loadAnthropicTranscript', () => {
     vi.mocked(sqliteSessionStore.load).mockResolvedValueOnce([]);
     await loadAnthropicTranscript({
       providerSessionId: 'sess-1',
-      projectFolderPath: '/home/ubuntu/misc/hello_world',
+      projectFolderPath: '/home/dev/projects/hello_world',
     });
     expect(sqliteSessionStore.load).toHaveBeenCalledWith({
-      projectKey: '-home-ubuntu-misc-hello-world',
+      projectKey: '-home-dev-projects-hello-world',
       sessionId: 'sess-1',
     });
   });

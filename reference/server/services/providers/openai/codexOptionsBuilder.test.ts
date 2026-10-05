@@ -44,7 +44,7 @@ describe('mapPermissionModeToCodexOptions', () => {
 
 describe('buildCodexThreadOptions', () => {
   it('always sets skipGitRepoCheck=true and workingDirectory=cwd', () => {
-    const opts = buildCodexThreadOptions({ cwd: '/work', prompt: 'hi', model: 'gpt-5.5', effort: null });
+    const opts = buildCodexThreadOptions({ cwd: '/work', prompt: 'hi', model: 'gpt-6.1-sol', effort: null });
     expect(opts.workingDirectory).toBe('/work');
     expect(opts.skipGitRepoCheck).toBe(true);
   });
@@ -53,10 +53,10 @@ describe('buildCodexThreadOptions', () => {
     const opts = buildCodexThreadOptions({
       cwd: '/x',
       prompt: 'hi',
-      model: 'gpt-5.5',
+      model: 'gpt-6.1-sol',
       effort: 'high',
     });
-    expect(opts.model).toBe('gpt-5.5');
+    expect(opts.model).toBe('gpt-6.1-sol');
     expect(opts.modelReasoningEffort).toBe('high');
   });
 
@@ -68,10 +68,10 @@ describe('buildCodexThreadOptions', () => {
     const opts = buildCodexThreadOptions({
       cwd: '/x',
       prompt: 'hi',
-      model: 'gpt-5.5',
+      model: 'gpt-6.1-sol',
       effort: 'max',
     });
-    expect(opts.model).toBe('gpt-5.5');
+    expect(opts.model).toBe('gpt-6.1-sol');
     expect(opts.modelReasoningEffort).toBeUndefined();
   });
 
@@ -79,7 +79,7 @@ describe('buildCodexThreadOptions', () => {
     const opts = buildCodexThreadOptions({
       cwd: '/x',
       prompt: 'hi',
-      model: 'gpt-5.5',
+      model: 'gpt-6.1-sol',
       effort: null,
       permissionMode: 'bypassPermissions',
     });

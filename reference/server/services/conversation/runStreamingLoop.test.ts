@@ -87,7 +87,9 @@ describe('runStreamingLoop', () => {
     });
 
     expect(thinkingAcc.patchAssistantMessage).toHaveBeenCalledWith(assistant);
-    expect(contextUsageTracker.onAssistant).toHaveBeenCalledWith(queryInstance, null, null);
+    expect(contextUsageTracker.onAssistant).toHaveBeenCalledWith(
+      queryInstance, null, null, { input_tokens: 10, output_tokens: 5 },
+    );
     // Dual-emit (Phase 5): legacy claude-response + provider-tagged ai-response.
     expect(broadcastFn).toHaveBeenCalledWith(1, { type: 'claude-response', data: assistant });
     expect(broadcastFn).toHaveBeenCalledWith(1, {
@@ -126,8 +128,15 @@ describe('runStreamingLoop', () => {
       initialSessionId: 'sess',
     });
 
-    expect(contextUsageTracker.onAssistant).toHaveBeenNthCalledWith(1, queryInstance, null, MASTER_MODEL);
-    expect(contextUsageTracker.onAssistant).toHaveBeenNthCalledWith(2, queryInstance, 'tool-use-abc', SUB_AGENT_MODEL);
+    // The per-request usage is forwarded too, so the tracker can build the
+    // context baseline from point-in-time occupancy rather than the turn-wide
+    // cumulative result.modelUsage aggregate.
+    expect(contextUsageTracker.onAssistant).toHaveBeenNthCalledWith(
+      1, queryInstance, null, MASTER_MODEL, { input_tokens: 1, output_tokens: 1 },
+    );
+    expect(contextUsageTracker.onAssistant).toHaveBeenNthCalledWith(
+      2, queryInstance, 'tool-use-abc', SUB_AGENT_MODEL, { input_tokens: 1, output_tokens: 1 },
+    );
   });
 
   it('captures the first session_id and fires onSessionId exactly once', async () => {

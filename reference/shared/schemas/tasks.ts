@@ -27,12 +27,22 @@ export const CleanupOldCompletedQuerySchema = z.object({
 });
 export type CleanupOldCompletedQuery = z.infer<typeof CleanupOldCompletedQuerySchema>;
 
-export const DiscardWorktreeQuerySchema = z.object({
-  // The handler treats `force === 'true'` as a boolean — preserve that
-  // string-typed contract instead of coercing.
+/**
+ * `?force=true` — proceed even though the worktree holds uncommitted or
+ * unpushed work. Shared by every worktree-destroying route (discard,
+ * merge-cleanup, delete task) so they take the same escape hatch.
+ *
+ * The handlers treat `force === 'true'` as a boolean — preserve that
+ * string-typed contract instead of coercing.
+ */
+export const ForceQuerySchema = z.object({
   force: z.string().optional(),
 });
-export type DiscardWorktreeQuery = z.infer<typeof DiscardWorktreeQuerySchema>;
+export type ForceQuery = z.infer<typeof ForceQuerySchema>;
+
+/** @deprecated Alias of `ForceQuerySchema`, kept for existing call sites. */
+export const DiscardWorktreeQuerySchema = ForceQuerySchema;
+export type DiscardWorktreeQuery = ForceQuery;
 
 // ---- Param schemas ----------------------------------------------------
 
@@ -46,6 +56,8 @@ export type TaskAttachmentParams = z.infer<typeof TaskAttachmentParamsSchema>;
 
 // ---- Body schemas -----------------------------------------------------
 
+// Epic membership fields were removed in architecture-v2 step 3 — tickets are
+// created through POST /epics/:id/tasks instead.
 export const CreateTaskBodySchema = z.object({
   title: z.string().nullable().optional(),
   description: z.string().optional(),

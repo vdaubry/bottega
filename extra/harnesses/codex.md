@@ -190,8 +190,9 @@ summary (full mechanics in [`overview.md`](./overview.md)):
   [`codexAuthFlow.ts`](../../reference/server/services/codexAuthFlow.ts) and the
   routes in [`codexAuth.ts`](../../reference/server/routes/codexAuth.ts)
   (`/status`, `/start`, `/cancel`, `/paste`, `DELETE /`). A `/paste` fallback
-  accepts the JSON of a working `auth.json` directly. `auth.json` can hold
-  either OAuth tokens or an `OPENAI_API_KEY`; the status reader supports both.
+  accepts the JSON of a working OAuth `auth.json` directly. API-key payloads
+  are rejected, and Bottega pins each per-user Codex `config.toml` to
+  `forced_login_method = "chatgpt"` before login or agent execution.
 
 ## What to build
 

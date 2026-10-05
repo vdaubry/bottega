@@ -24,7 +24,7 @@ import type {
   ProjectRow,
   TaskRow,
   ConversationRow,
-  AgentRunRow,
+  TaskAgentRunRow,
 } from '../../shared/types/db';
 import type {
   UpdateProjectRequest,
@@ -32,7 +32,9 @@ import type {
 import type {
   CreateTaskRequest,
   UpdateTaskRequest,
+  UnsavedWorktreeWorkResponse,
 } from '../../shared/api/tasks';
+import { UNSAVED_WORKTREE_WORK } from '../../shared/api/tasks';
 import type { ServerMessageOf } from '../../shared/websocket/messages';
 import type { Provider } from '../../shared/providers/types';
 
@@ -43,7 +45,7 @@ import type { Provider } from '../../shared/providers/types';
 export type Project = ProjectRow;
 export type Task = TaskRow;
 export type Conversation = ConversationRow;
-export type AgentRun = AgentRunRow;
+export type AgentRun = TaskAgentRunRow;
 
 export type CurrentView =
   | 'empty'
@@ -56,6 +58,14 @@ export type CurrentView =
 interface ActionResult {
   success: boolean;
   error?: string;
+}
+
+/**
+ * Deleting a task destroys its worktree, so it can come back 409 with the
+ * unsaved-work report rather than a plain error string.
+ */
+export interface DeleteTaskResult extends ActionResult {
+  conflict?: UnsavedWorktreeWorkResponse;
 }
 
 export interface CreateProjectResult extends ActionResult {
@@ -91,6 +101,7 @@ export interface TaskContextValue {
   createProject: (
     name: string,
     repoFolderPath: string,
+    sensitiveAreas?: string,
   ) => Promise<CreateProjectResult>;
   updateProject: (
     id: number,
@@ -110,7 +121,9 @@ export interface TaskContextValue {
     options?: Omit<CreateTaskRequest, 'title' | 'documentation'>,
   ) => Promise<CreateTaskResult>;
   updateTask: (id: number, data: UpdateTaskRequest) => Promise<UpdateTaskResult>;
-  deleteTask: (id: number) => Promise<ActionResult>;
+  deleteTask: (id: number, force?: boolean) => Promise<DeleteTaskResult>;
+  /** Retry a failed worktree setup; the row goes back to 'provisioning'. */
+  retryWorktreeSetup: (id: number) => Promise<ActionResult>;
 
   // Task Documentation
   taskDoc: string;
@@ -262,9 +275,10 @@ export function TaskContextProvider({ children }: { children: ReactNode }) {
     async (
       name: string,
       repoFolderPath: string,
+      sensitiveAreas?: string,
     ): Promise<CreateProjectResult> => {
       try {
-        const response = await api.projects.create(name, repoFolderPath);
+        const response = await api.projects.create(name, repoFolderPath, sensitiveAreas);
         if (response.ok) {
           const newProject = await response.json();
           setProjects((prev) => [...prev, newProject]);
@@ -406,10 +420,17 @@ export function TaskContextProvider({ children }: { children: ReactNode }) {
     [selectedTask],
   );
 
+  /**
+   * Delete a task and its worktree.
+   *
+   * Answers `conflict` instead of `error` on the server's 409 when the worktree
+   * still holds uncommitted or unpushed work, so callers can hand it to
+   * `useWorktreeGuard` and re-issue with `force` if the user chooses to discard.
+   */
   const deleteTask = useCallback(
-    async (id: number): Promise<ActionResult> => {
+    async (id: number, force = false): Promise<DeleteTaskResult> => {
       try {
-        const response = await api.tasks.delete(id);
+        const response = await api.tasks.delete(id, force);
         if (response.ok) {
           setTasks((prev) => prev.filter((t) => t.id !== id));
           if (selectedTask?.id === id) {
@@ -419,7 +440,12 @@ export function TaskContextProvider({ children }: { children: ReactNode }) {
           }
           return { success: true };
         }
-        const err = (await response.json()) as unknown as { error?: string };
+        const err = (await response.json()) as unknown as {
+          error?: string;
+        } & Partial<UnsavedWorktreeWorkResponse>;
+        if (response.status === 409 && err.error === UNSAVED_WORKTREE_WORK) {
+          return { success: false, conflict: err as UnsavedWorktreeWorkResponse };
+        }
         return { success: false, error: err.error || 'Failed to delete task' };
       } catch (err) {
         console.error('Error deleting task:', err);
@@ -428,6 +454,22 @@ export function TaskContextProvider({ children }: { children: ReactNode }) {
     },
     [selectedTask],
   );
+
+  const retryWorktreeSetup = useCallback(async (id: number): Promise<ActionResult> => {
+    try {
+      const response = await api.tasks.retryWorktreeSetup(id);
+      if (response.ok) {
+        const updated = await response.json();
+        setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...updated } : t)));
+        return { success: true };
+      }
+      const err = (await response.json().catch(() => ({}))) as { error?: string };
+      return { success: false, error: err.error || 'Failed to retry the worktree setup' };
+    } catch (err) {
+      console.error('Error retrying worktree setup:', err);
+      return { success: false, error: errorMessage(err, 'Failed to retry the worktree setup') };
+    }
+  }, []);
 
   // ========== Task Documentation API ==========
 
@@ -704,59 +746,113 @@ export function TaskContextProvider({ children }: { children: ReactNode }) {
     void loadProjects();
   }, [loadProjects]);
 
-  // Fetch active streaming sessions on mount and when WebSocket connects
+  // Reconcile the frontend `liveTaskIds` against the authoritative
+  // `/api/streaming-sessions` endpoint. Overwriting the whole set is correct:
+  // the endpoint is the source of truth, so this clears any stale-ON entry
+  // (Bug #1, once the backend cleanup has run) AND restores any stale-OFF
+  // entry the client missed (Bug #2 — a `streaming-started` that never
+  // arrived). The only race — a `streaming-started` landing mid-fetch being
+  // overwritten by a slightly stale response — self-corrects on the next
+  // reconcile/event, so the full overwrite is intentional.
+  const reconcileLiveTaskIds = useCallback(async () => {
+    try {
+      const response = await api.streamingSessions.getActive();
+      if (!response.ok) return;
+      const data = await response.json();
+      const taskIds = new Set<number>(
+        data.sessions
+          .map((s) => s.taskId)
+          .filter((id): id is number => typeof id === 'number'),
+      );
+      setLiveTaskIds(taskIds);
+      liveTaskIdsRef.current = taskIds;
+    } catch (err) {
+      console.error('Error reconciling active streaming sessions:', err);
+    }
+  }, []);
+
+  // Reconcile on mount and on every WebSocket (re)connect. A reconnect
+  // re-bootstraps liveness after any events missed while disconnected.
   useEffect(() => {
-    const fetchActiveSessions = async () => {
-      try {
-        const response = await api.streamingSessions.getActive();
-        if (response.ok) {
-          const data = await response.json();
-          const taskIds = new Set<number>(data.sessions.map((s) => s.taskId));
-          setLiveTaskIds(taskIds);
-          liveTaskIdsRef.current = taskIds;
-        }
-      } catch (err) {
-        console.error('Error fetching active streaming sessions:', err);
+    void reconcileLiveTaskIds();
+  }, [isConnected, reconcileLiveTaskIds]);
+
+  // Reconcile when a backgrounded tab regains focus. Browser timers are
+  // throttled in hidden tabs, so the periodic resync below can stall; this
+  // self-heals the dot immediately on refocus.
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void reconcileLiveTaskIds();
       }
     };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [reconcileLiveTaskIds]);
 
-    void fetchActiveSessions();
-  }, [isConnected]);
+  // Light periodic resync so a stale dot self-corrects within ≤30s even on a
+  // stable connection that never reconnects (covers a missed event with no
+  // subsequent reconnect or tab refocus).
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void reconcileLiveTaskIds();
+    }, 30000);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [reconcileLiveTaskIds]);
 
   // Subscribe to streaming events via WebSocket
   useEffect(() => {
     if (!subscribe || !unsubscribe) return;
 
+    // Add/remove a single task id, keeping the `liveTaskIdsRef` mirror in sync
+    // so the synchronous `isTaskLive` reader sees the change immediately.
+    const setTaskLive = (taskId: number | undefined, live: boolean) => {
+      if (!taskId) return;
+      setLiveTaskIds((prev) => {
+        const next = new Set(prev);
+        if (live) next.add(taskId);
+        else next.delete(taskId);
+        liveTaskIdsRef.current = next;
+        return next;
+      });
+    };
+
     const handleStreamingStarted = (message: ServerMessageOf<'streaming-started'>) => {
-      const { taskId } = message;
-      if (taskId) {
-        setLiveTaskIds((prev) => {
-          const next = new Set(prev);
-          next.add(taskId);
-          liveTaskIdsRef.current = next;
-          return next;
-        });
-      }
+      setTaskLive(message.taskId, true);
     };
 
     const handleStreamingEnded = (message: ServerMessageOf<'streaming-ended'>) => {
-      const { taskId } = message;
-      if (taskId) {
-        setLiveTaskIds((prev) => {
-          const next = new Set(prev);
-          next.delete(taskId);
-          liveTaskIdsRef.current = next;
-          return next;
-        });
-      }
+      setTaskLive(message.taskId, false);
+    };
+
+    // The background worktree setup moved (task channel): patch the row so the
+    // board badge and the task page's banner / disabled actions follow it.
+    const handleWorktreeUpdated = (message: ServerMessageOf<'task-worktree-updated'>) => {
+      setTasks((prev) =>
+        prev.map((task) =>
+          task.id === message.taskId
+            ? {
+                ...task,
+                worktree_state: message.worktreeState,
+                worktree_error: message.worktreeError,
+              }
+            : task,
+        ),
+      );
     };
 
     subscribe('streaming-started', handleStreamingStarted);
     subscribe('streaming-ended', handleStreamingEnded);
+    subscribe('task-worktree-updated', handleWorktreeUpdated);
 
     return () => {
       unsubscribe('streaming-started', handleStreamingStarted);
       unsubscribe('streaming-ended', handleStreamingEnded);
+      unsubscribe('task-worktree-updated', handleWorktreeUpdated);
     };
   }, [subscribe, unsubscribe]);
 
@@ -784,6 +880,7 @@ export function TaskContextProvider({ children }: { children: ReactNode }) {
     createTask,
     updateTask,
     deleteTask,
+    retryWorktreeSetup,
 
     // Task Documentation
     taskDoc,

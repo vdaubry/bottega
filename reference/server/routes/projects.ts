@@ -52,13 +52,15 @@ router.post(
   ) => {
     try {
       const userId = req.user!.id;
-      const { name, repoFolderPath, subprojectPath } = req.validated!.body as CreateProjectBody;
+      const { name, repoFolderPath, subprojectPath, sensitiveAreas } =
+        req.validated!.body as CreateProjectBody;
 
       const project = projectsDb.create(
         userId,
         name.trim(),
         repoFolderPath.trim(),
         subprojectPath?.trim() || null,
+        sensitiveAreas?.trim() || null,
       );
 
       // The pre-TS handler returned the `projectsDb.create` summary
@@ -123,6 +125,10 @@ router.put(
       }
       if (body.subprojectPath !== undefined) {
         updates.subproject_path = body.subprojectPath?.trim() || null;
+      }
+      if (body.sensitiveAreas !== undefined) {
+        // Blank clears it: an empty list switches the guardrail off.
+        updates.sensitive_areas = body.sensitiveAreas?.trim() || null;
       }
 
       const project = updateProject(projectId, userId, updates);

@@ -82,6 +82,13 @@ The variable set per prompt is small and stable: most carry `taskDocPath` and
 and `feedbackSection`. The exact lists are the `variables` arrays in the
 registry.
 
+One variable is built in rather than listed per prompt: `scriptsDir`, the
+absolute path to the completion scripts, resolved from where the app is
+installed. The prompts tell agents to run those scripts by absolute path from
+inside a task worktree (`tsx {{scriptsDir}}/complete-plan.ts {{taskId}}`), so
+the path must come from the running install, never be written into the prompt
+text.
+
 ### How `agentPrompts.ts` composes a per-agent message
 
 [`../reference/server/constants/agentPrompts.ts`](../reference/server/constants/agentPrompts.ts)
@@ -119,6 +126,13 @@ and the type in
 This **replaced** a single global `app_settings.agent_model_settings` blob — the
 point of going per-user is that each user runs agents on a provider/model they
 actually hold credentials for.
+
+Two other extras add keys to the same blob without adding agent types: Explore
+adds `schema`, the model that generates its HTML artifacts (locked to Anthropic
+in the reference — see [`./explore.md`](./explore.md)), and Epics adds one key
+per epic agent (see [`./epics.md`](./epics.md)). The map is therefore keyed by
+`AgentModelKey`, a superset of `AgentType`; everything below applies to those
+keys unchanged.
 
 ### The per-provider enums
 

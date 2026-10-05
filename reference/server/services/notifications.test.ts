@@ -242,3 +242,39 @@ describe('Notification Service Logic', () => {
     });
   });
 });
+
+// Driver policy 3 (architecture-v2 step 2): the real notifyClaudeComplete
+// mutes automation-driven turn ends before it ever reaches OneSignal, and
+// the muting keys on the run's driver alone — no epic lookup is involved.
+import { vi } from 'vitest';
+import { notifyClaudeComplete } from './notifications.js';
+
+describe('notifyClaudeComplete driver muting', () => {
+  it('skips the banner for automation-driven runs', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const result = await notifyClaudeComplete(1, 'T', 7, 100, 1, {
+        agentType: 'pr',
+        driver: 'automation',
+      });
+      expect(result).toBeNull();
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining('automation-driven run on task 7'),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('does not mute a human-driven PR run for the driver (only for config)', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await notifyClaudeComplete(1, 'T', 7, 100, 1, { agentType: 'pr', driver: 'human' });
+      expect(log).not.toHaveBeenCalledWith(
+        expect.stringContaining('automation-driven run'),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+});

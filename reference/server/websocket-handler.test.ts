@@ -133,7 +133,7 @@ describe('WebSocket Handler - Task-based Conversation Flow', () => {
 
       // Get conversation and then task with project
       const retrieved = testDb.conversationsDb.getById(conversation.id);
-      const taskWithProject = testDb.tasksDb.getWithProject(retrieved!.task_id);
+      const taskWithProject = testDb.tasksDb.getWithProject(retrieved!.task_id!);
 
       expect(taskWithProject!.repo_folder_path).toBe(testDir);
     });
@@ -334,7 +334,7 @@ describe('WebSocket Handler - Task-based Conversation Flow', () => {
       expect(retrievedConversation!.claude_conversation_id).toBe(claudeSessionId);
 
       // Get task with project for cwd (as handler would do)
-      const taskWithProject = testDb.tasksDb.getWithProject(retrievedConversation!.task_id);
+      const taskWithProject = testDb.tasksDb.getWithProject(retrievedConversation!.task_id!);
 
       // Build SDK options for resume (as handler would do)
       const sdkOptions = {

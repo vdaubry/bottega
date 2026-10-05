@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../database/db.js', () => ({
+vi.mock('../database/conversations.js', () => ({
   conversationsDb: {
     updateContextUsage: vi.fn()
   }
 }));
 
 import { createContextUsageTracker } from './contextUsageTracker.js';
-import { conversationsDb } from '../database/db.js';
+import { conversationsDb } from '../database/conversations.js';
 
 // Resolved (versioned) Claude model IDs — what the SDK reports back in
 // `result.modelUsage` and `assistant.message.model`. Defined in one place
@@ -64,30 +64,34 @@ describe('contextUsageTracker', () => {
     });
   });
 
-  it('falls back to baseline from result.modelUsage when getContextUsage rejects', async () => {
+  it('falls back to the latest master per-request usage (not the modelUsage aggregate) when getContextUsage rejects', async () => {
     const queryInstance = { getContextUsage: vi.fn().mockRejectedValue(new Error('Query closed')) };
     const tracker = createContextUsageTracker({ conversationId: 7, broadcastFn });
 
-    tracker.onAssistant(queryInstance, null, MASTER_MODEL);
+    // The master assistant message carries the point-in-time per-request usage.
+    tracker.onAssistant(queryInstance, null, MASTER_MODEL, {
+      input_tokens: 1000, cache_read_input_tokens: 200, cache_creation_input_tokens: 100,
+    });
     await tracker.onResult(baselineResult);
 
     expect(broadcastFn).toHaveBeenCalledTimes(1);
     expect(broadcastFn.mock.calls[0][1].data).toEqual(expect.objectContaining({
       model: MASTER_MODEL,
-      totalTokens: 1300, // input + cacheRead + cacheCreate
+      totalTokens: 1300, // input + cache_read + cache_creation of the last request
       maxTokens: 200000,
       categories: []
     }));
   });
 
-  it('broadcasts baseline-only when no assistant message arrives', async () => {
+  it('reports 0 (never the cumulative modelUsage sum) when no master assistant usage was observed', async () => {
     const tracker = createContextUsageTracker({ conversationId: 7, broadcastFn });
 
-    // No onAssistant call → captureContextUsage is never invoked
+    // No onAssistant call → no per-request usage. getSessionTokenUsage reports
+    // 0 in this degenerate case; we match it rather than summing the aggregate.
     await tracker.onResult(baselineResult);
 
     expect(broadcastFn).toHaveBeenCalledTimes(1);
-    expect(broadcastFn.mock.calls[0][1].data.totalTokens).toBe(1300);
+    expect(broadcastFn.mock.calls[0][1].data.totalTokens).toBe(0);
   });
 
   it('does not broadcast or persist if neither baseline nor breakdown is available', async () => {
@@ -146,8 +150,67 @@ describe('contextUsageTracker', () => {
     expect(broadcastFn.mock.calls[0][1].data.model).toBe(MASTER_MODEL);
   });
 
-  it('keys into result.modelUsage by the observed master model so the sub-agent entry is ignored', async () => {
-    // Two-model result: sub-agent entry is first, master entry is second.
+  it('builds the baseline from the latest master per-request usage, not the cumulative modelUsage aggregate', async () => {
+    // Regression for the "2.7M against a 1M window" bug. An agentic turn makes
+    // many tool-use round-trips, so result.modelUsage accumulates cache reads
+    // far beyond the real window (and folds the same-model sub-agent in too).
+    // The point-in-time usage on the last master assistant message is the true
+    // occupancy and must be preferred.
+    const result = {
+      type: 'result',
+      modelUsage: {
+        [MASTER_MODEL]: {
+          inputTokens: 20,
+          cacheReadInputTokens: 2_700_000, // summed across every round-trip
+          cacheCreationInputTokens: 24_000,
+          contextWindow: 1_000_000,
+        },
+      },
+    };
+    // getContextUsage rejects → the baseline path is exercised (the buggy one).
+    const queryInstance = { getContextUsage: vi.fn().mockRejectedValue(new Error('Query closed')) };
+    const tracker = createContextUsageTracker({ conversationId: 7, broadcastFn });
+
+    // The last master API request actually held 196_530 tokens.
+    tracker.onAssistant(queryInstance, null, MASTER_MODEL, {
+      input_tokens: 2,
+      cache_read_input_tokens: 196_182,
+      cache_creation_input_tokens: 346,
+    });
+    await tracker.onResult(result);
+
+    const data = broadcastFn.mock.calls[0][1].data;
+    expect(data.totalTokens).toBe(196_530); // NOT 2_724_020 from the aggregate
+    expect(data.maxTokens).toBe(1_000_000);
+    expect(data.percentage).toBeCloseTo(19.653, 2); // well under 100%
+  });
+
+  it('tracks the latest master per-request usage and ignores sub-agent usage', async () => {
+    const queryInstance = { getContextUsage: vi.fn().mockRejectedValue(new Error()) };
+    const tracker = createContextUsageTracker({ conversationId: 7, broadcastFn });
+
+    // Early master request (smaller prompt).
+    tracker.onAssistant(queryInstance, null, MASTER_MODEL, {
+      input_tokens: 2, cache_read_input_tokens: 50_000, cache_creation_input_tokens: 1_000,
+    });
+    // A sub-agent request (parent_tool_use_id set) — must not influence the master.
+    tracker.onAssistant(queryInstance, 'tool-use-abc', SUB_AGENT_MODEL, {
+      input_tokens: 2, cache_read_input_tokens: 900_000, cache_creation_input_tokens: 0,
+    });
+    // Later master request — the real end-of-turn window.
+    tracker.onAssistant(queryInstance, null, MASTER_MODEL, {
+      input_tokens: 2, cache_read_input_tokens: 120_000, cache_creation_input_tokens: 2_000,
+    });
+    await tracker.onResult(baselineResult);
+
+    // 2 + 120_000 + 2_000 — latest master request; the sub-agent's 900K is ignored.
+    expect(broadcastFn.mock.calls[0][1].data.totalTokens).toBe(122_002);
+  });
+
+  it('keys into result.modelUsage by the observed master model for the model name and context window', async () => {
+    // Two-model result: sub-agent entry is first, master entry is second. The
+    // model name + context window are picked by the observed master key; the
+    // total comes from the master's per-request usage.
     const result = {
       type: 'result',
       modelUsage: {
@@ -155,7 +218,7 @@ describe('contextUsageTracker', () => {
           inputTokens: 5000,
           cacheReadInputTokens: 0,
           cacheCreationInputTokens: 0,
-          contextWindow: 200000,
+          contextWindow: 400000,
         },
         [MASTER_MODEL]: {
           inputTokens: 200,
@@ -167,11 +230,17 @@ describe('contextUsageTracker', () => {
     };
     const tracker = createContextUsageTracker({ conversationId: 7, broadcastFn });
     // Master assistant event (no breakdown — getContextUsage rejects)
-    tracker.onAssistant({ getContextUsage: vi.fn().mockRejectedValue(new Error()) }, null, MASTER_MODEL);
+    tracker.onAssistant(
+      { getContextUsage: vi.fn().mockRejectedValue(new Error()) },
+      null,
+      MASTER_MODEL,
+      { input_tokens: 200, cache_read_input_tokens: 50, cache_creation_input_tokens: 50 },
+    );
     await tracker.onResult(result);
 
     expect(broadcastFn.mock.calls[0][1].data.model).toBe(MASTER_MODEL);
-    // 200 + 50 + 50 = master's totals, not the sub-agent's 5000.
+    expect(broadcastFn.mock.calls[0][1].data.maxTokens).toBe(200000); // master's window, not sub-agent's
+    // 200 + 50 + 50 = the master request's point-in-time usage.
     expect(broadcastFn.mock.calls[0][1].data.totalTokens).toBe(300);
   });
 });

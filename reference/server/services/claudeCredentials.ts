@@ -232,6 +232,7 @@ export interface ClaudeSdkEnv extends Record<string, string | undefined> {
   CLAUDE_CODE_OAUTH_TOKEN: string;
   HOME: string | undefined;
   PATH: string | undefined;
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: string;
   ANTHROPIC_API_KEY: undefined;
   ANTHROPIC_AUTH_TOKEN: undefined;
 }
@@ -245,6 +246,13 @@ export function buildClaudeSdkEnv(userId: number | string | undefined): ClaudeSd
     CLAUDE_CODE_OAUTH_TOKEN: token,
     HOME: process.env.HOME,
     PATH: process.env.PATH,
+    // Bottega runs one SDK subprocess per turn and aborts it at the terminal
+    // `result` (startConversation.ts onResult). SDK 2.1.198's "amber sentinel"
+    // blocks inline `sleep >= 25s` and steers the agent to run_in_background /
+    // Monitor, whose cross-turn <task-notification> can never be delivered in
+    // our per-turn model — the conversation deadlocks. Disabling background
+    // tasks restores the pre-2.1.198 inline-wait behavior.
+    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,
   };

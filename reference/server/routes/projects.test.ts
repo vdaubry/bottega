@@ -93,7 +93,24 @@ describe('Projects Routes - Phase 3', () => {
 
       expect(response.status).toBe(201);
       expect(response.body).toEqual(newProject);
-      expect(projectsDb.create).toHaveBeenCalledWith(testUserId, 'New Project', '/path/new', null);
+      expect(projectsDb.create).toHaveBeenCalledWith(testUserId, 'New Project', '/path/new', null, null);
+    });
+
+    it('stores a trimmed sensitive-areas list when one is given', async () => {
+      vi.mocked(projectsDb.create).mockReturnValue({ id: 2 } as never);
+
+      const response = await request(app)
+        .post('/api/projects')
+        .send({ name: 'Shop', repoFolderPath: '/path/shop', sensitiveAreas: '  - the orders tables\n' });
+
+      expect(response.status).toBe(201);
+      expect(projectsDb.create).toHaveBeenCalledWith(
+        testUserId,
+        'Shop',
+        '/path/shop',
+        null,
+        '- the orders tables',
+      );
     });
 
     it('should return 400 if name is missing', async () => {
@@ -173,6 +190,28 @@ describe('Projects Routes - Phase 3', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual(updatedProject);
       expect(updateProject).toHaveBeenCalledWith(1, testUserId, { name: 'Updated Name' });
+    });
+
+    it('updates the sensitive-areas list, and a blank one clears it', async () => {
+      vi.mocked(updateProject).mockReturnValue({ id: 1 } as never);
+
+      await request(app).put('/api/projects/1').send({ sensitiveAreas: ' - checkout and payments ' });
+      expect(updateProject).toHaveBeenCalledWith(1, testUserId, {
+        sensitive_areas: '- checkout and payments',
+      });
+
+      await request(app).put('/api/projects/1').send({ sensitiveAreas: '   ' });
+      expect(updateProject).toHaveBeenLastCalledWith(1, testUserId, { sensitive_areas: null });
+
+      await request(app).put('/api/projects/1').send({ sensitiveAreas: null });
+      expect(updateProject).toHaveBeenLastCalledWith(1, testUserId, { sensitive_areas: null });
+    });
+
+    it('leaves the sensitive-areas list untouched when the field is omitted', async () => {
+      vi.mocked(updateProject).mockReturnValue({ id: 1 } as never);
+
+      await request(app).put('/api/projects/1').send({ name: 'Renamed' });
+      expect(updateProject).toHaveBeenCalledWith(1, testUserId, { name: 'Renamed' });
     });
 
     it('should return 404 if project not found', async () => {

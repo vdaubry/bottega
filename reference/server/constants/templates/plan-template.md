@@ -37,8 +37,13 @@ summarize, or omit any part of it. This section is mandatory.
 ### Unit tests
 - {{ spec/test files and what each one covers }}
 
-### Manual / Playwright MCP testing
-- {{ scenarios with steps and expected results, or an explicit "not needed because …" }}
+### Manual QA
+- **Tool:** {{ Playwright MCP, curl, Rails runner, direct job/task invocation, DB/log/queue inspection, etc. }}
+- **Setup and safety:** {{ exact isolated data, environment, side-effect controls, and cleanup }}
+- **Scenario:** {{ precise steps that execute the changed behavior }}
+- **Expected evidence:** {{ observable output, persisted state, logs, queued work, or rendered behavior }}
+
+{{ If genuinely not applicable, write "Not needed" followed by a task-specific explanation of why this change has no executable runtime behavior to verify. }}
 
 ## To-Do List
 

@@ -254,7 +254,7 @@ export async function startClaudeAuthLogin(
     name: 'xterm-256color',
     cols: 1000,
     rows: 30,
-    env: env as Record<string, string>,
+    env: env,
   });
 
   const startedAtMs = Date.now();

@@ -5,10 +5,12 @@ vi.mock('../database/db.js', () => ({
   tasksDb: {
     getById: vi.fn(),
     getWithProject: vi.fn(),
+    assertWorktreeReady: vi.fn(),
     update: vi.fn(),
-    incrementRunCount: vi.fn()
+    incrementRunCount: vi.fn(),
+    blockWorkflow: vi.fn()
   },
-  agentRunsDb: {
+  taskAgentRunsDb: {
     create: vi.fn(),
     getByTask: vi.fn(),
     linkConversation: vi.fn(),
@@ -34,6 +36,8 @@ vi.mock('./notifications.js', () => ({
 
 vi.mock('./documentation.js', () => ({
   buildContextPrompt: vi.fn().mockReturnValue('test context prompt'),
+  buildEpicContextPrompt: vi.fn().mockReturnValue('epic context prompt'),
+  ensureEpicDirs: vi.fn(),
   getTaskDocPath: vi.fn((projectId, taskId) => `/archive/projects/${projectId}/tasks/task-${taskId}.md`),
   getRecordingPath: vi.fn((projectId, taskId) => `/archive/projects/${projectId}/recordings/task-${taskId}.webm`)
 }));
@@ -42,13 +46,27 @@ vi.mock('../constants/agentPrompts.js', () => ({
   generatePlanificationMessage: vi.fn().mockReturnValue('planification message'),
   generateImplementationMessage: vi.fn().mockReturnValue('implementation message'),
   generateReviewMessage: vi.fn().mockReturnValue('review message'),
-  generateRefinementMessage: vi.fn().mockReturnValue('refinement message')
+  generateRefinementMessage: vi.fn().mockReturnValue('refinement message'),
+  generatePrAgentMessage: vi.fn().mockReturnValue('pr message'),
+  generatePrAgentCommentMessage: vi.fn().mockReturnValue('pr comment message'),
+  generatePrAgentReviewMessage: vi.fn().mockReturnValue('pr review message'),
+  generateYoloMessage: vi.fn().mockReturnValue('yolo message')
 }));
+
 
 vi.mock('./worktree.js', () => ({
   getWorktreePath: vi.fn(),
   getWorktreeProjectPath: vi.fn(),
-  worktreeExists: vi.fn()
+  worktreeExists: vi.fn(),
+  hasUncommittedChanges: vi.fn(),
+  syncWithBase: vi.fn(),
+  getPullRequestStatus: vi.fn(),
+}));
+
+// Base-branch resolution (a task property since v2 step 3). Auto-sync keys
+// on the task row's base_branch directly.
+vi.mock('./tasks/baseBranch.js', () => ({
+  resolveBaseBranch: vi.fn(),
 }));
 
 vi.mock('./claudeCredentials.js', () => ({
@@ -80,17 +98,25 @@ vi.mock('./agentModelSettings.js', () => ({
     refinement: { provider: 'anthropic', model: 'opus', effort: 'high' },
     review: { provider: 'anthropic', model: 'opus', effort: 'high' },
     pr: { provider: 'anthropic', model: 'opus', effort: 'high' },
-    yolo: { provider: 'anthropic', model: 'opus', effort: 'high' }
+    yolo: { provider: 'anthropic', model: 'opus', effort: 'high' },
+    'epic-architecture': { provider: 'anthropic', model: 'sonnet', effort: 'high' },
+    'epic-specification': { provider: 'anthropic', model: 'opus', effort: 'high' },
+    'epic-stories': { provider: 'anthropic', model: 'opus', effort: 'high' },
+    'epic-spec-review': { provider: 'anthropic', model: 'opus', effort: 'high' },
+    'epic-orchestrator': { provider: 'anthropic', model: 'opus', effort: 'high' },
+    'epic-pr-review': { provider: 'anthropic', model: 'opus', effort: 'high' },
+    'epic-delivery': { provider: 'anthropic', model: 'opus', effort: 'high' }
   })
 }));
 
 import {
   startAgentRun,
-  getRunningAgentForTask,
+  BaseSyncConflictError,
+  TaskAgentRunConflictError,
   forceCompleteRunningAgents
 } from './agentRunner.js';
 
-import { tasksDb, agentRunsDb, conversationsDb, userDb } from '../database/db.js';
+import { tasksDb, taskAgentRunsDb, conversationsDb, userDb } from '../database/db.js';
 import { startConversation } from './conversationAdapter.js';
 import { updateUserBadge } from './notifications.js';
 import { buildContextPrompt } from './documentation.js';
@@ -98,10 +124,19 @@ import {
   generatePlanificationMessage,
   generateImplementationMessage,
   generateReviewMessage,
-  generateRefinementMessage
+  generateRefinementMessage,
+  generatePrAgentMessage,
+  generatePrAgentCommentMessage,
+  generateYoloMessage
 } from '../constants/agentPrompts.js';
-import { getWorktreeProjectPath, worktreeExists } from './worktree.js';
-import { validateClaudeCredentials } from './claudeCredentials.js';
+import {
+  getWorktreeProjectPath,
+  worktreeExists,
+  hasUncommittedChanges,
+  syncWithBase,
+  getPullRequestStatus,
+} from './worktree.js';
+import { resolveBaseBranch } from './tasks/baseBranch.js';
 import { loadAgentModelSettings } from './agentModelSettings.js';
 
 describe('agentRunner', () => {
@@ -121,7 +156,7 @@ describe('agentRunner', () => {
     agent_type: 'implementation',
     status: 'running',
     conversation_id: null
-  };
+  } as unknown as import('../database/db.js').TaskAgentRunRow;
 
   const mockConversation = {
     id: 1,
@@ -136,12 +171,15 @@ describe('agentRunner', () => {
   describe('startAgentRun', () => {
     beforeEach(() => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(agentRunsDb.create).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([]);
+      vi.mocked(taskAgentRunsDb.create).mockReturnValue(mockAgentRun);
       vi.mocked(conversationsDb.create).mockReturnValue(mockConversation as never);
-      vi.mocked(agentRunsDb.linkConversation).mockReturnValue({ ...mockAgentRun, conversation_id: 1 } as never);
+      vi.mocked(taskAgentRunsDb.linkConversation).mockReturnValue({ ...mockAgentRun, conversation_id: 1 });
       vi.mocked(startConversation).mockResolvedValue({ conversationId: 1, claudeSessionId: 'session-123' });
       vi.mocked(worktreeExists).mockResolvedValue(false);
       vi.mocked(userDb.getUserById).mockReturnValue({ id: 1, username: 'test', is_technical: 1 } as never);
+      // Standalone ticket on a `main`-default repo unless a test says otherwise.
+      vi.mocked(resolveBaseBranch).mockResolvedValue('main');
     });
 
     it('should throw error if task not found', async () => {
@@ -163,20 +201,54 @@ describe('agentRunner', () => {
         .rejects.toThrow('Claude credentials are not provisioned for user 42');
 
       expect(tasksDb.incrementRunCount).not.toHaveBeenCalled();
-      expect(agentRunsDb.create).not.toHaveBeenCalled();
+      expect(taskAgentRunsDb.create).not.toHaveBeenCalled();
       expect(conversationsDb.create).not.toHaveBeenCalled();
       expect(startConversation).not.toHaveBeenCalled();
+    });
+
+    it('refuses a second running task agent at the final write boundary', async () => {
+      const running = {
+        id: 8,
+        task_id: 1,
+        agent_type: 'review',
+        status: 'running',
+      };
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([running] as never);
+
+      await expect(startAgentRun(1, 'implementation')).rejects.toBeInstanceOf(
+        TaskAgentRunConflictError,
+      );
+      expect(tasksDb.incrementRunCount).not.toHaveBeenCalled();
+      expect(taskAgentRunsDb.create).not.toHaveBeenCalled();
+      expect(conversationsDb.create).not.toHaveBeenCalled();
     });
 
     it('should create agent run and conversation for planification agent', async () => {
       const result = await startAgentRun(1, 'planification');
 
-      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, true);
-      expect(agentRunsDb.create).toHaveBeenCalledWith(1, 'planification', null, 'anthropic');
+      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, true, null);
+      expect(taskAgentRunsDb.create).toHaveBeenCalledWith(1, 'planification', null, 'anthropic', 'human');
       expect(conversationsDb.create).toHaveBeenCalledWith(1, 'anthropic', 'opus', 'high');
-      expect(agentRunsDb.linkConversation).toHaveBeenCalledWith(1, 1);
+      expect(taskAgentRunsDb.linkConversation).toHaveBeenCalledWith(1, 1);
       expect(result.agentRun).toEqual(mockAgentRun);
       expect(result.conversation).toEqual(mockConversation);
+    });
+
+    it('hands the project sensitive-areas list to the planification prompt builder', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...mockTaskWithProject,
+        sensitive_areas: '- the orders tables and every query that reads them',
+      } as never);
+      vi.mocked(userDb.getUserById).mockReturnValue({ id: 1, username: 'owner', is_technical: 0 } as never);
+
+      await startAgentRun(1, 'planification');
+
+      expect(generatePlanificationMessage).toHaveBeenCalledWith(
+        '/archive/projects/1/tasks/task-1.md',
+        1,
+        false,
+        '- the orders tables and every query that reads them',
+      );
     });
 
     it('should fall back to the task owner is_technical when no userId is supplied', async () => {
@@ -186,7 +258,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'planification');
 
       expect(userDb.getUserById).toHaveBeenCalledWith(1);
-      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, false);
+      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, false, null);
     });
 
     it('should use the acting user is_technical even when the task owner differs (non-tech actor on tech-owned task)', async () => {
@@ -199,7 +271,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'planification', { userId: 2 });
 
       expect(userDb.getUserById).toHaveBeenCalledWith(2);
-      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, false);
+      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, false, null);
     });
 
     it('should use the acting user is_technical even when the task owner differs (tech actor on non-tech-owned task)', async () => {
@@ -212,14 +284,26 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'planification', { userId: 2 });
 
       expect(userDb.getUserById).toHaveBeenCalledWith(2);
-      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, true);
+      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, true, null);
+    });
+
+    it('an automation-driven planification always gets the technical prompt variant', async () => {
+      // Driver policy 1: the automation reviews the plan itself, so the
+      // non-technical variant (which only exists to auto-chain) would be
+      // reviewing nothing — even when the acting user is non-technical.
+      vi.mocked(userDb.getUserById).mockReturnValue({ id: 1, username: 'owner', is_technical: 0 } as never);
+
+      await startAgentRun(1, 'planification', { driver: 'automation' });
+
+      expect(generatePlanificationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1, true, null);
+      expect(taskAgentRunsDb.create).toHaveBeenCalledWith(1, 'planification', null, 'anthropic', 'automation');
     });
 
     it('should create agent run and conversation for implementation agent', async () => {
       const result = await startAgentRun(1, 'implementation');
 
       expect(generateImplementationMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1);
-      expect(agentRunsDb.create).toHaveBeenCalledWith(1, 'implementation', null, 'anthropic');
+      expect(taskAgentRunsDb.create).toHaveBeenCalledWith(1, 'implementation', null, 'anthropic', 'human');
       expect(conversationsDb.create).toHaveBeenCalledWith(1, 'anthropic', 'opus', 'high');
       expect(result.agentRun).toEqual(mockAgentRun);
     });
@@ -228,7 +312,7 @@ describe('agentRunner', () => {
       const result = await startAgentRun(1, 'review');
 
       expect(generateReviewMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1);
-      expect(agentRunsDb.create).toHaveBeenCalledWith(1, 'review', null, 'anthropic');
+      expect(taskAgentRunsDb.create).toHaveBeenCalledWith(1, 'review', null, 'anthropic', 'human');
       expect(conversationsDb.create).toHaveBeenCalledWith(1, 'anthropic', 'opus', 'high');
       expect(result.agentRun).toEqual(mockAgentRun);
     });
@@ -236,8 +320,12 @@ describe('agentRunner', () => {
     it('should create agent run and conversation for refinement agent', async () => {
       const result = await startAgentRun(1, 'refinement');
 
-      expect(generateRefinementMessage).toHaveBeenCalledWith('/archive/projects/1/tasks/task-1.md', 1);
-      expect(agentRunsDb.create).toHaveBeenCalledWith(1, 'refinement', null, 'anthropic');
+      expect(generateRefinementMessage).toHaveBeenCalledWith(
+        '/archive/projects/1/tasks/task-1.md',
+        1,
+        'main',
+      );
+      expect(taskAgentRunsDb.create).toHaveBeenCalledWith(1, 'refinement', null, 'anthropic', 'human');
       expect(conversationsDb.create).toHaveBeenCalledWith(1, 'anthropic', 'opus', 'high');
       expect(result.agentRun).toEqual(mockAgentRun);
     });
@@ -292,7 +380,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'implementation', { broadcastFn, userId: 1 });
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'implementation message',
         expect.objectContaining({
           broadcastFn,
@@ -311,13 +399,24 @@ describe('agentRunner', () => {
         refinement: { provider: 'anthropic', model: 'opus', effort: 'high' },
         review: { provider: 'anthropic', model: 'opus', effort: 'high' },
         pr: { provider: 'anthropic', model: 'opus', effort: 'high' },
-        yolo: { provider: 'anthropic', model: 'opus', effort: 'high' }
+        yolo: { provider: 'anthropic', model: 'opus', effort: 'high' },
+        schema: { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-architecture': { provider: 'anthropic', model: 'sonnet', effort: 'high' },
+        'epic-specification': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-stories': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-spec-review': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-orchestrator': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-pr-review': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-delivery': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-qa-scenarios': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-qa-execution': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-qa-fix': { provider: 'anthropic', model: 'opus', effort: 'high' }
       });
 
       await startAgentRun(1, 'planification');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'planification message',
         expect.objectContaining({
           model: 'sonnet',
@@ -326,26 +425,37 @@ describe('agentRunner', () => {
       );
     });
 
-    it('should stamp the configured provider on the conversation row (regression: gpt-5.5 → Anthropic SDK 404)', async () => {
+    it('should stamp the configured provider on the conversation row (regression: an OpenAI model id → Anthropic SDK 404)', async () => {
       vi.mocked(loadAgentModelSettings).mockReturnValueOnce({
-        planification: { provider: 'openai', model: 'gpt-5.5', effort: 'medium' },
+        planification: { provider: 'openai', model: 'gpt-6.1-sol', effort: 'medium' },
         implementation: { provider: 'anthropic', model: 'opus', effort: 'high' },
         refinement: { provider: 'anthropic', model: 'opus', effort: 'high' },
         review: { provider: 'anthropic', model: 'opus', effort: 'high' },
         pr: { provider: 'anthropic', model: 'opus', effort: 'high' },
-        yolo: { provider: 'anthropic', model: 'opus', effort: 'high' }
+        yolo: { provider: 'anthropic', model: 'opus', effort: 'high' },
+        schema: { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-architecture': { provider: 'anthropic', model: 'sonnet', effort: 'high' },
+        'epic-specification': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-stories': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-spec-review': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-orchestrator': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-pr-review': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-delivery': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-qa-scenarios': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-qa-execution': { provider: 'anthropic', model: 'opus', effort: 'high' },
+        'epic-qa-fix': { provider: 'anthropic', model: 'opus', effort: 'high' }
       });
 
       await startAgentRun(1, 'planification');
 
-      expect(conversationsDb.create).toHaveBeenCalledWith(1, 'openai', 'gpt-5.5', 'medium');
+      expect(conversationsDb.create).toHaveBeenCalledWith(1, 'openai', 'gpt-6.1-sol', 'medium');
     });
 
     it('should default each agent to opus + high when no overrides exist', async () => {
       await startAgentRun(1, 'review');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'review message',
         expect.objectContaining({
           model: 'opus',
@@ -358,7 +468,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'implementation');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'implementation message',
         expect.objectContaining({
           disallowedTools: ['Agent']
@@ -370,7 +480,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'planification');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'planification message',
         expect.objectContaining({
           disallowedTools: []
@@ -382,7 +492,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'review');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'review message',
         expect.objectContaining({
           disallowedTools: []
@@ -400,7 +510,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'review');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'review message',
         expect.objectContaining({
           videoConfig: expect.objectContaining({
@@ -420,7 +530,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'review');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'review message',
         expect.objectContaining({
           videoConfig: expect.objectContaining({
@@ -434,7 +544,7 @@ describe('agentRunner', () => {
       await startAgentRun(1, 'implementation');
 
       expect(startConversation).toHaveBeenCalledWith(
-        1,
+        { kind: 'task', taskId: 1 },
         'implementation message',
         expect.objectContaining({
           videoConfig: null
@@ -443,47 +553,150 @@ describe('agentRunner', () => {
     });
   });
 
-  describe('getRunningAgentForTask', () => {
-    it('should return null when no agents are running', () => {
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([
-        { id: 1, status: 'completed' } as never,
-        { id: 2, status: 'failed' } as never
-      ]);
+  // Epic tickets are brought up to date with their epic's feature branch, but
+  // only when a new pass over the ticket starts and only on a clean tree.
+  describe('startAgentRun — auto-sync with the epic feature branch', () => {
+    const broadcastToTaskSubscribersFn = vi.fn();
 
-      const result = getRunningAgentForTask(1);
-
-      expect(result).toBeNull();
+    beforeEach(() => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...mockTaskWithProject,
+        base_branch: 'epic/8-nimbus',
+      } as never);
+      vi.mocked(taskAgentRunsDb.create).mockReturnValue(mockAgentRun);
+      vi.mocked(conversationsDb.create).mockReturnValue(mockConversation as never);
+      vi.mocked(startConversation).mockResolvedValue({ conversationId: 1, claudeSessionId: 's' });
+      vi.mocked(userDb.getUserById).mockReturnValue({ id: 1, is_technical: 1 } as never);
+      vi.mocked(getPullRequestStatus).mockResolvedValue({ success: true, exists: false });
+      vi.mocked(resolveBaseBranch).mockResolvedValue('epic/8-nimbus');
+      vi.mocked(worktreeExists).mockResolvedValue(true);
+      vi.mocked(hasUncommittedChanges).mockResolvedValue({ success: true, hasChanges: false });
+      vi.mocked(syncWithBase).mockResolvedValue({ success: true });
     });
 
-    it('should return the running agent when one exists', () => {
-      const runningAgent = { id: 2, status: 'running', agent_type: 'implementation' };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([
-        { id: 1, status: 'completed' } as never,
-        runningAgent as never
-      ]);
+    it.each(['planification', 'yolo', 'pr'] as const)(
+      'syncs before a %s run (loop entry point)',
+      async (agentType) => {
+        await startAgentRun(1, agentType);
 
-      const result = getRunningAgentForTask(1);
+        expect(syncWithBase).toHaveBeenCalledWith('/path/to/project', 1, 'epic/8-nimbus');
+      },
+    );
 
-      expect(result).toEqual(runningAgent);
+    it.each(['implementation', 'review', 'refinement'] as const)(
+      'does NOT sync before a %s run (mid-loop worktree holds in-flight state)',
+      async (agentType) => {
+        await startAgentRun(1, agentType);
+
+        expect(syncWithBase).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not sync a task with no explicit base (base_branch NULL)', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...mockTaskWithProject,
+        base_branch: null,
+      } as never);
+      vi.mocked(resolveBaseBranch).mockResolvedValue('main');
+
+      await startAgentRun(1, 'planification');
+
+      expect(syncWithBase).not.toHaveBeenCalled();
     });
 
-    it('should return first running agent when multiple exist', () => {
-      const firstRunning = { id: 2, status: 'running', agent_type: 'implementation' } as never;
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([
-        { id: 1, status: 'completed' } as never,
-        firstRunning,
-        { id: 3, status: 'running', agent_type: 'review' } as never
-      ]);
+    it('does not sync when the worktree does not exist', async () => {
+      vi.mocked(worktreeExists).mockResolvedValue(false);
 
-      const result = getRunningAgentForTask(1);
+      await startAgentRun(1, 'planification');
 
-      expect(result).toEqual(firstRunning);
+      expect(syncWithBase).not.toHaveBeenCalled();
+    });
+
+    it('does not sync over uncommitted changes', async () => {
+      vi.mocked(hasUncommittedChanges).mockResolvedValue({ success: true, hasChanges: true });
+
+      await startAgentRun(1, 'planification');
+
+      expect(syncWithBase).not.toHaveBeenCalled();
+    });
+
+    it('fails the run, blocks the task and throws on a conflict', async () => {
+      vi.mocked(syncWithBase).mockResolvedValue({ success: false, error: 'CONFLICT (content)' });
+
+      await expect(
+        startAgentRun(1, 'planification', { broadcastToTaskSubscribersFn }),
+      ).rejects.toBeInstanceOf(BaseSyncConflictError);
+
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(1, 'failed');
+      expect(tasksDb.blockWorkflow).toHaveBeenCalledWith(1);
+      expect(broadcastToTaskSubscribersFn).toHaveBeenCalledWith(1, {
+        type: 'task-blocked',
+        reason: 'base-sync-conflict',
+      });
+      expect(broadcastToTaskSubscribersFn).toHaveBeenCalledWith(1, {
+        type: 'agent-run-updated',
+        agentRun: expect.objectContaining({ id: 1, status: 'failed' }),
+      });
+      // The conversation never starts on a conflicted worktree.
+      expect(startConversation).not.toHaveBeenCalled();
     });
   });
 
+  describe('startAgentRun — base branch in prompts', () => {
+    beforeEach(() => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(taskAgentRunsDb.create).mockReturnValue(mockAgentRun);
+      vi.mocked(conversationsDb.create).mockReturnValue(mockConversation as never);
+      vi.mocked(startConversation).mockResolvedValue({ conversationId: 1, claudeSessionId: 's' });
+      vi.mocked(worktreeExists).mockResolvedValue(false);
+      vi.mocked(getPullRequestStatus).mockResolvedValue({ success: true, exists: false });
+          });
+
+    it('passes the resolved base branch to the PR prompt (not a hardcoded main)', async () => {
+      vi.mocked(resolveBaseBranch).mockResolvedValue('master');
+
+      await startAgentRun(1, 'pr');
+
+      expect(generatePrAgentMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        1,
+        null,
+        'master',
+      );
+    });
+
+    it('passes the epic feature branch to the YOLO prompt', async () => {
+      vi.mocked(resolveBaseBranch).mockResolvedValue('epic/8-nimbus');
+
+      await startAgentRun(1, 'yolo');
+
+      expect(generateYoloMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        1,
+        null,
+        'epic/8-nimbus',
+      );
+    });
+
+    it('passes the base branch to the webhook-triggered PR-feedback prompt', async () => {
+      vi.mocked(resolveBaseBranch).mockResolvedValue('master');
+
+      await startAgentRun(1, 'pr', { webhookContext: { commentBody: 'fix this' } });
+
+      expect(generatePrAgentCommentMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        1,
+        null,
+        expect.objectContaining({ commentBody: 'fix this' }),
+        'master',
+      );
+    });
+  });
+
+
   describe('forceCompleteRunningAgents', () => {
     it('should return 0 when no agents are running', () => {
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([
         { id: 1, status: 'completed' } as never,
         { id: 2, status: 'failed' } as never
       ]);
@@ -491,11 +704,11 @@ describe('agentRunner', () => {
       const result = forceCompleteRunningAgents(1);
 
       expect(result).toBe(0);
-      expect(agentRunsDb.updateStatus).not.toHaveBeenCalled();
+      expect(taskAgentRunsDb.updateStatus).not.toHaveBeenCalled();
     });
 
     it('should force-complete single running agent', () => {
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([
         { id: 1, status: 'completed' } as never,
         { id: 2, status: 'running' } as never
       ]);
@@ -503,11 +716,11 @@ describe('agentRunner', () => {
       const result = forceCompleteRunningAgents(1);
 
       expect(result).toBe(1);
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(2, 'completed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(2, 'completed');
     });
 
     it('should force-complete multiple running agents', () => {
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([
         { id: 1, status: 'running' } as never,
         { id: 2, status: 'completed' } as never,
         { id: 3, status: 'running' } as never
@@ -516,8 +729,10 @@ describe('agentRunner', () => {
       const result = forceCompleteRunningAgents(1);
 
       expect(result).toBe(2);
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(1, 'completed');
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(3, 'completed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(1, 'completed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(3, 'completed');
     });
   });
+
+
 });

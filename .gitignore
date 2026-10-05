@@ -3,19 +3,28 @@
 # up at the repository root (agent/editor scratch dirs, OS cruft).
 
 # AI / agent scratch dirs
-.claude/
+.claude/*
+!.claude/commands/
+!.claude/workflows/
 .cursor/
 .roo/
 .cline/
 .windsurf/
 .serena/
 .mcp.json
+.playwright-mcp/
 
 # Editor
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Build / test output and scratch
+.vite/
+coverage/
+dist/
+tmp/
 
 # OS generated files
 .DS_Store

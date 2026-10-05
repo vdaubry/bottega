@@ -7,9 +7,11 @@ function LoginForm() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const { login } = useAuth();
+  const { login, error: authError } = useAuth();
+  // A boot-time session check that failed for a reason other than a bad
+  // credential (a 503 while the database is locked, a network error) lands
+  // here with the token still stored: say why, rather than show a bare form.
+  const [error, setError] = useState(authError ?? '');
   const { internalToolName } = useAppSettings();
 
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {

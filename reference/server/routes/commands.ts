@@ -2,6 +2,7 @@ import express, { type Request, type Response } from 'express';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import matter from 'gray-matter';
 import type { ApiError } from '../../shared/api/_common.js';
 import type {
@@ -13,10 +14,18 @@ import type {
 
 const router = express.Router();
 
+// Bottega's own .claude/commands/ ships with the repo and applies to every
+// project (workflow commands like /implement). It lives at the repo root,
+// one level above the `reference/` runtime — i.e. three levels up from
+// `reference/server/routes/`.
+const __filename = fileURLToPath(import.meta.url);
+const BOTTEGA_INSTALL_ROOT = path.resolve(path.dirname(__filename), '..', '..', '..');
+const BUILTIN_COMMANDS_DIR = path.join(BOTTEGA_INSTALL_ROOT, '.claude', 'commands');
+
 async function scanCommandsDirectory(
   dir: string,
   baseDir: string,
-  namespace: 'project' | 'user',
+  namespace: 'builtin' | 'project' | 'user',
 ): Promise<SlashCommand[]> {
   const commands: SlashCommand[] = [];
 
@@ -85,7 +94,15 @@ router.post(
   ) => {
     try {
       const { projectPath } = req.body;
-      const allCommands: SlashCommand[] = [];
+
+      const builtInCommands = await scanCommandsDirectory(
+        BUILTIN_COMMANDS_DIR,
+        BUILTIN_COMMANDS_DIR,
+        'builtin',
+      );
+      builtInCommands.sort((a, b) => a.name.localeCompare(b.name));
+
+      const customCommands: SlashCommand[] = [];
 
       if (projectPath) {
         const projectCommandsDir = path.join(projectPath, '.claude', 'commands');
@@ -94,7 +111,7 @@ router.post(
           projectCommandsDir,
           'project',
         );
-        allCommands.push(...projectCommands);
+        customCommands.push(...projectCommands);
       }
 
       const homeDir = os.homedir();
@@ -104,14 +121,14 @@ router.post(
         userCommandsDir,
         'user',
       );
-      allCommands.push(...userCommands);
+      customCommands.push(...userCommands);
 
-      allCommands.sort((a, b) => a.name.localeCompare(b.name));
+      customCommands.sort((a, b) => a.name.localeCompare(b.name));
 
       res.json({
-        builtIn: [],
-        custom: allCommands,
-        count: allCommands.length,
+        builtIn: builtInCommands,
+        custom: customCommands,
+        count: builtInCommands.length + customCommands.length,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

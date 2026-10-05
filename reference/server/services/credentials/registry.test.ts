@@ -45,7 +45,9 @@ describe('credentials/registry', () => {
 
   it('default module load wires opencode alongside anthropic and openai', async () => {
     _resetForTests();
-    await import('./registry.js?reload=opencode-default' as string).catch(() => {
+    // @ts-expect-error — the query string is a Vite cache-buster; TS cannot
+    // resolve a query-suffixed specifier (vitest resolves it at runtime).
+    await import('./registry.js?reload=opencode-default').catch(() => {
       // The query string is a no-op; importing the bare module re-runs the
       // top-level registerCredentialStore() calls once the registry has
       // been reset.

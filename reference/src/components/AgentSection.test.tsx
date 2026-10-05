@@ -2,7 +2,7 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import AgentSection from './AgentSection';
-import type { AgentRunRow } from '../../shared/types/db';
+import type { TaskAgentRunRow } from '../../shared/types/db';
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
@@ -43,8 +43,8 @@ vi.mock('../lib/utils', () => ({
 }));
 
 // Tests use partial agent-run shapes (and string-coerced ids) for readability;
-// cast through unknown so the strict AgentRunRow shape doesn't fight us.
-const asAgentRun = (run: Record<string, unknown>): AgentRunRow => run as unknown as AgentRunRow;
+// cast through unknown so the strict TaskAgentRunRow shape doesn't fight us.
+const asAgentRun = (run: Record<string, unknown>): TaskAgentRunRow => run as unknown as TaskAgentRunRow;
 
 describe('AgentSection', () => {
   const defaultProps = {

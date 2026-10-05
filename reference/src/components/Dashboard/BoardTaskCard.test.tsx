@@ -224,4 +224,35 @@ describe('BoardTaskCard Component', () => {
       expect(card).toHaveAttribute('tabIndex', '0');
     });
   });
+
+  describe('Worktree setup badge', () => {
+    it('says SETTING UP while the worktree is being set up', () => {
+      render(
+        <BoardTaskCard
+          {...defaultProps}
+          task={asTask({ id: 5, title: 'New', worktree_state: 'provisioning' })}
+        />,
+      );
+      expect(screen.getByTestId('board-task-setup-5')).toHaveTextContent('SETTING UP');
+    });
+
+    it('says SETUP FAILED, and takes precedence over BLOCKED', () => {
+      render(
+        <BoardTaskCard
+          {...defaultProps}
+          isBlocked
+          task={asTask({ id: 5, title: 'New', worktree_state: 'failed' })}
+        />,
+      );
+      expect(screen.getByTestId('board-task-setup-5')).toHaveTextContent('SETUP FAILED');
+      expect(screen.queryByText('BLOCKED')).not.toBeInTheDocument();
+    });
+
+    it('shows nothing once the worktree is ready', () => {
+      render(
+        <BoardTaskCard {...defaultProps} task={asTask({ id: 5, title: 'New', worktree_state: 'ready' })} />,
+      );
+      expect(screen.queryByTestId('board-task-setup-5')).not.toBeInTheDocument();
+    });
+  });
 });

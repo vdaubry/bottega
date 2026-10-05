@@ -233,6 +233,8 @@ describe('Auth Routes', () => {
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ success: true, message: 'Logged out successfully' });
       expect(mockedUserDb.bumpTokenVersion).toHaveBeenCalledWith(5);
+      // No rolling refresh: the client would store it after signing out.
+      expect(res.headers['x-refreshed-token']).toBeUndefined();
     });
 
     it('rejects logout without a token', async () => {

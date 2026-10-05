@@ -8,11 +8,23 @@
  * by the ConversationAdapter when streaming completes.
  */
 
-import { tasksDb, agentRunsDb, conversationsDb, userDb } from '../database/db.js';
+import { tasksDb, taskAgentRunsDb, conversationsDb, userDb } from '../database/db.js';
 import { startConversation } from './conversationAdapter.js';
 import { updateUserBadge } from './notifications.js';
-import { buildContextPrompt, getTaskDocPath, getRecordingPath } from './documentation.js';
-import { getWorktreeProjectPath, worktreeExists, getPullRequestStatus } from './worktree.js';
+import {
+  buildContextPrompt,
+  getTaskDocPath,
+  getRecordingPath,
+} from './documentation.js';
+import {
+  getWorktreeProjectPath,
+  worktreeExists,
+  getPullRequestStatus,
+  hasUncommittedChanges,
+  syncWithBase,
+} from './worktree.js';
+import { emitTaskEvent } from './tasks/events.js';
+import { resolveBaseBranch } from './tasks/baseBranch.js';
 import { getCredentialStore } from './credentials/registry.js';
 import { ProviderCredentialsMissingError } from './credentials/types.js';
 import {
@@ -26,7 +38,7 @@ import {
   generateYoloMessage,
 } from '../constants/agentPrompts.js';
 import { loadAgentModelSettings } from './agentModelSettings.js';
-import type { AgentRunRow, CreatedConversation } from '../database/db.js';
+import type { AgentRunDriver, TaskAgentRunRow, CreatedConversation, TaskWithProject } from '../database/db.js';
 import type {
   AgentType,
   BroadcastFn,
@@ -42,13 +54,76 @@ export interface StartAgentRunOptions {
     comments?: unknown;
     [key: string]: unknown;
   } | undefined;
+  /**
+   * Who starts this run and therefore reviews its output. Defaults to
+   * 'human' (every UI and webhook caller). An automation (the epic
+   * orchestrator today) passes 'automation'; chained runs inherit the parent
+   * run's driver, so the whole autonomous stretch keeps it. Policy, not
+   * identity — see the three driver policies in
+   * docs/epics/architecture-v2.md.
+   */
+  driver?: AgentRunDriver | undefined;
+  /**
+   * Extra instructions appended to the agent's generated prompt, verbatim.
+   * The epic orchestrator uses it to hand a restarted agent the correction a
+   * human would have typed — "the Playwright MCP is back, re-run QA", "the
+   * 5.05s job is within tolerance, stop reworking it". Never a substitute for
+   * the ticket document: it is context for THIS run only.
+   */
+  extraContext?: string | undefined;
 }
 
 export interface StartAgentRunResult {
-  agentRun: AgentRunRow;
+  agentRun: TaskAgentRunRow;
   conversation: CreatedConversation;
   claudeSessionId: string;
 }
+
+/** The task domain's single execution invariant: one running task agent. */
+export function getRunningAgentForTask(taskId: number): TaskAgentRunRow | null {
+  return taskAgentRunsDb.getByTask(taskId).find((run) => run.status === 'running') ?? null;
+}
+
+/** A caller attempted to start a second task agent while one is still running. */
+export class TaskAgentRunConflictError extends Error {
+  constructor(
+    public readonly taskId: number,
+    public readonly runningAgent: TaskAgentRunRow,
+  ) {
+    super(
+      `Task ${taskId} already has a running ${runningAgent.agent_type} agent ` +
+        `(run ${runningAgent.id})`,
+    );
+    this.name = 'TaskAgentRunConflictError';
+  }
+}
+
+/**
+ * The worktree could not be brought up to date with the task's base branch
+ * because the merge conflicts. The run is already marked failed and the task
+ * blocked when this is thrown; the route answers 409.
+ */
+export class BaseSyncConflictError extends Error {
+  constructor(
+    public readonly taskId: number,
+    public readonly baseBranch: string,
+    public readonly gitError: string,
+  ) {
+    super(
+      `Task ${taskId} could not be synced with ${baseBranch}: ${gitError}. ` +
+        'Resolve the conflicts in the worktree, then resume the task.',
+    );
+    this.name = 'BaseSyncConflictError';
+  }
+}
+
+/**
+ * Agent types that open a fresh pass over the ticket. Only these auto-sync the
+ * worktree with the epic's feature branch: mid-loop types (implementation,
+ * review, refinement) run on a worktree that holds in-flight state, and
+ * merging under them would rewrite files the agent is reasoning about.
+ */
+const LOOP_ENTRY_AGENT_TYPES: readonly AgentType[] = ['planification', 'yolo', 'pr'];
 
 /**
  * Start an agent run for a task
@@ -60,12 +135,16 @@ export async function startAgentRun(
   options: StartAgentRunOptions = {},
 ): Promise<StartAgentRunResult> {
   const { broadcastFn, broadcastToTaskSubscribersFn, userId } = options;
+  const driver: AgentRunDriver = options.driver ?? 'human';
 
   // Get task and project info
   const taskWithProject = tasksDb.getWithProject(taskId);
   if (!taskWithProject) {
     throw new Error(`Task ${taskId} not found`);
   }
+  // Before any side effect (run counter, run row): no agent works in a
+  // worktree that is still being set up, or whose setup failed.
+  tasksDb.assertWorktreeReady(taskId);
   const effectiveUserId = userId ?? taskWithProject.user_id ?? undefined;
 
   // Get effective path (worktree if exists, otherwise main repo)
@@ -76,16 +155,37 @@ export async function startAgentRun(
   // Task doc lives in the central archive, not the worktree — survives PR merge
   const taskDocPath = getTaskDocPath(taskWithProject.project_id, taskId);
 
+  // The branch this ticket forked from and will merge back into. Resolved once
+  // here and threaded into every prompt that talks about `origin/<base>`, so a
+  // `master`-default repo and an epic ticket both get correct instructions
+  // instead of a hardcoded `origin/main`.
+  const baseBranch = await resolveBaseBranch(
+    taskWithProject,
+    taskWithProject.repo_folder_path,
+  );
+
   // Generate message based on agent type
   let message: string;
   switch (agentType) {
     case 'planification': {
-      // Tech-vs-non-tech follows the user *triggering* the run, not the
-      // task creator. effectiveUserId already falls back to the task owner
-      // when no acting user is supplied (programmatic callers).
+      // Driver policy 1: an automation-driven run always gets the technical
+      // prompt variant — the driver reviews the plan itself, so the
+      // non-technical variant (which exists to auto-chain straight into
+      // implementation) would be reviewing nothing. For human runs,
+      // tech-vs-non-tech follows the user *triggering* the run, not the task
+      // creator. effectiveUserId already falls back to the task owner when no
+      // acting user is supplied (programmatic callers).
       const actor = effectiveUserId ? userDb.getUserById(effectiveUserId) : null;
-      const actorIsTechnical = actor ? actor.is_technical !== 0 : true;
-      message = await generatePlanificationMessage(taskDocPath, taskId, actorIsTechnical);
+      const actorIsTechnical =
+        driver === 'automation' ? true : actor ? actor.is_technical !== 0 : true;
+      // The project's sensitive-areas list feeds the non-technical guardrail;
+      // the builder ignores it for the technical variant.
+      message = await generatePlanificationMessage(
+        taskDocPath,
+        taskId,
+        actorIsTechnical,
+        taskWithProject.sensitive_areas ?? null,
+      );
       break;
     }
     case 'implementation':
@@ -95,7 +195,7 @@ export async function startAgentRun(
       message = await generateReviewMessage(taskDocPath, taskId);
       break;
     case 'refinement':
-      message = await generateRefinementMessage(taskDocPath, taskId);
+      message = await generateRefinementMessage(taskDocPath, taskId, baseBranch);
       break;
     case 'pr': {
       // IMPORTANT: Use main repo path (not worktree path) for getPullRequestStatus
@@ -108,22 +208,40 @@ export async function startAgentRun(
       const webhookCtx = options.webhookContext;
       if (webhookCtx?.comments) {
         // Shape is validated by the webhook route (commit 5: zod boundary).
-        message = await generatePrAgentReviewMessage(taskDocPath, taskId, prUrl, webhookCtx as never);
+        message = await generatePrAgentReviewMessage(
+          taskDocPath,
+          taskId,
+          prUrl,
+          webhookCtx as never,
+          baseBranch,
+        );
       } else if (webhookCtx) {
-        message = await generatePrAgentCommentMessage(taskDocPath, taskId, prUrl, webhookCtx as never);
+        message = await generatePrAgentCommentMessage(
+          taskDocPath,
+          taskId,
+          prUrl,
+          webhookCtx as never,
+          baseBranch,
+        );
       } else {
-        message = await generatePrAgentMessage(taskDocPath, taskId, prUrl);
+        message = await generatePrAgentMessage(taskDocPath, taskId, prUrl, baseBranch);
       }
       break;
     }
     case 'yolo': {
       const yoloPrStatus = await getPullRequestStatus(taskWithProject.repo_folder_path, taskId);
       const yoloPrUrl = yoloPrStatus.exists ? yoloPrStatus.url ?? null : null;
-      message = await generateYoloMessage(taskDocPath, taskId, yoloPrUrl);
+      message = await generateYoloMessage(taskDocPath, taskId, yoloPrUrl, baseBranch);
       break;
     }
     default:
       throw new Error(`Unknown agent type: ${agentType}`);
+  }
+
+  if (options.extraContext?.trim()) {
+    message +=
+      `\n\n---\n\n## Note from your supervisor\n\n${options.extraContext.trim()}\n\n` +
+      'This note is about this run specifically. The task document above remains the brief.';
   }
 
   // Resolve THIS USER's configured provider for this agent up-front so we can
@@ -152,10 +270,13 @@ export async function startAgentRun(
   }
 
   // Create video recording config for review agents (Playwright MCP video capture).
-  // Per docs/opencode/00-context-decisions.md § R1: OpenCode runs review
-  // agents in degraded mode — no Playwright MCP, no recording temp dir.
+  // Every provider now receives the operator's MCP servers — Claude through
+  // `sdkOptions.mcpServers`, Codex and OpenCode through the turn `extras`
+  // (`shared/providers/operatorMcpServers.ts`) — so a review agent gets Playwright
+  // and a recording temp dir whatever it runs on. The old OpenCode carve-out
+  // ("degraded mode, no Playwright MCP") is gone with the gap that caused it.
   let videoConfig: VideoConfig | null = null;
-  if (agentType === 'review' && provider !== 'opencode') {
+  if (agentType === 'review') {
     const tempDir = `/tmp/bottega-video-${taskId}-${Date.now()}`;
     videoConfig = {
       tempDir,
@@ -168,6 +289,15 @@ export async function startAgentRun(
     };
   }
 
+  // This is the authoritative task-local concurrency guard. All preparation
+  // above is read-only; keep this final check immediately adjacent to the
+  // synchronous SQLite writes below so two async callers cannot both insert a
+  // running row in this single-process server.
+  const runningAgent = getRunningAgentForTask(taskId);
+  if (runningAgent) {
+    throw new TaskAgentRunConflictError(taskId, runningAgent);
+  }
+
   // Increment workflow run count (for infinite loop prevention)
   tasksDb.incrementRunCount(taskId);
 
@@ -175,13 +305,13 @@ export async function startAgentRun(
   // (provider, model, effort) were loaded above so credential
   // validation could see the right backend.
   void agentSettings;
-  const agentRun = agentRunsDb.create(taskId, agentType, null, provider);
+  const agentRun = taskAgentRunsDb.create(taskId, agentType, null, provider, driver);
   console.log(
-    `[AgentRunner] Created agent run ${agentRun.id} (${agentType}) for task ${taskId} (provider=${provider})`,
+    `[AgentRunner] Created agent run ${agentRun.id} (${agentType}) for task ${taskId} (provider=${provider}, driver=${driver})`,
   );
 
   // Set agent run status to 'running' immediately
-  agentRunsDb.updateStatus(agentRun.id, 'running');
+  taskAgentRunsDb.updateStatus(agentRun.id, 'running');
   agentRun.status = 'running';
 
   // Create conversation. Stamp the configured (provider, model, effort) so
@@ -195,7 +325,7 @@ export async function startAgentRun(
   );
 
   // Link conversation to agent run
-  agentRunsDb.linkConversation(agentRun.id, conversation.id);
+  taskAgentRunsDb.linkConversation(agentRun.id, conversation.id);
   console.log(`[AgentRunner] Linked conversation ${conversation.id} to agent run ${agentRun.id}`);
 
   // Broadcast agent run created/running to task subscribers
@@ -210,6 +340,17 @@ export async function startAgentRun(
       },
     });
   }
+
+  // Bring the worktree up to date with the task's base branch before the
+  // agent starts reading code. Only at a loop entry point, only on a clean
+  // tree, and only when the task HAS an explicit base (an epic ticket's
+  // feature branch) — a standalone task's base is the default branch, and
+  // syncing that is still the user's explicit call.
+  await autoSyncWithBase(taskWithProject, agentType, {
+    agentRunId: agentRun.id,
+    conversationId: conversation.id,
+    ...(broadcastToTaskSubscribersFn ? { broadcastToTaskSubscribersFn } : {}),
+  });
 
   // Update task status to 'in_progress' if it's currently 'pending'
   if (taskWithProject.status === 'pending') {
@@ -238,7 +379,7 @@ export async function startAgentRun(
   // Start conversation via adapter
   // The adapter handles all lifecycle events (streaming-started, streaming-ended,
   // agent status updates, notifications, and chaining)
-  const { claudeSessionId } = await startConversation(taskId, message, {
+  const { claudeSessionId } = await startConversation({ kind: 'task', taskId }, message, {
     broadcastFn,
     broadcastToTaskSubscribersFn,
     userId: effectiveUserId,
@@ -256,11 +397,74 @@ export async function startAgentRun(
 }
 
 /**
- * Check if an agent is currently running for a task
+ * Merge the task's base branch into its worktree before an entry-point agent
+ * run. Silent no-op for a task with no explicit base (`base_branch` NULL).
+ *
+ * A conflict is terminal for this run: the agent would otherwise start on a
+ * tree full of conflict markers. The run is failed, the task blocked (the
+ * existing "resume" affordance is the recovery path) and a typed error thrown
+ * for the route to translate into a 409.
  */
-export function getRunningAgentForTask(taskId: number): AgentRunRow | null {
-  const allRuns = agentRunsDb.getByTask(taskId);
-  return allRuns.find((r) => r.status === 'running') || null;
+async function autoSyncWithBase(
+  task: TaskWithProject,
+  agentType: AgentType,
+  ctx: {
+    agentRunId: number;
+    conversationId: number;
+    broadcastToTaskSubscribersFn?: BroadcastToTaskSubscribersFn | undefined;
+  },
+): Promise<void> {
+  if (!LOOP_ENTRY_AGENT_TYPES.includes(agentType)) return;
+
+  const baseBranch = task.base_branch;
+  if (!baseBranch) return;
+
+  if (!(await worktreeExists(task.repo_folder_path, task.id))) return;
+
+  const dirty = await hasUncommittedChanges(task.repo_folder_path, task.id);
+  if (!dirty.success || dirty.hasChanges) {
+    console.log(
+      `[AgentRunner] Skipping base sync for task ${task.id}: worktree has uncommitted changes`,
+    );
+    return;
+  }
+
+  const sync = await syncWithBase(task.repo_folder_path, task.id, baseBranch);
+  if (sync.success) {
+    console.log(`[AgentRunner] Synced task ${task.id} worktree with ${baseBranch}`);
+    return;
+  }
+
+  console.error(
+    `[AgentRunner] Base sync failed for task ${task.id} (${baseBranch}): ${sync.error}`,
+  );
+  taskAgentRunsDb.updateStatus(ctx.agentRunId, 'failed');
+  tasksDb.blockWorkflow(task.id);
+
+  ctx.broadcastToTaskSubscribersFn?.(task.id, {
+    type: 'agent-run-updated',
+    agentRun: {
+      id: ctx.agentRunId,
+      status: 'failed',
+      agent_type: agentType,
+      conversation_id: ctx.conversationId,
+    },
+  });
+  ctx.broadcastToTaskSubscribersFn?.(task.id, {
+    type: 'task-blocked',
+    reason: 'base-sync-conflict',
+  });
+
+  // Whoever supervises this task (the epic orchestrator, via its subscriber)
+  // cannot fix this itself, but it must know the ticket it just started is
+  // dead in the water.
+  emitTaskEvent('workflow-blocked', {
+    taskId: task.id,
+    reason: 'base-sync-conflict',
+    detail: `Merging ${baseBranch} into the ticket worktree failed: ${sync.error ?? 'unknown error'}`,
+  });
+
+  throw new BaseSyncConflictError(task.id, baseBranch, sync.error ?? 'unknown error');
 }
 
 /**
@@ -268,12 +472,12 @@ export function getRunningAgentForTask(taskId: number): AgentRunRow | null {
  * Used for recovery from stuck states
  */
 export function forceCompleteRunningAgents(taskId: number): number {
-  const agentRuns = agentRunsDb.getByTask(taskId);
+  const agentRuns = taskAgentRunsDb.getByTask(taskId);
   let count = 0;
 
   for (const run of agentRuns) {
     if (run.status === 'running') {
-      agentRunsDb.updateStatus(run.id, 'completed');
+      taskAgentRunsDb.updateStatus(run.id, 'completed');
       console.log(`[AgentRunner] Force-completed stuck agent run ${run.id}`);
       count++;
     }

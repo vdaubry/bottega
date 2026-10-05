@@ -23,20 +23,25 @@ import {
 
 describe('shared/providers/models', () => {
   describe('static lists', () => {
-    it('exposes the canonical Anthropic model list (sonnet, opus — no haiku)', () => {
-      expect(ANTHROPIC_MODELS).toEqual(['sonnet', 'opus']);
+    it('exposes the canonical Anthropic model list (sonnet, opus, fable — no haiku)', () => {
+      expect(ANTHROPIC_MODELS).toEqual(['sonnet', 'opus', 'fable']);
     });
 
     it('exposes Anthropic efforts including xhigh and max', () => {
       expect(ANTHROPIC_EFFORTS).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     });
 
-    it('exposes the canonical OpenAI model list (gpt-5.5, gpt-5.4, gpt-5.4-mini)', () => {
-      expect(OPENAI_MODELS).toEqual(['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']);
+    it('exposes the canonical OpenAI model list, newest first (gpt-6-astra leads)', () => {
+      expect(OPENAI_MODELS).toEqual(['gpt-6-astra', 'gpt-6.1-sol']);
     });
 
-    it('exposes OpenAI efforts mirroring the SDK ModelReasoningEffort union (minimal..xhigh)', () => {
-      expect(OPENAI_EFFORTS).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh']);
+    it('exposes OpenAI efforts as the intersection every listed model accepts (medium..xhigh)', () => {
+      // `minimal` and `low` retired with GPT-6 Astra: its documented
+      // `reasoning.effort` range starts at `low` and it rejects the Codex
+      // CLI's `minimal`, so neither is safe across the whole model list.
+      // Persisted rows carrying them are rewritten by
+      // `migrateRetiredOpenAiEfforts`.
+      expect(OPENAI_EFFORTS).toEqual(['medium', 'high', 'xhigh']);
     });
 
     it('ships no hardcoded OpenCode model list — the Zen catalog is fetched live from /api/opencode-auth/models', () => {
@@ -95,7 +100,7 @@ describe('shared/providers/models', () => {
       expect(isAnthropicModel('sonnet')).toBe(true);
       expect(isAnthropicModel('opus')).toBe(true);
       expect(isAnthropicModel('haiku')).toBe(false);
-      expect(isAnthropicModel('gpt-5.5')).toBe(false);
+      expect(isAnthropicModel('gpt-6.1-sol')).toBe(false);
     });
 
     it('isAnthropicEffort rejects bogus efforts', () => {
@@ -105,22 +110,27 @@ describe('shared/providers/models', () => {
       expect(isAnthropicEffort('extreme')).toBe(false);
     });
 
-    it('isOpenAIModel accepts gpt-5.* and rejects anthropic models', () => {
-      expect(isOpenAIModel('gpt-5.5')).toBe(true);
-      expect(isOpenAIModel('gpt-5.4-mini')).toBe(true);
+    it('isOpenAIModel accepts the gpt-6 models and rejects retired and anthropic models', () => {
+      expect(isOpenAIModel('gpt-6-astra')).toBe(true);
+      expect(isOpenAIModel('gpt-6.1-sol')).toBe(true);
+      expect(isOpenAIModel('gpt-5.6-sol')).toBe(false);
+      expect(isOpenAIModel('gpt-5.4')).toBe(false);
+      expect(isOpenAIModel('gpt-5.4-mini')).toBe(false);
       expect(isOpenAIModel('opus')).toBe(false);
       expect(isOpenAIModel('gpt-4')).toBe(false);
     });
 
-    it('isOpenAIEffort accepts minimal..xhigh and rejects max', () => {
-      expect(isOpenAIEffort('minimal')).toBe(true);
+    it('isOpenAIEffort accepts medium..xhigh and rejects the retired minimal/low and max', () => {
+      expect(isOpenAIEffort('medium')).toBe(true);
       expect(isOpenAIEffort('xhigh')).toBe(true);
+      expect(isOpenAIEffort('minimal')).toBe(false);
+      expect(isOpenAIEffort('low')).toBe(false);
       expect(isOpenAIEffort('max')).toBe(false);
       expect(isOpenAIEffort(undefined)).toBe(false);
     });
 
     it('isOpenCodeModel accepts anything with the opencode/ prefix — Zen owns the namespace', () => {
-      expect(isOpenCodeModel('opencode/kimi-k2.6')).toBe(true);
+      expect(isOpenCodeModel('opencode/kimi-k2.7-code')).toBe(true);
       expect(isOpenCodeModel('opencode/qwen3.6-plus')).toBe(true);
       // Unknown model names also pass — runtime validation happens
       // at the SDK boundary where OpenCode itself returns "Model not
@@ -128,7 +138,7 @@ describe('shared/providers/models', () => {
       // removed in Phase 12.3.
       expect(isOpenCodeModel('opencode/some-future-model')).toBe(true);
       // Bare modelID (SDK form) is not the Bottega-persisted shape.
-      expect(isOpenCodeModel('kimi-k2.6')).toBe(false);
+      expect(isOpenCodeModel('kimi-k2.7-code')).toBe(false);
       expect(isOpenCodeModel('opus')).toBe(false);
       // Empty bare ID is not a valid OpenCode model string.
       expect(isOpenCodeModel('opencode/')).toBe(false);
@@ -145,22 +155,28 @@ describe('shared/providers/models', () => {
 
     it('isModelForProvider rejects cross-provider models', () => {
       expect(isModelForProvider('anthropic', 'opus')).toBe(true);
-      expect(isModelForProvider('anthropic', 'gpt-5.5')).toBe(false);
-      expect(isModelForProvider('openai', 'gpt-5.4-mini')).toBe(true);
+      expect(isModelForProvider('anthropic', 'gpt-6.1-sol')).toBe(false);
+      expect(isModelForProvider('openai', 'gpt-6.1-sol')).toBe(true);
+      expect(isModelForProvider('openai', 'gpt-6-astra')).toBe(true);
+      expect(isModelForProvider('anthropic', 'gpt-6-astra')).toBe(false);
       expect(isModelForProvider('openai', 'opus')).toBe(false);
       expect(isModelForProvider('openai', null)).toBe(false);
-      expect(isModelForProvider('opencode', 'opencode/kimi-k2.6')).toBe(true);
+      expect(isModelForProvider('opencode', 'opencode/kimi-k2.7-code')).toBe(true);
       // Any opencode/ prefix passes — Zen owns the catalog.
       expect(isModelForProvider('opencode', 'opencode/some-future-model')).toBe(true);
-      expect(isModelForProvider('opencode', 'kimi-k2.6')).toBe(false);
+      expect(isModelForProvider('opencode', 'kimi-k2.7-code')).toBe(false);
       expect(isModelForProvider('opencode', 'opus')).toBe(false);
-      expect(isModelForProvider('anthropic', 'opencode/kimi-k2.6')).toBe(false);
+      expect(isModelForProvider('anthropic', 'opencode/kimi-k2.7-code')).toBe(false);
     });
 
     it('isEffortForProvider rejects cross-provider efforts', () => {
       expect(isEffortForProvider('anthropic', 'max')).toBe(true);
       expect(isEffortForProvider('anthropic', 'minimal')).toBe(false);
-      expect(isEffortForProvider('openai', 'minimal')).toBe(true);
+      expect(isEffortForProvider('openai', 'medium')).toBe(true);
+      // Retired with GPT-6 Astra; `low` survives for Anthropic only.
+      expect(isEffortForProvider('openai', 'minimal')).toBe(false);
+      expect(isEffortForProvider('anthropic', 'low')).toBe(true);
+      expect(isEffortForProvider('openai', 'low')).toBe(false);
       expect(isEffortForProvider('openai', 'max')).toBe(false);
       expect(isEffortForProvider('opencode', 'high')).toBe(false);
       expect(isEffortForProvider('opencode', 'max')).toBe(false);

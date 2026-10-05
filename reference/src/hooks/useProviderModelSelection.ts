@@ -28,9 +28,9 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
 const MODEL_LABELS: Record<string, string> = {
   sonnet: 'Sonnet',
   opus: 'Opus',
-  'gpt-5.5': 'GPT-5.5',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.4-mini': 'GPT-5.4 mini',
+  fable: 'Fable',
+  'gpt-6-astra': 'GPT-6 Astra',
+  'gpt-6.1-sol': 'GPT-6.1 Sol',
 };
 
 /** First selectable model for a provider, given the (maybe-unloaded) Zen catalog. */

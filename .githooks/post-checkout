@@ -6,7 +6,7 @@
 # branch. Idempotent: skips files that already exist locally or are absent in
 # the main repo.
 #
-# Files are split into two categories:
+# Files are split into categories:
 #   FILES_TO_COPY  — independent copy per worktree. Edits don't propagate.
 #                    Use for env files: a worktree should be able to change
 #                    `.env` without affecting the running main app.
@@ -15,6 +15,11 @@
 #                    DB, shared task docs) and for the node_modules build
 #                    artifact (linked to avoid a 1.1GB per-worktree
 #                    install — treat as read-only; see the list below).
+#   CLAUDE.local.md — operator/infra context (repo root). Auto-loads for
+#                    worktrees NESTED under the main repo via cwd-ancestor
+#                    lookup; EXTERNAL worktrees (claude-squad under
+#                    ~/.claude-squad/worktrees) get a symlink at their own
+#                    root so it auto-loads there too and tracks canonical.
 #
 # Hook args (from git): $1 = previous HEAD, $2 = new HEAD, $3 = flag (1 if
 # branch checkout, 0 if file checkout).
@@ -32,15 +37,14 @@ GIT_COMMON_DIR=$(git rev-parse --git-common-dir)
 MAIN_REPO=$(cd "$GIT_COMMON_DIR/.." && pwd)
 WORKTREE=$(git rev-parse --show-toplevel)
 
-# The app lives under reference/ (repo root holds SPEC.md). Provision dev
-# files into the worktree's reference/ subdir.
+# The app lives under reference/ (repo root holds SPEC.md). Env files are
+# provisioned into the worktree's reference/ subdir.
 FILES_TO_COPY="
 reference/.env
 reference/.env.local
 reference/.env.development.local
 reference/.env.test.local
 reference/.env.production.local
-reference/CLAUDE.local.md
 "
 
 FILES_TO_LINK="
@@ -92,6 +96,16 @@ for f in $FILES_TO_COPY; do
     [ -n "$f" ] || continue
     provision_file "$MAIN_REPO/$f" "$WORKTREE/$f" copy
 done
+
+# CLAUDE.local.md (operator/infra context) must auto-load in EVERY worktree.
+# Worktrees nested under the main repo already inherit the repo-root file via
+# cwd-ancestor lookup; external worktrees (e.g. claude-squad under
+# ~/.claude-squad/worktrees) can't see it, so symlink it at their own root.
+# Symlink (not copy) so it always tracks the canonical file.
+case "$WORKTREE/" in
+    "$MAIN_REPO"/*) : ;;  # nested — repo-root CLAUDE.local.md already auto-loads
+    *) provision_file "$MAIN_REPO/CLAUDE.local.md" "$WORKTREE/CLAUDE.local.md" link ;;
+esac
 
 # DB symlink: prefer bottega.db; fall back to legacy auth.db during the
 # rename transition (between this PR merging and the main app restarting).

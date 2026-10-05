@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { spawn } from 'child_process';
-import { conversationsDb } from '../database/db.js';
+import { conversationsDb } from '../database/conversations.js';
 import { auditClaudeLaunch, buildClaudeSpawnEnv } from './claudeCredentials.js';
 import { generateConversationTitle } from './titleGenerator.js';
 
@@ -19,7 +19,7 @@ vi.mock('child_process', async (importOriginal) => {
   };
 });
 
-vi.mock('../database/db.js', () => ({
+vi.mock('../database/conversations.js', () => ({
   conversationsDb: {
     updateName: vi.fn()
   }
@@ -352,14 +352,12 @@ ${message}`;
       const broadcastFn = vi.fn();
 
       const broadcastToTaskSubscribersFn = vi.fn();
-      generateConversationTitle(
-        7,
-        'Help me debug login',
+      generateConversationTitle(7, 'Help me debug login', {
         broadcastFn,
-        42,
-        99,
+        userId: 42,
+        taskId: 99,
         broadcastToTaskSubscribersFn,
-      );
+      });
 
       expect(buildClaudeSpawnEnv).toHaveBeenCalledWith(42);
       expect(spawn).toHaveBeenCalledWith(
@@ -403,7 +401,7 @@ ${message}`;
         throw new Error('Claude credentials are not provisioned for user 42');
       });
 
-      generateConversationTitle(7, 'Help me debug login', null as never, 42);
+      generateConversationTitle(7, 'Help me debug login', { userId: 42 });
 
       expect(spawn).not.toHaveBeenCalled();
       expect(auditClaudeLaunch).not.toHaveBeenCalled();

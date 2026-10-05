@@ -33,11 +33,11 @@ describe('ConversationContentStore', () => {
   it('resolveProjectKey replaces every non-alphanumeric char with - (mirrors SDK f1())', () => {
     // The SDK's `f1()` does `path.replace(/[^a-zA-Z0-9]/g, '-')`. Underscores
     // collapse to `-` along with `/` and `.`; we must match exactly or reads
-    // miss messages the SDK wrote (e.g. /home/ubuntu/misc/hello_world).
+    // miss messages the SDK wrote (e.g. /home/dev/projects/hello_world).
     expect(resolveProjectKey('/repo/example_project')).toBe('-repo-example-project');
     expect(resolveProjectKey('/repo/with.dots')).toBe('-repo-with-dots');
     expect(resolveProjectKey('/tmp/path-with-dashes')).toBe('-tmp-path-with-dashes');
-    expect(resolveProjectKey('/home/ubuntu/misc/hello_world')).toBe('-home-ubuntu-misc-hello-world');
+    expect(resolveProjectKey('/home/dev/projects/hello_world')).toBe('-home-dev-projects-hello-world');
   });
 
   it('getSessionMessages returns paginated messages from SQLite', async () => {

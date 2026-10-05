@@ -21,6 +21,7 @@ import {
   type StructuredAnswers,
   type ToolResultContent,
 } from './answerUtils';
+import { isAskUserToolName } from './toolName';
 
 // ChatInterface's DisplayMessage is wider than what we need here. toolResult
 // stays `unknown` at the boundary — classifyAskUserToolResult narrows it.
@@ -92,7 +93,7 @@ export function indexAskWidgets(
     if (
       msg?.type !== 'tool' ||
       !msg.isToolUse ||
-      msg.toolName !== 'AskUserQuestion' ||
+      !isAskUserToolName(msg.toolName) ||
       !msg.toolId
     )
       continue;

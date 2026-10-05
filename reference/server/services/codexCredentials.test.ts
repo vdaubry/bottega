@@ -11,6 +11,7 @@ import {
   getCodexAuthStatus,
   readCodexAuth,
   resolveCodexAuthJsonPath,
+  resolveCodexConfigPath,
   resolveCodexHomeDir,
   writeCodexAuth,
 } from './codexCredentials.js';
@@ -70,6 +71,39 @@ describe('codexCredentials', () => {
     const stat = fs.statSync(codexHome);
     expect(stat.isDirectory()).toBe(true);
     expect(stat.mode & 0o777).toBe(0o700);
+    expect(fs.readFileSync(resolveCodexConfigPath(42), 'utf8')).toBe(
+      'forced_login_method = "chatgpt"\n',
+    );
+  });
+
+  it('overrides API-key login in config.toml without losing existing settings', () => {
+    const { codexHome } = ensureCodexHomeDir(42);
+    const configPath = path.join(codexHome, 'config.toml');
+    fs.writeFileSync(
+      configPath,
+      'forced_login_method = "api"\n\n[projects."/tmp/example"]\ntrust_level = "trusted"\n',
+    );
+
+    buildCodexSdkEnv(42);
+
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(
+      'forced_login_method = "chatgpt"\n\n[projects."/tmp/example"]\ntrust_level = "trusted"\n',
+    );
+  });
+
+  it('adds the login requirement before existing TOML tables', () => {
+    const { codexHome } = ensureCodexHomeDir(42);
+    const configPath = path.join(codexHome, 'config.toml');
+    fs.writeFileSync(
+      configPath,
+      '[projects."/tmp/example"]\ntrust_level = "trusted"\n',
+    );
+
+    buildCodexSdkEnv(42);
+
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(
+      'forced_login_method = "chatgpt"\n\n[projects."/tmp/example"]\ntrust_level = "trusted"\n',
+    );
   });
 
   it('rejects non-numeric or non-positive user ids', () => {
@@ -90,16 +124,45 @@ describe('codexCredentials', () => {
     expect(out.payload.tokens?.access_token).toBe('abc');
   });
 
-  it('readCodexAuth rejects when neither tokens nor OPENAI_API_KEY are present', () => {
+  it('readCodexAuth rejects when OAuth tokens are absent', () => {
     ensureCodexHomeDir(42);
     fs.writeFileSync(resolveCodexAuthJsonPath(42), JSON.stringify({}), { mode: 0o600 });
-    expect(() => readCodexAuth(42)).toThrow(/neither OAuth tokens nor OPENAI_API_KEY/);
+    expect(() => readCodexAuth(42)).toThrow(/must contain ChatGPT OAuth tokens/);
   });
 
-  it('accepts an OPENAI_API_KEY-only auth.json', () => {
-    provisionAuth(42, { OPENAI_API_KEY: 'sk-test-123' });
-    const out = readCodexAuth(42);
-    expect(out.payload.OPENAI_API_KEY).toBe('sk-test-123');
+  it('writeCodexAuth rejects API-key credentials without persisting them', () => {
+    expect(() => writeCodexAuth(42, { OPENAI_API_KEY: 'sk-test-123' })).toThrow(
+      /API key authentication is disabled/,
+    );
+    expect(fs.existsSync(resolveCodexAuthJsonPath(42))).toBe(false);
+  });
+
+  it('rejects API-key fields even when OAuth tokens are also present', () => {
+    expect(() =>
+      writeCodexAuth(42, {
+        OPENAI_API_KEY: 'sk-test-123',
+        tokens: { access_token: 'oauth-token' },
+      }),
+    ).toThrow(/API key authentication is disabled/);
+  });
+
+  it('readCodexAuth rejects a pre-existing API-key auth.json', () => {
+    ensureCodexHomeDir(42);
+    fs.writeFileSync(
+      resolveCodexAuthJsonPath(42),
+      JSON.stringify({ OPENAI_API_KEY: 'sk-test-123' }),
+      { mode: 0o600 },
+    );
+    expect(() => readCodexAuth(42)).toThrow(/API key authentication is disabled/);
+  });
+
+  it('accepts the null OPENAI_API_KEY field emitted by OAuth login', () => {
+    provisionAuth(42, {
+      auth_mode: 'chatgpt',
+      OPENAI_API_KEY: null,
+      tokens: { access_token: 'oauth-token' },
+    });
+    expect(readCodexAuth(42).payload.tokens?.access_token).toBe('oauth-token');
   });
 
   it('rejects an auth.json with wrong file mode (e.g. 0644)', () => {
@@ -133,6 +196,21 @@ describe('codexCredentials', () => {
     expect(status.reason).toBeDefined();
   });
 
+  it('getCodexAuthStatus reports API-key credentials as unusable', async () => {
+    ensureCodexHomeDir(42);
+    fs.writeFileSync(
+      resolveCodexAuthJsonPath(42),
+      JSON.stringify({ OPENAI_API_KEY: 'sk-test-123' }),
+      { mode: 0o600 },
+    );
+
+    const status = await getCodexAuthStatus(42);
+
+    expect(status.authenticated).toBe(false);
+    expect(status.method).toBeUndefined();
+    expect(status.reason).toMatch(/API key authentication is disabled/);
+  });
+
   it('buildCodexSdkEnv sets CODEX_HOME and strips inherited OPENAI_*/CODEX_* keys', () => {
     process.env['OPENAI_API_KEY'] = 'sk-bad-from-process-env';
     process.env['OPENAI_BASE_URL'] = 'https://wrong.example';
@@ -148,6 +226,9 @@ describe('codexCredentials', () => {
     expect(env['OPENAI_ORG_ID']).toBeUndefined();
     expect(env['CODEX_API_KEY']).toBeUndefined();
     expect(env['HOME']).toBe(process.env['HOME']);
+    expect(fs.readFileSync(resolveCodexConfigPath(42), 'utf8')).toContain(
+      'forced_login_method = "chatgpt"',
+    );
   });
 
   it('cross-user isolation: user 1 status reports its own credential, user 2 reads as missing', async () => {

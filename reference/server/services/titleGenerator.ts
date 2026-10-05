@@ -7,7 +7,8 @@
 
 import { spawn, type ChildProcessByStdio } from 'child_process';
 import type { Readable } from 'stream';
-import { conversationsDb } from '../database/db.js';
+import { conversationsDb } from '../database/conversations.js';
+import { FIGMA_WRITE_TOOLS } from '../constants/figmaTools.js';
 import {
   auditClaudeLaunch,
   buildClaudeSpawnEnv,
@@ -15,7 +16,9 @@ import {
 import type {
   BroadcastFn,
   BroadcastToTaskSubscribersFn,
+  BroadcastToEpicSubscribersFn,
   ConversationId,
+  EpicId,
   TaskId,
 } from '@shared/websocket/messages';
 
@@ -48,17 +51,33 @@ function sanitizeTitle(raw: string | null | undefined): string | null {
  *
  * When the title lands we dual-emit `conversation-name-updated`:
  * - on the conversation channel via `broadcastFn` (chat header updates)
- * - on the task channel via `broadcastToTaskSubscribersFn` (task viewer's
- *   conversation list updates) — only when `taskId` is provided.
+ * - on the owning entity's channel — the task channel via
+ *   `broadcastToTaskSubscribersFn` (task viewer's conversation list) or the
+ *   epic channel via `broadcastToEpicSubscribersFn` (epic page's stage rail),
+ *   depending on which id the caller passes.
  */
+export interface GenerateTitleOptions {
+  broadcastFn?: BroadcastFn | undefined;
+  userId?: number | undefined;
+  taskId?: TaskId | undefined;
+  epicId?: EpicId | undefined;
+  broadcastToTaskSubscribersFn?: BroadcastToTaskSubscribersFn | undefined;
+  broadcastToEpicSubscribersFn?: BroadcastToEpicSubscribersFn | undefined;
+}
+
 export function generateConversationTitle(
   conversationId: ConversationId,
   message: string,
-  broadcastFn?: BroadcastFn,
-  userId?: number,
-  taskId?: TaskId,
-  broadcastToTaskSubscribersFn?: BroadcastToTaskSubscribersFn,
+  options: GenerateTitleOptions = {},
 ): void {
+  const {
+    broadcastFn,
+    userId,
+    taskId,
+    epicId,
+    broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
+  } = options;
   if (!conversationId || !message) {
     console.warn('[TitleGenerator] Missing conversationId or message');
     return;
@@ -93,6 +112,12 @@ ${truncatedMessage}`;
     'text',
     '--max-turns',
     '1',
+    // This spawns the `claude` CLI directly, bypassing `mapOptionsToSDK`, so
+    // the global Figma write denial has to be repeated here. `--max-turns 1`
+    // on a summarize-this-text prompt makes a tool call very unlikely, but
+    // "no agent ever writes to Figma" is an invariant, not a probability.
+    '--disallowedTools',
+    ...FIGMA_WRITE_TOOLS,
   ];
 
   console.log(
@@ -181,17 +206,25 @@ ${truncatedMessage}`;
         `[TitleGenerator] Updated conversation ${conversationId} with title: "${title}"`,
       );
 
-      if (broadcastFn && taskId !== undefined) {
+      if (broadcastFn && (taskId !== undefined || epicId !== undefined)) {
         broadcastFn(conversationId, {
           type: 'conversation-name-updated',
           conversationId,
-          taskId,
+          ...(taskId !== undefined ? { taskId } : {}),
+          ...(epicId !== undefined ? { epicId } : {}),
           name: title,
         });
       }
       if (broadcastToTaskSubscribersFn && taskId !== undefined) {
         // `taskId` is spliced in by the helper itself.
         broadcastToTaskSubscribersFn(taskId, {
+          type: 'conversation-name-updated',
+          conversationId,
+          name: title,
+        });
+      }
+      if (broadcastToEpicSubscribersFn && epicId !== undefined) {
+        broadcastToEpicSubscribersFn(epicId, {
           type: 'conversation-name-updated',
           conversationId,
           name: title,

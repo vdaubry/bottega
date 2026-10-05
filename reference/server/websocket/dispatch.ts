@@ -6,6 +6,12 @@
 // - `taskSubscriptions` for task-scoped broadcasts (agent runs, task lifecycle)
 // - `conversationSubscriptions` for conversation-scoped broadcasts (streaming
 //   transcripts, status, completion)
+// - `atlasSubscriptions` for the Explore (code-atlas) view's UI commands —
+//   a separate channel so file contents only fan out to open Explore views,
+//   never to every task-detail watcher
+// - `epicSubscriptions` for epic-scoped broadcasts — the epic channel is to an
+//   epic what the task channel is to a task (agent runs, conversation
+//   lifecycle, streaming badges)
 //
 // Every handler that touches a user-scoped resource (a conversation, a task,
 // a session) authorizes against project membership via the shared
@@ -15,9 +21,11 @@ import { WebSocket, type WebSocketServer } from 'ws';
 import type {
   BroadcastFn,
   BroadcastToConversationSubscribersFn,
+  BroadcastToEpicSubscribersFn,
   BroadcastToTaskSubscribersFn,
   ClientToServerMessage,
   ConversationId,
+  EpicId,
   ServerToClientMessage,
   TaskId,
 } from '@shared/websocket/messages';
@@ -29,15 +37,21 @@ import {
   getActiveStreamingByConversation,
   resolveAskUserQuestion,
 } from '../services/conversationAdapter.js';
-import {
-  conversationsDb,
-  tasksDb,
-} from '../database/db.js';
+import { conversationsDb, tasksDb } from '../database/db.js';
+// The WS dispatcher is the epic channel's transport adapter (like
+// routes/epics.ts is its REST adapter), so it may read the epic tables for
+// channel authorization; conversation-owner questions go through the
+// owner-adapter registry instead.
+import { epicsDb } from '../database/epics.js';
+import { resolveScopeFromConversation } from '../services/conversation/conversationScope.js';
 import { hasProjectAccess } from '../services/projectService.js';
 import { activeSessions } from '../services/conversation/sessionState.js';
+import { resolveAtlasAck } from '../services/atlas/bridge.js';
 
 const taskSubscriptions = new Map<WebSocket, Set<TaskId>>();
 const conversationSubscriptions = new Map<WebSocket, Set<ConversationId>>();
+const atlasSubscriptions = new Map<WebSocket, Set<TaskId>>();
+const epicSubscriptions = new Map<WebSocket, Set<EpicId>>();
 
 /**
  * Build a `broadcastToTaskSubscribers` function bound to the given
@@ -92,11 +106,79 @@ export function makeBroadcastToConversationSubscribers(
 }
 
 /**
+ * Build the broadcaster for the Explore (code-atlas) channel. Mirrors
+ * `makeBroadcastToTaskSubscribers` (splices `taskId` into the payload) but
+ * fans out over `atlasSubscriptions`, so agent-driven UI commands — which
+ * carry whole file contents — only reach open Explore views.
+ */
+export function makeBroadcastToAtlasSubscribers(
+  wss: WebSocketServer,
+): BroadcastToTaskSubscribersFn {
+  return (taskId, message) => {
+    const messageWithTaskId = { ...message, taskId };
+    const payload = JSON.stringify(messageWithTaskId);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        const subscribed = atlasSubscriptions.get(client);
+        if (subscribed?.has(taskId)) {
+          client.send(payload);
+        }
+      }
+    });
+  };
+}
+
+/**
+ * Build a counter of open Explore views subscribed to a task — the bridge
+ * uses it to decide whether a UI command can be acknowledged at all.
+ */
+export function makeGetAtlasSubscriberCount(
+  wss: WebSocketServer,
+): (taskId: TaskId) => number {
+  return (taskId) => {
+    let count = 0;
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN && atlasSubscriptions.get(client)?.has(taskId)) {
+        count += 1;
+      }
+    });
+    return count;
+  };
+}
+
+/**
+ * Build the broadcaster for the epic channel. Mirrors
+ * `makeBroadcastToTaskSubscribers` (splices `epicId` into the payload) but
+ * fans out over `epicSubscriptions`: for an epic, this channel plays exactly
+ * the role the task channel plays for a task — agent-run status, conversation
+ * lifecycle, streaming start/end. Transcripts still flow on the conversation
+ * channel, because an epic conversation is a normal conversation.
+ */
+export function makeBroadcastToEpicSubscribers(
+  wss: WebSocketServer,
+): BroadcastToEpicSubscribersFn {
+  return (epicId, message) => {
+    const messageWithEpicId = { ...message, epicId };
+    const payload = JSON.stringify(messageWithEpicId);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        const subscribed = epicSubscriptions.get(client);
+        if (subscribed?.has(epicId)) {
+          client.send(payload);
+        }
+      }
+    });
+  };
+}
+
+/**
  * Drop all subscriptions for a disconnected WebSocket client.
  */
 export function cleanupClientSubscriptions(ws: WebSocket): void {
   taskSubscriptions.delete(ws);
   conversationSubscriptions.delete(ws);
+  atlasSubscriptions.delete(ws);
+  epicSubscriptions.delete(ws);
 }
 
 export interface DispatchContext {
@@ -105,6 +187,7 @@ export interface DispatchContext {
   userId: number | undefined;
   broadcastToTaskSubscribersFn: BroadcastToTaskSubscribersFn;
   broadcastToConversationSubscribersFn: BroadcastToConversationSubscribersFn;
+  broadcastToEpicSubscribersFn: BroadcastToEpicSubscribersFn;
 }
 
 function errorMessage(err: unknown): string {
@@ -114,7 +197,9 @@ function errorMessage(err: unknown): string {
 interface ConversationAccessOk {
   ok: true;
   conversation: ReturnType<typeof conversationsDb.getById> & object;
-  taskId: number;
+  // Exactly one is set — a conversation belongs to a task or to an epic.
+  taskId: number | null;
+  epicId: number | null;
   projectId: number;
 }
 interface ConversationAccessFail {
@@ -125,9 +210,9 @@ type ConversationAccess = ConversationAccessOk | ConversationAccessFail;
 
 /**
  * Verify that `userId` is allowed to act on `conversationId`. Walks
- * conversation → task → project and delegates to `hasProjectAccess` (admin OR
- * project member). Returns the resolved project id on success so handlers
- * don't have to repeat the lookups.
+ * conversation → owner (task or epic) → project and delegates to
+ * `hasProjectAccess` (admin OR project member). Returns the resolved project
+ * id on success so handlers don't have to repeat the lookups.
  *
  * Returns `not_found` if any link in the chain is missing — handlers should
  * respond with the same payload as `not_authorized` to avoid leaking the
@@ -138,21 +223,22 @@ function authorizeConversationAccess(
   userId: number | undefined,
 ): ConversationAccess {
   const conversation = conversationsDb.getById(conversationId);
-  if (!conversation || !conversation.task_id) {
+  if (!conversation) {
     return { ok: false, reason: 'not_found' };
   }
-  const task = tasksDb.getById(conversation.task_id);
-  if (!task) {
+  const owner = resolveScopeFromConversation(conversation);
+  if (!owner) {
     return { ok: false, reason: 'not_found' };
   }
-  if (!hasProjectAccess(task.project_id, userId)) {
+  if (!hasProjectAccess(owner.projectId, userId)) {
     return { ok: false, reason: 'not_authorized' };
   }
   return {
     ok: true,
     conversation,
-    taskId: conversation.task_id,
-    projectId: task.project_id,
+    taskId: owner.taskId,
+    epicId: owner.epicId,
+    projectId: owner.projectId,
   };
 }
 
@@ -179,6 +265,22 @@ function authorizeTaskAccess(
   return { ok: true, taskId, projectId: task.project_id };
 }
 
+type EpicAccess =
+  | { ok: true; epicId: number; projectId: number }
+  | { ok: false; reason: 'not_found' | 'not_authorized' };
+
+function authorizeEpicAccess(
+  epicId: number,
+  userId: number | undefined,
+): EpicAccess {
+  const epic = epicsDb.getById(epicId);
+  if (!epic) return { ok: false, reason: 'not_found' };
+  if (!hasProjectAccess(epic.project_id, userId)) {
+    return { ok: false, reason: 'not_authorized' };
+  }
+  return { ok: true, epicId, projectId: epic.project_id };
+}
+
 /**
  * Verify that `userId` is allowed to control the active Claude session
  * `sessionId`. Looks up the in-memory `activeSessions` map for the owning
@@ -200,7 +302,16 @@ function authorizeSessionAccess(
     return { authorized: true, projectId: active.projectId };
   }
   const conv = conversationsDb.findByClaudeSessionId(sessionId);
-  if (!conv || !conv.task_id) return { authorized: false, projectId: null };
+  if (!conv) return { authorized: false, projectId: null };
+  if (conv.epic_id) {
+    const owner = resolveScopeFromConversation(conv);
+    if (!owner) return { authorized: false, projectId: null };
+    if (!hasProjectAccess(owner.projectId, userId)) {
+      return { authorized: false, projectId: owner.projectId };
+    }
+    return { authorized: true, projectId: owner.projectId };
+  }
+  if (!conv.task_id) return { authorized: false, projectId: null };
   const task = tasksDb.getById(conv.task_id);
   if (!task) return { authorized: false, projectId: null };
   if (!hasProjectAccess(task.project_id, userId)) {
@@ -226,6 +337,7 @@ export async function dispatchClientMessage(
     userId,
     broadcastToTaskSubscribersFn,
     broadcastToConversationSubscribersFn,
+    broadcastToEpicSubscribersFn,
   } = ctx;
 
   switch (data.type) {
@@ -285,6 +397,7 @@ export async function dispatchClientMessage(
         await adapterSendMessage(conversationId, data.command, {
           broadcastFn,
           broadcastToTaskSubscribersFn,
+          broadcastToEpicSubscribersFn,
           userId,
           images,
           permissionMode: permissionMode || 'bypassPermissions',
@@ -359,6 +472,7 @@ export async function dispatchClientMessage(
         const result = await resolveAskUserQuestion(conversationId, answers, {
           broadcastFn,
           broadcastToTaskSubscribersFn,
+          broadcastToEpicSubscribersFn,
           userId,
         });
         ws.send(
@@ -509,6 +623,107 @@ export async function dispatchClientMessage(
       return;
     }
 
+    case 'subscribe-atlas': {
+      const { taskId } = data;
+      if (typeof taskId !== 'number' || !Number.isFinite(taskId)) {
+        console.warn('[WS] subscribe-atlas: invalid taskId');
+        return;
+      }
+      const access = authorizeTaskAccess(taskId, userId);
+      if (!access.ok) {
+        console.warn(
+          `[WS] not authorized: subscribe-atlas taskId=${taskId} userId=${userId} reason=${access.reason}`,
+        );
+        return;
+      }
+      let bucket = atlasSubscriptions.get(ws);
+      if (!bucket) {
+        bucket = new Set();
+        atlasSubscriptions.set(ws, bucket);
+      }
+      bucket.add(taskId);
+      ws.send(
+        JSON.stringify({
+          type: 'atlas-subscribed',
+          taskId,
+          success: true,
+        }),
+      );
+      return;
+    }
+
+    case 'unsubscribe-atlas': {
+      const { taskId } = data;
+      atlasSubscriptions.get(ws)?.delete(taskId);
+      ws.send(
+        JSON.stringify({
+          type: 'atlas-unsubscribed',
+          taskId,
+          success: true,
+        }),
+      );
+      return;
+    }
+
+    case 'subscribe-epic': {
+      const { epicId } = data;
+      if (typeof epicId !== 'number' || !Number.isFinite(epicId)) {
+        console.warn('[WS] subscribe-epic: invalid epicId');
+        return;
+      }
+      const access = authorizeEpicAccess(epicId, userId);
+      if (!access.ok) {
+        console.warn(
+          `[WS] not authorized: subscribe-epic epicId=${epicId} userId=${userId} reason=${access.reason}`,
+        );
+        return;
+      }
+      let bucket = epicSubscriptions.get(ws);
+      if (!bucket) {
+        bucket = new Set();
+        epicSubscriptions.set(ws, bucket);
+      }
+      bucket.add(epicId);
+      ws.send(
+        JSON.stringify({
+          type: 'epic-subscribed',
+          epicId,
+          success: true,
+        }),
+      );
+      return;
+    }
+
+    case 'unsubscribe-epic': {
+      const { epicId } = data;
+      epicSubscriptions.get(ws)?.delete(epicId);
+      ws.send(
+        JSON.stringify({
+          type: 'epic-unsubscribed',
+          epicId,
+          success: true,
+        }),
+      );
+      return;
+    }
+
+    case 'atlas-ack': {
+      // The Explore view acknowledging an agent-driven UI command. Only a
+      // socket that is atlas-subscribed to the task may resolve its pending
+      // commands — the subscription was membership-checked at subscribe time,
+      // and the bridge re-checks the (requestId → taskId) binding, so a
+      // foreign socket can never spoof another task's acks.
+      const { taskId, requestId } = data;
+      if (!atlasSubscriptions.get(ws)?.has(taskId)) {
+        console.warn(
+          `[WS] dropped atlas-ack: socket not atlas-subscribed to task ${taskId} (userId=${userId})`,
+        );
+        return;
+      }
+      resolveAtlasAck(requestId, { taskId, error: data.error, detail: data.detail });
+      return;
+    }
+
     default: {
       // Exhaustiveness check — TS reports if a new ClientToServerMessage
       // variant is added without a matching case.
@@ -527,6 +742,16 @@ export async function dispatchClientMessage(
 export function __resetSubscriptionsForTesting(): void {
   taskSubscriptions.clear();
   conversationSubscriptions.clear();
+  atlasSubscriptions.clear();
+  epicSubscriptions.clear();
+}
+
+export function __getAtlasSubscriptionsForTesting(): Map<WebSocket, Set<TaskId>> {
+  return atlasSubscriptions;
+}
+
+export function __getEpicSubscriptionsForTesting(): Map<WebSocket, Set<EpicId>> {
+  return epicSubscriptions;
 }
 
 export function __getTaskSubscriptionsForTesting(): Map<

@@ -3,11 +3,18 @@
 import type {
   BroadcastFn,
   BroadcastToTaskSubscribersFn,
+  BroadcastToEpicSubscribersFn,
   PermissionMode,
 } from '@shared/websocket/messages';
 import type { Provider } from '@shared/providers/types';
 
-export type { BroadcastFn, BroadcastToTaskSubscribersFn, PermissionMode, Provider };
+export type {
+  BroadcastFn,
+  BroadcastToTaskSubscribersFn,
+  BroadcastToEpicSubscribersFn,
+  PermissionMode,
+  Provider,
+};
 
 export interface ConversationImage {
   data: string;
@@ -29,6 +36,13 @@ export interface AskUserQuestionToolResult {
 export interface ConversationOptions {
   broadcastFn?: BroadcastFn | undefined;
   broadcastToTaskSubscribersFn?: BroadcastToTaskSubscribersFn | undefined;
+  /**
+   * Epic channel broadcaster — the epic-scoped counterpart of
+   * `broadcastToTaskSubscribersFn`. Epic conversations emit their lifecycle
+   * events (streaming start/end, conversation-added, agent-run-updated) here;
+   * the transcript itself still flows on the conversation channel.
+   */
+  broadcastToEpicSubscribersFn?: BroadcastToEpicSubscribersFn | undefined;
   userId?: number | undefined;
   permissionMode?: PermissionMode | undefined;
   customSystemPrompt?: string | undefined;
@@ -62,11 +76,14 @@ export interface ConversationOptions {
 
 export interface StreamingContext {
   conversationId: number;
+  // Exactly one of taskId / epicId is set, mirroring the conversation row.
   taskId?: number | null | undefined;
+  epicId?: number | null | undefined;
   claudeSessionId: string | null;
   userId?: number | undefined;
   broadcastFn?: BroadcastFn | undefined;
   broadcastToTaskSubscribersFn?: BroadcastToTaskSubscribersFn | undefined;
+  broadcastToEpicSubscribersFn?: BroadcastToEpicSubscribersFn | undefined;
   isNewSession: boolean;
   broadcastClaudeStatus?: boolean | undefined;
   videoConfig?: VideoConfig | null | undefined;

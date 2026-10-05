@@ -1,13 +1,29 @@
 import path from 'path';
 import fs from 'fs';
-import { runCommand } from './shell.js';
+import { CommandGroupError, runCommand, runCommandGroup } from './shell.js';
 import { assertValidBranchName } from './validators.js';
+import { assertWorktreeSafeToDestroy, getWorktreeSafety } from './worktreeSafety.js';
 
 /**
  * Derive the worktree path for a task based on convention
  */
 export function getWorktreePath(repoPath: string, taskId: number): string {
   return path.join(`${repoPath}-worktrees`, `task-${taskId}`);
+}
+
+/**
+ * Derive the worktree path for an EPIC's delivery worktree — where the epic's
+ * feature branch is checked out so the delivery agent can merge, resolve
+ * conflicts and push without ever moving the main checkout's HEAD.
+ *
+ * Same `{repo}-worktrees/` directory as the tickets, a different prefix: an
+ * epic id and a task id are independent sequences, so `task-7` and `epic-7`
+ * must not collide. Its lifecycle lives in `epics/epicBranch.ts` — this is
+ * only the naming convention, kept beside `getWorktreePath` so the two can
+ * never drift apart.
+ */
+export function getEpicWorktreePath(repoPath: string, epicId: number): string {
+  return path.join(`${repoPath}-worktrees`, `epic-${epicId}`);
 }
 
 /**
@@ -98,7 +114,7 @@ export async function getBranchName(worktreePath: string): Promise<string | null
   }
 }
 
-function sanitizeTitle(title: string | null | undefined): string {
+export function sanitizeTitle(title: string | null | undefined): string {
   return (title || 'task')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -106,69 +122,98 @@ function sanitizeTitle(title: string | null | undefined): string {
     .slice(0, 30);
 }
 
-async function symlinkEnvFiles(
-  projectPath: string,
+/**
+ * Who makes a new worktree a RUNNABLE checkout, as opposed to just a git tree.
+ *
+ * - **`hook`** — the project ships a `post-checkout` hook. Git runs it *inside*
+ *   `git worktree add`, with the new worktree as the working directory and the
+ *   null SHA as `$1` (that is how a hook tells "fresh worktree" from "branch
+ *   switch"). Bottega does nothing at all, and because the hook is synchronous
+ *   the worktree is fully provisioned the moment the command returns.
+ * - **`none`** — no hook. The worktree is a bare checkout: git-tracked files
+ *   only. That is correct for a repo that needs nothing else to run, and a
+ *   visible settings warning for one that does — Bottega deliberately
+ *   provisions nothing itself (docs/agents/worktree-provisioning.md).
+ *
+ * Detection goes through `git rev-parse --git-path`, so it honours
+ * `core.hooksPath` — which is how a project makes the hook *committed* and
+ * therefore genuinely part of the repo (`.githooks/post-checkout` +
+ * `git config core.hooksPath .githooks`) rather than per-clone local state.
+ *
+ * It must run with `cwd` = the repo root: git resolves a RELATIVE `core.hooksPath`
+ * against the invocation's working directory, so asking from inside a worktree
+ * returns that worktree's path instead of the project's.
+ */
+export type WorktreeProvisioning = 'hook' | 'none';
+
+export async function worktreeProvisioningMode(
+  repoPath: string,
+): Promise<WorktreeProvisioning> {
+  let hookPath: string;
+  try {
+    const { stdout } = await runCommand(
+      'git',
+      ['rev-parse', '--path-format=absolute', '--git-path', 'hooks/post-checkout'],
+      { cwd: repoPath },
+    );
+    hookPath = stdout.trim();
+  } catch {
+    // `--path-format` needs git >= 2.31; fall back to the relative form.
+    try {
+      const { stdout } = await runCommand(
+        'git',
+        ['rev-parse', '--git-path', 'hooks/post-checkout'],
+        { cwd: repoPath },
+      );
+      hookPath = path.resolve(repoPath, stdout.trim());
+    } catch {
+      return 'none';
+    }
+  }
+  if (!hookPath) return 'none';
+
+  // Executable, like every git hook — a non-`+x` file is not run by git either.
+  try {
+    await fs.promises.access(hookPath, fs.constants.X_OK);
+    return 'hook';
+  } catch {
+    return 'none';
+  }
+}
+
+/**
+ * Best-effort sweep after a failed `git worktree add`. `post-checkout` runs
+ * *after* the checkout, so when the hook fails (or times out) the worktree and
+ * the freshly-created branch are already on disk — git does not undo them.
+ * Every step tolerates "was never created": a failure before the checkout
+ * simply finds nothing to remove.
+ *
+ * Exported for the epic delivery worktree (`epics/epicBranch.ts`), which runs
+ * the same `git worktree add` and inherits the same failure mode — it passes
+ * `branch: null` because the epic's feature branch outlives any worktree.
+ */
+export async function cleanupFailedWorktreeAdd(
+  repoPath: string,
   worktreePath: string,
-  subprojectPath: string | null,
+  branch: string | null,
 ): Promise<void> {
-  const envFiles = ['.env', '.env.local', '.env.development', '.env.development.local'];
-
-  const srcBase = subprojectPath ? path.join(projectPath, subprojectPath) : projectPath;
-  const destBase = subprojectPath ? path.join(worktreePath, subprojectPath) : worktreePath;
-
-  for (const file of envFiles) {
-    const srcPath = path.join(srcBase, file);
-    const destPath = path.join(destBase, file);
-
-    if (!fs.existsSync(srcPath)) {
-      continue;
-    }
-
-    if (fs.existsSync(destPath)) {
-      continue;
-    }
-
-    try {
-      await fs.promises.symlink(srcPath, destPath);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`Failed to symlink ${file}: ${message}`);
-    }
+  try {
+    await runCommand('git', ['worktree', 'remove', worktreePath, '--force'], {
+      cwd: repoPath,
+      timeout: 60_000,
+    });
+  } catch {
+    // Not registered (the add died early) or the removal itself failed. The
+    // directory would shadow a future `git worktree add` at the same path, so
+    // clear both it and any stale registration.
+    await fs.promises.rm(worktreePath, { recursive: true, force: true }).catch(() => {});
+    await runCommand('git', ['worktree', 'prune'], { cwd: repoPath }).catch(() => {});
   }
-}
-
-const DEPENDENCY_DIRS = ['node_modules', '.venv'];
-
-function copyDependenciesInBackground(srcProjectPath: string, destProjectPath: string): void {
-  for (const dir of DEPENDENCY_DIRS) {
-    const srcDir = path.join(srcProjectPath, dir);
-
-    if (!fs.existsSync(srcDir)) {
-      continue;
-    }
-
-    const destDir = path.join(destProjectPath, dir);
-
-    runCommand('cp', ['-a', srcDir, destDir], { timeout: 600_000 })
-      .then(() => {
-        console.log(`${dir} copied to worktree: ${destProjectPath}`);
-      })
-      .catch((err: Error) => {
-        console.warn(`Failed to copy ${dir} to worktree: ${err.message}`);
-      });
-  }
-}
-
-async function createGitignoreddirs(projectPath: string): Promise<void> {
-  const dirs = ['log', 'tmp', 'storage'];
-
-  for (const dir of dirs) {
-    const dirPath = path.join(projectPath, dir);
+  if (branch) {
     try {
-      await fs.promises.mkdir(dirPath, { recursive: true });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`Note: Could not create ${dir} directory: ${message}`);
+      await runCommand('git', ['branch', '-D', branch], { cwd: repoPath });
+    } catch {
+      /* never created */
     }
   }
 }
@@ -178,16 +223,50 @@ export interface CreateWorktreeResult {
   worktreePath?: string;
   branch?: string;
   error?: string;
+  /** The last lines git and the project's hook printed, on failure. */
+  output?: string;
+  /** The add was cancelled through `options.signal` (the task was deleted). */
+  aborted?: boolean;
+}
+
+/** How long `git worktree add` — the project's hook included — may run. */
+export const WORKTREE_ADD_TIMEOUT_MS = 10 * 60_000;
+
+const OUTPUT_TAIL_LINES = 40;
+
+function outputTail(stdout: string, stderr: string): string {
+  // Git runs hooks with stdout redirected to stderr, so stderr carries both
+  // git's own messages and everything the hook printed.
+  const lines = [stderr, stdout]
+    .join('\n')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0);
+  return lines.slice(-OUTPUT_TAIL_LINES).join('\n');
 }
 
 /**
- * Create a worktree for a task
+ * Create a worktree for a task.
+ *
+ * Provisioning — env files, dependencies, runtime directories — is the
+ * project's own job: git runs the repo's `post-checkout` hook synchronously
+ * *inside* `git worktree add`, so the tree is runnable the moment the command
+ * returns, and a failing hook fails the command. Bottega adds nothing on top
+ * (docs/agents/worktree-provisioning.md).
+ *
+ * `baseBranch` is where the task branch forks from. Omitted (the default, and
+ * every non-epic ticket) it resolves to the repo's default branch and the
+ * *local* ref is used verbatim — byte-for-byte the pre-epic behaviour. Passed
+ * explicitly (epic tickets fork off their epic's feature branch) the branch is
+ * fetched first and the remote-tracking ref is preferred, so a ticket starts
+ * from what origin has rather than from a stale local copy.
  */
 export async function createWorktree(
   repoPath: string,
   taskId: number,
   title: string | null | undefined,
-  subprojectPath: string | null = null,
+  baseBranch?: string | null,
+  options: { signal?: AbortSignal | undefined } = {},
 ): Promise<CreateWorktreeResult> {
   const sanitizedTitle = sanitizeTitle(title);
   const branch = `task/${taskId}-${sanitizedTitle}`;
@@ -197,25 +276,52 @@ export async function createWorktree(
   try {
     await fs.promises.mkdir(worktreesDir, { recursive: true });
 
-    const baseBranch = assertValidBranchName(await getDefaultBranch(repoPath), 'default branch');
-
-    await runCommand(
-      'git',
-      ['worktree', 'add', '-b', assertValidBranchName(branch), worktreePath, baseBranch],
-      { cwd: repoPath },
+    const base = assertValidBranchName(
+      baseBranch ?? (await getDefaultBranch(repoPath)),
+      baseBranch ? 'base branch' : 'default branch',
     );
 
-    const projectPath = subprojectPath ? path.join(worktreePath, subprojectPath) : worktreePath;
+    let startPoint = base;
+    if (baseBranch) {
+      try {
+        await runCommand('git', ['fetch', 'origin', base], { cwd: repoPath });
+        startPoint = `origin/${base}`;
+      } catch {
+        // Remoteless repo, or the feature branch never made it to origin
+        // (push failed when the epic branch was created). The local ref is
+        // still correct — degrade to it instead of failing ticket creation.
+      }
+    }
 
-    await symlinkEnvFiles(repoPath, worktreePath, subprojectPath);
-
-    await createGitignoreddirs(projectPath);
-
-    copyDependenciesInBackground(repoPath, projectPath);
+    // The project's post-checkout hook runs inside this command and may do a
+    // real dependency install — the 30 s runCommand default is a hang guard,
+    // not an install budget. Same ceiling as worktree removal. A process
+    // group, so a timeout or a cancel also stops whatever the hook started
+    // (a hung build otherwise outlives `git` forever).
+    await runCommandGroup(
+      'git',
+      ['worktree', 'add', '-b', assertValidBranchName(branch), worktreePath, startPoint],
+      { cwd: repoPath, timeout: WORKTREE_ADD_TIMEOUT_MS, signal: options.signal },
+    );
 
     return { success: true, worktreePath, branch };
   } catch (error) {
+    await cleanupFailedWorktreeAdd(repoPath, worktreePath, branch);
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof CommandGroupError) {
+      // Said plainly: the user sees this on the task, with the output below it.
+      const reason = error.timedOut
+        ? `The project's setup did not finish within ${WORKTREE_ADD_TIMEOUT_MS / 60_000} minutes, so it was stopped`
+        : error.aborted
+          ? 'The worktree setup was cancelled'
+          : `The project's setup failed (git worktree add exited with code ${error.exitCode})`;
+      return {
+        success: false,
+        error: reason,
+        output: outputTail(error.stdout, error.stderr),
+        aborted: error.aborted,
+      };
+    }
     return { success: false, error: message };
   }
 }
@@ -226,13 +332,23 @@ export interface RemoveWorktreeResult {
 }
 
 /**
- * Remove a worktree and its branch
+ * Remove a worktree and its branch.
+ *
+ * **Throws `UnsavedWorktreeWorkError` when the worktree holds uncommitted or
+ * unpushed work and `force` is not set.** That throw — rather than a
+ * `{success:false}` return — is deliberate: it carries the structured safety
+ * report every caller needs to offer the user a choice, and it cannot be
+ * mistaken for an ordinary git failure. Callers that mean "discard it" pass
+ * `{ force: true }`.
  */
 export async function removeWorktree(
   repoPath: string,
   taskId: number,
+  options: { force?: boolean | undefined } = {},
 ): Promise<RemoveWorktreeResult> {
   const worktreePath = getWorktreePath(repoPath, taskId);
+
+  await assertWorktreeSafeToDestroy(worktreePath, taskId, options);
 
   try {
     const branch = await getBranchName(worktreePath);
@@ -259,17 +375,28 @@ export interface WorktreeStatusResult {
   branch?: string | null;
   ahead?: number;
   behind?: number;
+  /** The branch the counts are measured against (an epic ticket's is its epic's feature branch). */
+  baseBranch?: string;
+  /** @deprecated Alias of `baseBranch`, kept for existing UI consumers. */
   mainBranch?: string;
   worktreePath?: string;
+  /** Paths with uncommitted modifications (capped — see `MAX_LISTED_FILES`). */
+  dirtyPaths?: string[];
+  /** Count of uncommitted paths. Drives the "N uncommitted" badge. */
+  dirtyFiles?: number;
+  /** Commits the branch has that `origin/<branch>` does not. */
+  unpushed?: number;
   error?: string;
 }
 
 /**
- * Get worktree status including commits ahead/behind main
+ * Get worktree status including commits ahead/behind its base branch
+ * (the repo default unless the caller resolved something else).
  */
 export async function getWorktreeStatus(
   repoPath: string,
   taskId: number,
+  baseBranch?: string | null,
 ): Promise<WorktreeStatusResult> {
   const worktreePath = getWorktreePath(repoPath, taskId);
 
@@ -277,7 +404,10 @@ export async function getWorktreeStatus(
     await fs.promises.access(worktreePath);
 
     const branch = await getBranchName(worktreePath);
-    const mainBranch = assertValidBranchName(await getDefaultBranch(repoPath), 'default branch');
+    const base = assertValidBranchName(
+      baseBranch ?? (await getDefaultBranch(repoPath)),
+      baseBranch ? 'base branch' : 'default branch',
+    );
 
     try {
       await runCommand('git', ['fetch', 'origin'], { cwd: worktreePath });
@@ -290,7 +420,7 @@ export async function getWorktreeStatus(
     try {
       const { stdout } = await runCommand(
         'git',
-        ['rev-list', '--left-right', '--count', `origin/${mainBranch}...HEAD`],
+        ['rev-list', '--left-right', '--count', `origin/${base}...HEAD`],
         { cwd: worktreePath },
       );
       const parts = stdout.trim().split(/\s+/);
@@ -300,13 +430,22 @@ export async function getWorktreeStatus(
       /* ignore */
     }
 
+    // Ahead/behind alone cannot answer "is my work on the PR?" — they measure
+    // against the *base* branch, so a pushed commit and an unpushed one look
+    // identical. The safety report is what the UI badge needs.
+    const safety = await getWorktreeSafety(worktreePath);
+
     return {
       success: true,
       branch,
       ahead,
       behind,
-      mainBranch,
+      baseBranch: base,
+      mainBranch: base,
       worktreePath,
+      dirtyPaths: safety.files,
+      dirtyFiles: safety.dirtyFiles,
+      unpushed: safety.unpushedCommits,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -315,23 +454,38 @@ export async function getWorktreeStatus(
 }
 
 /**
- * Sync a worktree with the main branch (merge main into worktree branch)
+ * Merge a worktree's base branch into the worktree branch. `baseBranch`
+ * defaults to the repo's default branch — epic tickets pass their epic's
+ * feature branch (see `resolveTaskBaseBranch`).
+ *
+ * A failed merge is always aborted before returning: this runs automatically
+ * before agent runs, and handing an agent a tree full of conflict markers is
+ * far worse than reporting the conflict.
  */
-export async function syncWithMain(
+export async function syncWithBase(
   repoPath: string,
   taskId: number,
+  baseBranch?: string | null,
 ): Promise<RemoveWorktreeResult> {
   const worktreePath = getWorktreePath(repoPath, taskId);
 
   try {
-    const mainBranch = assertValidBranchName(await getDefaultBranch(repoPath), 'default branch');
+    const base = assertValidBranchName(
+      baseBranch ?? (await getDefaultBranch(repoPath)),
+      baseBranch ? 'base branch' : 'default branch',
+    );
 
     await runCommand('git', ['fetch', 'origin'], { cwd: worktreePath });
-    await runCommand('git', ['merge', `origin/${mainBranch}`], { cwd: worktreePath });
+    await runCommand('git', ['merge', `origin/${base}`], { cwd: worktreePath });
 
     return { success: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    try {
+      await runCommand('git', ['merge', '--abort'], { cwd: worktreePath });
+    } catch {
+      /* nothing to abort — the failure came before/outside the merge */
+    }
     return { success: false, error: message };
   }
 }
@@ -343,13 +497,19 @@ export interface CreatePRResult {
 }
 
 /**
- * Create a pull request for a task's worktree branch
+ * Create a pull request for a task's worktree branch.
+ *
+ * `baseBranch` becomes `gh pr create --base`. Callers (prService) always
+ * resolve and pass it, so an epic ticket's PR targets the epic's feature
+ * branch and a plain ticket's PR targets the repo default explicitly rather
+ * than relying on gh's own default.
  */
 export async function createPullRequest(
   repoPath: string,
   taskId: number,
   title: string,
   body: string,
+  baseBranch?: string | null,
 ): Promise<CreatePRResult> {
   const worktreePath = getWorktreePath(repoPath, taskId);
 
@@ -366,7 +526,15 @@ export async function createPullRequest(
     // shell metacharacters inside title/body are literal bytes here.
     const { stdout } = await runCommand(
       'gh',
-      ['pr', 'create', '--title', title, '--body', body],
+      [
+        'pr',
+        'create',
+        '--title',
+        title,
+        '--body',
+        body,
+        ...(baseBranch ? ['--base', assertValidBranchName(baseBranch, 'base branch')] : []),
+      ],
       { cwd: worktreePath },
     );
 
@@ -395,8 +563,39 @@ export interface PullRequestStatusResult {
   url?: string;
   state?: string;
   mergeable?: string;
+  headBranch?: string;
+  baseBranch?: string;
+  mergeCommitSha?: string | null;
+  mergedAt?: string | null;
   ciStatus?: CIStatus;
   error?: string;
+}
+
+interface GitHubPullRequestData {
+  url: string;
+  state: string;
+  mergeable: string;
+  headRefName: string;
+  baseRefName: string;
+  mergeCommit: { oid: string } | null;
+  mergedAt: string | null;
+}
+
+const PR_STATUS_FIELDS =
+  'url,state,mergeable,headRefName,baseRefName,mergeCommit,mergedAt';
+
+function pullRequestResult(prData: GitHubPullRequestData): PullRequestStatusResult {
+  return {
+    success: true,
+    exists: true,
+    url: prData.url,
+    state: prData.state,
+    mergeable: prData.mergeable,
+    headBranch: prData.headRefName,
+    baseBranch: prData.baseRefName,
+    mergeCommitSha: prData.mergeCommit?.oid ?? null,
+    mergedAt: prData.mergedAt,
+  };
 }
 
 /**
@@ -411,10 +610,10 @@ export async function getPullRequestStatus(
   try {
     const { stdout } = await runCommand(
       'gh',
-      ['pr', 'view', '--json', 'url,state,mergeable'],
+      ['pr', 'view', '--json', PR_STATUS_FIELDS],
       { cwd: worktreePath },
     );
-    const prData = JSON.parse(stdout) as { url: string; state: string; mergeable: string };
+    const prData = JSON.parse(stdout) as GitHubPullRequestData;
 
     let ciStatus: CIStatus = { status: 'none', checks: [] };
     try {
@@ -447,72 +646,128 @@ export async function getPullRequestStatus(
       }
     }
 
-    return {
-      success: true,
-      exists: true,
-      url: prData.url,
-      state: prData.state,
-      mergeable: prData.mergeable,
-      ciStatus,
-    };
+    return { ...pullRequestResult(prData), ciStatus };
   } catch {
     return { success: true, exists: false };
   }
 }
 
+/** Query a known PR from the stable project checkout, not its disposable worktree. */
+export async function getPullRequestStatusByUrl(
+  repoPath: string,
+  prUrl: string,
+): Promise<PullRequestStatusResult> {
+  try {
+    const { stdout } = await runCommand(
+      'gh',
+      ['pr', 'view', prUrl, '--json', PR_STATUS_FIELDS],
+      { cwd: repoPath },
+    );
+    return pullRequestResult(JSON.parse(stdout) as GitHubPullRequestData);
+  } catch (error) {
+    return {
+      success: false,
+      exists: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+export interface MergePullRequestResult extends PullRequestStatusResult {
+  merged: boolean;
+}
+
 /**
- * Merge a pull request and clean up the worktree and branch
+ * Idempotently ask GitHub to merge one known PR.
+ *
+ * A non-zero/timeout response is ambiguous: GitHub may have accepted the
+ * irreversible merge before the client lost its response. Always re-read the
+ * PR and report success when the remote fact is MERGED.
  */
-export async function mergeAndCleanup(
+export async function mergePullRequest(
+  repoPath: string,
+  prUrl: string,
+): Promise<MergePullRequestResult> {
+  const before = await getPullRequestStatusByUrl(repoPath, prUrl);
+  if (before.success && before.state === 'MERGED') return { ...before, merged: true };
+
+  let mergeError: unknown = null;
+  try {
+    await runCommand('gh', ['pr', 'merge', prUrl, '--merge'], {
+      cwd: repoPath,
+      timeout: 5 * 60_000,
+    });
+  } catch (error) {
+    mergeError = error;
+  }
+
+  const after = await getPullRequestStatusByUrl(repoPath, prUrl);
+  if (after.success && after.state === 'MERGED') return { ...after, merged: true };
+
+  if (mergeError) {
+    const errorMessage =
+      mergeError instanceof Error
+        ? mergeError.message
+        : typeof mergeError === 'string'
+          ? mergeError
+          : 'The merge command failed without a readable error message.';
+    return {
+      ...after,
+      success: false,
+      merged: false,
+      error: errorMessage,
+    };
+  }
+
+  // A zero exit can mean GitHub accepted auto-merge or a merge-queue request;
+  // it is not proof that the PR is landed. Keep the write-ahead intent pending
+  // until an authoritative read observes MERGED.
+  return {
+    ...after,
+    success: false,
+    merged: false,
+    error:
+      after.error ??
+      `GitHub accepted the merge command for ${prUrl}, but has not confirmed the PR as MERGED.`,
+  };
+}
+
+export interface CleanupMergedWorktreeResult extends RemoveWorktreeResult {
+  warning?: string;
+}
+
+export interface MergeAndCleanupResult extends RemoveWorktreeResult {
+  /** The irreversible remote merge happened even if later cleanup failed. */
+  merged?: boolean;
+  warning?: string;
+}
+
+/**
+ * Retryable housekeeping after GitHub has merged the PR. No safety check here:
+ * the check ran before the durable merge request was written, and once the
+ * remote head has landed, a half-removed worktree must be cleanable on retry.
+ */
+export async function cleanupMergedWorktree(
   repoPath: string,
   taskId: number,
-): Promise<RemoveWorktreeResult> {
+  branch: string,
+  baseBranch?: string | null,
+): Promise<CleanupMergedWorktreeResult> {
   const worktreePath = getWorktreePath(repoPath, taskId);
 
   try {
-    const branch = await getBranchName(worktreePath);
-    const mainBranch = assertValidBranchName(await getDefaultBranch(repoPath), 'default branch');
-
-    let merged = false;
-    let lastMergeError: Error | null = null;
-    for (let mergeAttempt = 0; mergeAttempt < 3 && !merged; mergeAttempt++) {
-      try {
-        await runCommand('gh', ['pr', 'merge', '--merge'], { cwd: worktreePath });
-        merged = true;
-      } catch (mergeError) {
-        lastMergeError = mergeError instanceof Error ? mergeError : new Error(String(mergeError));
-        const message = lastMergeError.message;
-        const is502 = message.includes('502');
-        const isMergeInProgress = message.includes('Merge already in progress');
-
-        if (is502 || isMergeInProgress) {
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-          try {
-            await runCommand('git', ['fetch', 'origin'], { cwd: worktreePath });
-            const { stdout: branchHead } = await runCommand('git', ['rev-parse', 'HEAD'], {
-              cwd: worktreePath,
-            });
-            const { stdout: mergeCheck } = await runCommand(
-              'git',
-              ['branch', '-r', '--contains', branchHead.trim(), `origin/${mainBranch}`],
-              { cwd: worktreePath },
-            );
-            if (mergeCheck.trim().length > 0) {
-              merged = true;
-            }
-          } catch {
-            /* will retry merge */
-          }
-        } else {
-          break;
-        }
-      }
+    if (fs.existsSync(worktreePath)) {
+      // Provisioned worktrees are large — a hook's dependency install easily
+      // reaches gigabytes (the incident that led to this path involved
+      // ~1.1 GB). The global 30s command timeout is not a meaningful cleanup
+      // deadline.
+      await runCommand('git', ['worktree', 'remove', worktreePath, '--force'], {
+        cwd: repoPath,
+        timeout: 10 * 60_000,
+      });
+    } else {
+      await runCommand('git', ['worktree', 'prune'], { cwd: repoPath });
     }
-    if (!merged) {
-      throw lastMergeError ?? new Error('Failed to merge after retries');
-    }
-
-    await runCommand('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: repoPath });
 
     if (branch) {
       try {
@@ -520,18 +775,78 @@ export async function mergeAndCleanup(
           cwd: repoPath,
         });
       } catch {
-        /* ignore */
+        /* already deleted, or checked out elsewhere */
       }
     }
 
-    await runCommand('git', ['checkout', mainBranch], { cwd: repoPath });
-    await runCommand('git', ['pull'], { cwd: repoPath });
+    // Neither checkout refresh nor the feature-branch fetch is part of task
+    // completion. New worktrees fetch their explicit base themselves; keep
+    // these conveniences best-effort so network trouble cannot reopen a task.
+    try {
+      const mainBranch = assertValidBranchName(await getDefaultBranch(repoPath), 'default branch');
+      await runCommand('git', ['checkout', mainBranch], { cwd: repoPath });
+      await runCommand('git', ['pull'], { cwd: repoPath, timeout: 5 * 60_000 });
+      if (baseBranch && baseBranch !== mainBranch) {
+        await runCommand('git', ['fetch', 'origin', assertValidBranchName(baseBranch)], {
+          cwd: repoPath,
+          timeout: 5 * 60_000,
+        });
+      }
+    } catch (error) {
+      return {
+        success: true,
+        warning: `Worktree removed, but refreshing local branches failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
 
     return { success: true };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { success: false, error: message };
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * Merge a pull request and clean up the worktree and branch.
+ *
+ * Compatibility primitive for callers below the task-domain facade. New
+ * product code calls `tasks.mergeTask`, which persists a write-ahead landing
+ * record before invoking these remote/local primitives. `baseBranch` is used
+ * only to refresh the local feature ref after cleanup; GitHub merges into the
+ * PR's own recorded base.
+ */
+export async function mergeAndCleanup(
+  repoPath: string,
+  taskId: number,
+  baseBranch?: string | null,
+  options: { force?: boolean | undefined } = {},
+): Promise<MergeAndCleanupResult> {
+  const worktreePath = getWorktreePath(repoPath, taskId);
+
+  // Before the merge, not after: `gh pr merge` merges the branch's *remote*
+  // head, so unpushed commits are already excluded from the merge — refusing
+  // afterwards would leave the PR landed and the work still stranded.
+  await assertWorktreeSafeToDestroy(worktreePath, taskId, options);
+
+  const branch = await getBranchName(worktreePath);
+  const pr = await getPullRequestStatus(repoPath, taskId);
+  if (!pr.success || !pr.exists || !pr.url) {
+    return { success: false, error: pr.error ?? 'No pull request found' };
+  }
+
+  const merge = await mergePullRequest(repoPath, pr.url);
+  if (!merge.merged) return { success: false, error: merge.error ?? 'Pull request did not merge' };
+
+  const cleanup = await cleanupMergedWorktree(
+    repoPath,
+    taskId,
+    branch ?? pr.headBranch ?? '',
+    baseBranch,
+  );
+  return cleanup.success
+    ? { success: true, ...(cleanup.warning ? { warning: cleanup.warning } : {}) }
+    : { success: false, error: cleanup.error ?? 'unknown cleanup error', merged: true };
 }
 
 export interface UncommittedChangesResult {

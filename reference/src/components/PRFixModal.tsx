@@ -1,31 +1,66 @@
 /*
- * CIFixModal.tsx — pick a provider + model before starting a "Fix CI"
- * conversation. The Fix-CI action used to hard-code a Claude model; it now
- * runs on whatever the user explicitly selects here.
+ * PRFixModal.tsx — pick a provider + model before starting a PR-repair
+ * conversation. Two flavours share this modal: fixing failing CI, and
+ * resolving merge conflicts with the base branch. Neither hard-codes a model
+ * any more — both run on whatever the user explicitly selects here.
  */
 
 import React from 'react';
-import { X, AlertCircle } from 'lucide-react';
+import { X, AlertCircle, GitMerge } from 'lucide-react';
 import { Button } from './ui/button';
 import { ProviderModelPicker } from './ProviderModelPicker';
 import { useProviderModelSelection } from '../hooks/useProviderModelSelection';
 import type { Provider } from '../../shared/providers/types';
 
-export interface CIFixModalProps {
-  isOpen: boolean;
+/** Which repair the conversation is being started for. */
+export type PRFixKind = 'ci' | 'conflicts';
+
+const KIND_CONFIG: Record<
+  PRFixKind,
+  {
+    title: string;
+    Icon: typeof AlertCircle;
+    iconClass: string;
+    description: string;
+    testIdPrefix: string;
+  }
+> = {
+  ci: {
+    title: 'Fix CI failures',
+    Icon: AlertCircle,
+    iconClass: 'text-red-500',
+    description:
+      'Starts a conversation in the task worktree to retrieve the CI failures, fix ' +
+      'them, and push — iterating until checks pass.',
+    testIdPrefix: 'ci-fix',
+  },
+  conflicts: {
+    title: 'Fix merge conflicts',
+    Icon: GitMerge,
+    iconClass: 'text-amber-500',
+    description:
+      'Starts a conversation in the task worktree to merge the base branch in, ' +
+      'resolve the conflicts, and push — iterating until the PR is mergeable.',
+    testIdPrefix: 'conflict-fix',
+  },
+};
+
+export interface PRFixModalProps {
+  /** The repair to start — `null` closes the modal. */
+  kind: PRFixKind | null;
   onClose: () => void;
   onSubmit: (provider: Provider, model: string) => void | Promise<void>;
   prUrl?: string | undefined;
   isSubmitting?: boolean;
 }
 
-export default function CIFixModal({
-  isOpen,
+export default function PRFixModal({
+  kind,
   onClose,
   onSubmit,
   prUrl,
   isSubmitting = false,
-}: CIFixModalProps) {
+}: PRFixModalProps) {
   const {
     provider,
     model,
@@ -36,8 +71,9 @@ export default function CIFixModal({
     availableProviders,
   } = useProviderModelSelection();
 
-  if (!isOpen) return null;
+  if (!kind) return null;
 
+  const { title, Icon, iconClass, description, testIdPrefix } = KIND_CONFIG[kind];
   const canSubmit = !isSubmitting && !(provider === 'opencode' && !model);
 
   return (
@@ -50,8 +86,8 @@ export default function CIFixModal({
       <div className="relative bg-card rounded-lg shadow-xl border border-border w-full max-w-md mx-4">
         <div className="flex items-center justify-between p-4 border-b border-border">
           <div className="flex items-center gap-2">
-            <AlertCircle className="w-5 h-5 text-red-500" />
-            <h2 className="text-lg font-semibold text-foreground">Fix CI failures</h2>
+            <Icon className={`w-5 h-5 ${iconClass}`} />
+            <h2 className="text-lg font-semibold text-foreground">{title}</h2>
           </div>
           <Button
             variant="ghost"
@@ -66,8 +102,7 @@ export default function CIFixModal({
 
         <div className="p-4 space-y-4">
           <p className="text-sm text-muted-foreground">
-            Starts a conversation in the task worktree to retrieve the CI failures, fix
-            them, and push — iterating until checks pass.
+            {description}
             {prUrl && (
               <>
                 {' '}
@@ -85,7 +120,7 @@ export default function CIFixModal({
             loadingOpenCodeModels={loadingOpenCodeModels}
             availableProviders={availableProviders}
             disabled={isSubmitting}
-            testIdPrefix="ci-fix"
+            testIdPrefix={testIdPrefix}
           />
 
           <div className="flex gap-2 pt-2">

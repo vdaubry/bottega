@@ -4,6 +4,10 @@ import {
   EFFORTS_FOR_UI,
   MODELS_FOR_UI,
   AGENT_TYPES_WITH_SETTINGS,
+  DEFAULT_AGENT_MODEL_SETTINGS,
+  SCHEMA_DEFAULT_SETTING,
+  ANTHROPIC_LOCKED_DEFAULTS,
+  isAnthropicLockedKey,
   isValidAgentModelSetting,
   defaultSettingForProvider,
   buildSeedSettings,
@@ -19,7 +23,7 @@ describe('shared/types/agentModelSettings', () => {
 
     it('accepts a well-formed OpenAI triple', () => {
       expect(
-        isValidAgentModelSetting({ provider: 'openai', model: 'gpt-5.5', effort: 'minimal' }),
+        isValidAgentModelSetting({ provider: 'openai', model: 'gpt-6-astra', effort: 'medium' }),
       ).toBe(true);
     });
 
@@ -27,7 +31,7 @@ describe('shared/types/agentModelSettings', () => {
       expect(
         isValidAgentModelSetting({
           provider: 'opencode',
-          model: 'opencode/kimi-k2.6',
+          model: 'opencode/kimi-k2.7-code',
           effort: null,
         }),
       ).toBe(true);
@@ -38,14 +42,14 @@ describe('shared/types/agentModelSettings', () => {
       expect(
         isValidAgentModelSetting({
           provider: 'opencode',
-          model: 'opencode/kimi-k2.6',
+          model: 'opencode/kimi-k2.7-code',
           effort: 'high',
         }),
       ).toBe(false);
       expect(
         isValidAgentModelSetting({
           provider: 'opencode',
-          model: 'opencode/kimi-k2.6',
+          model: 'opencode/kimi-k2.7-code',
           effort: '',
         }),
       ).toBe(false);
@@ -53,7 +57,7 @@ describe('shared/types/agentModelSettings', () => {
 
     it('rejects an OpenCode entry whose model lacks the opencode/ prefix', () => {
       expect(
-        isValidAgentModelSetting({ provider: 'opencode', model: 'kimi-k2.6', effort: null }),
+        isValidAgentModelSetting({ provider: 'opencode', model: 'kimi-k2.7-code', effort: null }),
       ).toBe(false);
     });
 
@@ -95,18 +99,18 @@ describe('shared/types/agentModelSettings', () => {
       });
     });
 
-    it('defaults openai to GPT-5.5', () => {
+    it('defaults openai to GPT-6.1 Sol', () => {
       expect(defaultSettingForProvider('openai', null)).toEqual({
         provider: 'openai',
-        model: 'gpt-5.5',
+        model: 'gpt-6.1-sol',
         effort: 'high',
       });
     });
 
     it('uses the supplied live OpenCode model id (no effort)', () => {
-      expect(defaultSettingForProvider('opencode', 'opencode/kimi-k2')).toEqual({
+      expect(defaultSettingForProvider('opencode', 'opencode/kimi-k2.7-code')).toEqual({
         provider: 'opencode',
-        model: 'opencode/kimi-k2',
+        model: 'opencode/kimi-k2.7-code',
         effort: null,
       });
     });
@@ -117,16 +121,62 @@ describe('shared/types/agentModelSettings', () => {
   });
 
   describe('buildSeedSettings', () => {
-    it('fills all six agents with the provider default', () => {
+    it('fills every agent with the provider default and every locked key with its own', () => {
       const seed = buildSeedSettings('anthropic', null);
       expect(seed).not.toBeNull();
-      for (const agent of AGENT_TYPES_WITH_SETTINGS) {
-        expect(seed![agent]).toEqual({ provider: 'anthropic', model: 'sonnet', effort: 'high' });
+      for (const key of AGENT_TYPES_WITH_SETTINGS) {
+        const expected = ANTHROPIC_LOCKED_DEFAULTS[key] ?? {
+          provider: 'anthropic',
+          model: 'sonnet',
+          effort: 'high',
+        };
+        expect(seed![key]).toEqual(expected);
       }
+    });
+
+    it('seeds every epic stage to the selected provider', () => {
+      const seed = buildSeedSettings('openai', null);
+      expect(seed).not.toBeNull();
+      expect(seed!['epic-architecture']).toEqual({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
+      expect(seed!['epic-orchestrator']).toEqual({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
+    });
+
+    it('seeds schema as Anthropic even when the other agents seed to a different provider', () => {
+      const seed = buildSeedSettings('openai', null);
+      expect(seed).not.toBeNull();
+      // The agent rows follow the chosen provider…
+      expect(seed!.planification).toEqual({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
+      // …but schema is locked to the Anthropic default.
+      expect(seed!.schema).toEqual(SCHEMA_DEFAULT_SETTING);
+      expect(seed!.schema.provider).toBe('anthropic');
     });
 
     it('returns null when the provider cannot be defaulted (opencode, no model id)', () => {
       expect(buildSeedSettings('opencode', null)).toBeNull();
+    });
+  });
+
+  describe('schema model key', () => {
+    it("includes 'schema' in the settings list", () => {
+      expect(AGENT_TYPES_WITH_SETTINGS).toContain('schema');
+    });
+
+    it('includes every epic stage key in the settings list', () => {
+      for (const key of [
+        'epic-architecture',
+        'epic-specification',
+        'epic-stories',
+        'epic-orchestrator',
+      ]) {
+        expect(AGENT_TYPES_WITH_SETTINGS).toContain(key);
+        expect(isAnthropicLockedKey(key as never)).toBe(false);
+      }
+    });
+
+    it('exposes an Anthropic schema default', () => {
+      expect(DEFAULT_AGENT_MODEL_SETTINGS.schema.provider).toBe('anthropic');
+      expect(SCHEMA_DEFAULT_SETTING.provider).toBe('anthropic');
+      expect(isValidAgentModelSetting(SCHEMA_DEFAULT_SETTING)).toBe(true);
     });
   });
 });

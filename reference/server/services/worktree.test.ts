@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // Use vi.hoisted so `vi.mock` can reach the mock function before module init.
-const { mockRunCommand, mockAccess, mockMkdir, mockSymlink, mockExistsSync } = vi.hoisted(
+const { mockRunCommand, mockAccess, mockMkdir, mockRm, mockExistsSync } = vi.hoisted(
   () => ({
     mockRunCommand: vi.fn(),
     mockAccess: vi.fn(),
     mockMkdir: vi.fn(),
-    mockSymlink: vi.fn(),
+    mockRm: vi.fn(),
     mockExistsSync: vi.fn(),
   }),
 );
@@ -15,25 +15,32 @@ const { mockRunCommand, mockAccess, mockMkdir, mockSymlink, mockExistsSync } = v
 // supposed to flow through runCommand(cmd, args[], opts), so we can assert
 // on (cmd, args) shape directly — and adversarial inputs end up as argv
 // elements, never interpreted by a shell.
-vi.mock('./shell.js', () => ({
+// `runCommandGroup` (the process-group runner `git worktree add` uses) routes
+// through the same mock, so every git call is recorded in one place; the real
+// `CommandGroupError` is kept for `instanceof`.
+vi.mock('./shell.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shell.js')>()),
   runCommand: mockRunCommand,
+  runCommandGroup: (...args: unknown[]) => mockRunCommand(...args),
 }));
 
 // Mock fs
 vi.mock('fs', () => ({
   default: {
     existsSync: mockExistsSync,
+    constants: { X_OK: 1 },
     promises: {
       access: mockAccess,
       mkdir: mockMkdir,
-      symlink: mockSymlink,
+      rm: mockRm,
     },
   },
   existsSync: mockExistsSync,
+  constants: { X_OK: 1 },
   promises: {
     access: mockAccess,
     mkdir: mockMkdir,
-    symlink: mockSymlink,
+    rm: mockRm,
   },
 }));
 
@@ -47,13 +54,17 @@ import {
   createWorktree,
   removeWorktree,
   getWorktreeStatus,
-  syncWithMain,
+  syncWithBase,
   createPullRequest,
   getPullRequestStatus,
+  getPullRequestStatusByUrl,
+  mergePullRequest,
+  cleanupMergedWorktree,
   mergeAndCleanup,
   hasUncommittedChanges,
   commitAllChanges,
   pushChanges,
+  worktreeProvisioningMode,
 } from './worktree.js';
 
 // Helper: configure mockRunCommand to dispatch on (cmd, args) so each test
@@ -186,6 +197,7 @@ describe('Worktree Service', () => {
     beforeEach(() => {
       vi.mocked(mockExistsSync).mockReturnValue(false);
       vi.mocked(mockMkdir).mockResolvedValue(undefined);
+      vi.mocked(mockRm).mockResolvedValue(undefined);
     });
 
     it('passes branch / base / path as separate argv elements', async () => {
@@ -213,6 +225,41 @@ describe('Worktree Service', () => {
         '/home/user/repo-worktrees/task-15',
         'main',
       ]);
+    });
+
+    it('fetches an explicit base branch first and forks off the remote ref', async () => {
+      const calls: string[][] = [];
+      withDispatch(async (cmd, args) => {
+        calls.push([cmd, ...args]);
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await createWorktree(
+        '/home/user/repo',
+        15,
+        'Add User Login',
+        'epic/8-nimbus-pricing',
+      );
+
+      expect(result.success).toBe(true);
+      // No default-branch lookup: the caller already resolved the base.
+      expect(calls.some((c) => c.includes('symbolic-ref'))).toBe(false);
+      expect(calls).toContainEqual(['git', 'fetch', 'origin', 'epic/8-nimbus-pricing']);
+      const add = calls.find((c) => c.includes('worktree'))!;
+      expect(add[add.length - 1]).toBe('origin/epic/8-nimbus-pricing');
+    });
+
+    it('falls back to the local ref when the base branch is not on origin', async () => {
+      withDispatch(async (_cmd, args) => {
+        if (args[0] === 'fetch') throw new Error("couldn't find remote ref");
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await createWorktree('/repo', 15, 'Task', 'epic/8-nimbus');
+
+      expect(result.success).toBe(true);
+      const add = mockRunCommand.mock.calls.find((c) => (c[1] as string[]).includes('worktree'))!;
+      expect((add[1] as string[]).at(-1)).toBe('epic/8-nimbus');
     });
 
     it('rejects an invalid base branch returned from git rather than executing it', async () => {
@@ -256,8 +303,10 @@ describe('Worktree Service', () => {
       expect(result.error).toContain('branch already exists');
     });
 
-    it('symlinks .env when it exists in the main repo', async () => {
-      vi.mocked(mockSymlink).mockResolvedValue(undefined);
+    // Provisioning belongs to the project's own post-checkout hook, which git
+    // runs inside `git worktree add`. Bottega adds nothing: no env symlinks,
+    // no dependency copies, no stack-specific directories.
+    it('runs no provisioning of its own', async () => {
       vi.mocked(mockExistsSync).mockImplementation((p) => p === '/repo/.env');
       withDispatch(async (_cmd, args) => {
         if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
@@ -267,26 +316,15 @@ describe('Worktree Service', () => {
       const result = await createWorktree('/repo', 1, 'Test');
 
       expect(result.success).toBe(true);
-      expect(mockSymlink).toHaveBeenCalledWith('/repo/.env', '/repo-worktrees/task-1/.env');
+      expect(mockRunCommand.mock.calls.every((c) => c[0] === 'git')).toBe(true);
+      // Only the worktrees parent dir; nothing inside the worktree.
+      expect(mockMkdir).toHaveBeenCalledTimes(1);
+      expect(mockMkdir).toHaveBeenCalledWith('/repo-worktrees', { recursive: true });
     });
 
-    it('does not overwrite an existing worktree .env', async () => {
-      vi.mocked(mockExistsSync).mockImplementation(
-        (p) => p === '/repo/.env' || p === '/repo-worktrees/task-1/.env',
-      );
-      withDispatch(async (_cmd, args) => {
-        if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
-        return { stdout: '', stderr: '' };
-      });
-
-      const result = await createWorktree('/repo', 1, 'Test');
-
-      expect(result.success).toBe(true);
-      expect(mockSymlink).not.toHaveBeenCalled();
-    });
-
-    it('fires background cp -a for node_modules when source exists', async () => {
-      vi.mocked(mockExistsSync).mockImplementation((p) => p === '/repo/node_modules');
+    // The hook may do a real dependency install; the 30 s runCommand default
+    // would kill git mid-provisioning.
+    it('gives `git worktree add` a 10-minute budget for the post-checkout hook', async () => {
       withDispatch(async (_cmd, args) => {
         if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
         return { stdout: '', stderr: '' };
@@ -294,26 +332,115 @@ describe('Worktree Service', () => {
 
       await createWorktree('/repo', 1, 'Test');
 
-      const cpCall = mockRunCommand.mock.calls.find((c) => c[0] === 'cp');
-      expect(cpCall).toBeDefined();
-      expect(cpCall![1]).toEqual(['-a', '/repo/node_modules', '/repo-worktrees/task-1/node_modules']);
+      const add = mockRunCommand.mock.calls.find((c) => (c[1] as string[])[1] === 'add')!;
+      expect(add[2]).toEqual({ cwd: '/repo', timeout: 600_000 });
     });
 
-    it('does not block worktree creation if dependency copy fails', async () => {
-      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      vi.mocked(mockExistsSync).mockImplementation((p) => p === '/repo/node_modules');
-
-      withDispatch(async (cmd) => {
-        if (cmd === 'cp') throw new Error('No space left on device');
+    // post-checkout runs AFTER the checkout, so a failing (or timed-out) hook
+    // leaves the worktree and branch on disk while `git worktree add` reports
+    // failure. They must not survive as orphans.
+    it('sweeps the worktree and branch when the add fails', async () => {
+      const calls: string[][] = [];
+      withDispatch(async (cmd, args) => {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'add') throw new Error('post-checkout hook failed');
         return { stdout: 'main\n', stderr: '' };
       });
 
       const result = await createWorktree('/repo', 1, 'Test');
 
-      expect(result.success).toBe(true);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to copy node_modules'));
-      consoleSpy.mockRestore();
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('post-checkout hook failed');
+      expect(calls).toContainEqual([
+        'git',
+        'worktree',
+        'remove',
+        '/repo-worktrees/task-1',
+        '--force',
+      ]);
+      expect(calls).toContainEqual(['git', 'branch', '-D', 'task/1-test']);
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    it('runs the add as a process group and hands it the caller\'s abort signal', async () => {
+      withDispatch(async (_cmd, args) => {
+        if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      });
+      const controller = new AbortController();
+
+      await createWorktree('/repo', 1, 'Test', null, { signal: controller.signal });
+
+      const add = mockRunCommand.mock.calls.find((c) => (c[1] as string[])[1] === 'add')!;
+      expect(add[2]).toEqual({ cwd: '/repo', timeout: 600_000, signal: controller.signal });
+    });
+
+    // The failure has to be explainable to the user: git sends the hook's
+    // output to stderr, and its tail travels back with the error.
+    it('returns the tail of the hook output when the add fails', async () => {
+      const { CommandGroupError } = await import('./shell.js');
+      const hookLines = Array.from({ length: 60 }, (_, i) => `hook line ${i + 1}`);
+      withDispatch(async (_cmd, args) => {
+        if (args[1] === 'add') {
+          throw new CommandGroupError(
+            'git worktree add timed out after 600s',
+            '',
+            `${hookLines.join('\n')}\n`,
+            null,
+            true,
+            false,
+          );
+        }
+        return { stdout: 'main\n', stderr: '' };
+      });
+
+      const result = await createWorktree('/repo', 1, 'Test');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe(
+        "The project's setup did not finish within 10 minutes, so it was stopped",
+      );
+      expect(result.aborted).toBe(false);
+      const output = result.output!.split('\n');
+      expect(output).toHaveLength(40);
+      expect(output.at(-1)).toBe('hook line 60');
+      expect(output[0]).toBe('hook line 21');
+    });
+
+    it('reports a cancelled add as aborted, and still sweeps it', async () => {
+      const { CommandGroupError } = await import('./shell.js');
+      const calls: string[][] = [];
+      withDispatch(async (cmd, args) => {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'add') {
+          throw new CommandGroupError('git worktree add was cancelled', '', '', null, false, true);
+        }
+        return { stdout: 'main\n', stderr: '' };
+      });
+
+      const result = await createWorktree('/repo', 1, 'Test');
+
+      expect(result).toMatchObject({ success: false, aborted: true });
+      expect(calls).toContainEqual(['git', 'branch', '-D', 'task/1-test']);
+    });
+
+    it('falls back to rm + prune when the failed worktree is not registered', async () => {
+      const calls: string[][] = [];
+      withDispatch(async (cmd, args) => {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'add') throw new Error('hook timed out');
+        if (args[1] === 'remove') throw new Error('is not a working tree');
+        return { stdout: 'main\n', stderr: '' };
+      });
+
+      const result = await createWorktree('/repo', 1, 'Test');
+
+      expect(result.success).toBe(false);
+      expect(mockRm).toHaveBeenCalledWith('/repo-worktrees/task-1', {
+        recursive: true,
+        force: true,
+      });
+      expect(calls).toContainEqual(['git', 'worktree', 'prune']);
     });
   });
 
@@ -335,6 +462,39 @@ describe('Worktree Service', () => {
         (c) => (c[1] as string[]).includes('-D'),
       );
       expect(branchDelete![1]).toEqual(['branch', '-D', 'task/15-feature']);
+    });
+
+    // The guard lives inside the primitive so no caller can route around it.
+    it('refuses to remove a worktree holding unsaved work', async () => {
+      mockAccess.mockResolvedValue(undefined);
+      withDispatch(async (_cmd, args) => {
+        if (args[0] === 'status') return { stdout: ' M src/app.ts\n', stderr: '' };
+        if (args[0] === 'for-each-ref') return { stdout: 'refs/remotes/origin/main', stderr: '' };
+        if (args.includes('--show-current')) return { stdout: 'task/15-feature\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(removeWorktree('/repo', 15)).rejects.toMatchObject({
+        code: 'worktree-has-unsaved-work',
+        taskId: 15,
+        safety: { dirtyFiles: 1 },
+      });
+      expect(
+        mockRunCommand.mock.calls.some((c) => (c[1] as string[]).includes('remove')),
+      ).toBe(false);
+    });
+
+    it('removes a worktree holding unsaved work when forced', async () => {
+      mockAccess.mockResolvedValue(undefined);
+      withDispatch(async (_cmd, args) => {
+        if (args[0] === 'status') return { stdout: ' M src/app.ts\n', stderr: '' };
+        if (args.includes('--show-current')) return { stdout: 'task/15-feature\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await removeWorktree('/repo', 15, { force: true });
+
+      expect(result.success).toBe(true);
     });
 
     it('succeeds even if branch deletion fails', async () => {
@@ -384,6 +544,25 @@ describe('Worktree Service', () => {
       expect(result.worktreePath).toBe('/repo-worktrees/task-10');
     });
 
+    it('counts against the given base branch and echoes it back', async () => {
+      mockAccess.mockResolvedValue(undefined);
+      withDispatch(async (_cmd, args) => {
+        if (args.includes('--show-current')) return { stdout: 'task/10-feature\n', stderr: '' };
+        if (args[0] === 'rev-list') return { stdout: '2\t5\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await getWorktreeStatus('/repo', 10, 'epic/8-nimbus');
+
+      expect(result.behind).toBe(2);
+      expect(result.ahead).toBe(5);
+      expect(result.baseBranch).toBe('epic/8-nimbus');
+      // Kept as an alias so the existing worktree panel keeps rendering.
+      expect(result.mainBranch).toBe('epic/8-nimbus');
+      const revList = mockRunCommand.mock.calls.find((c) => (c[1] as string[])[0] === 'rev-list');
+      expect(revList![1]).toContain('origin/epic/8-nimbus...HEAD');
+    });
+
     it('handles worktree not existing', async () => {
       vi.mocked(mockAccess).mockRejectedValue(new Error('ENOENT'));
 
@@ -393,31 +572,61 @@ describe('Worktree Service', () => {
     });
   });
 
-  describe('syncWithMain', () => {
-    it('passes the main branch as an argv element', async () => {
+  describe('syncWithBase', () => {
+    it('merges the repo default branch when no base is given', async () => {
       withDispatch(async (_cmd, args) => {
         if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
         return { stdout: '', stderr: '' };
       });
 
-      const result = await syncWithMain('/repo', 10);
+      const result = await syncWithBase('/repo', 10);
 
       expect(result.success).toBe(true);
-      const mergeCall = mockRunCommand.mock.calls.find((c) => (c[1] as string[]).includes('merge'));
+      const mergeCall = mockRunCommand.mock.calls.find((c) => (c[1] as string[])[0] === 'merge');
       expect(mergeCall![1]).toEqual(['merge', 'origin/main']);
     });
 
-    it('returns error on merge conflict', async () => {
+    it('merges the given base branch without consulting the repo default', async () => {
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+
+      const result = await syncWithBase('/repo', 10, 'epic/8-nimbus');
+
+      expect(result.success).toBe(true);
+      const mergeCall = mockRunCommand.mock.calls.find((c) => (c[1] as string[])[0] === 'merge');
+      expect(mergeCall![1]).toEqual(['merge', 'origin/epic/8-nimbus']);
+      expect(
+        mockRunCommand.mock.calls.some((c) => (c[1] as string[]).includes('symbolic-ref')),
+      ).toBe(false);
+    });
+
+    it('aborts the merge on conflict so the worktree is never left mid-merge', async () => {
       withDispatch(async (_cmd, args) => {
-        if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
-        if (args.includes('merge')) throw new Error('merge conflict');
+        if (args[0] === 'merge' && args[1] !== '--abort') throw new Error('merge conflict');
         return { stdout: '', stderr: '' };
       });
 
-      const result = await syncWithMain('/repo', 10);
+      const result = await syncWithBase('/repo', 10, 'epic/8-nimbus');
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('merge conflict');
+      expect(mockRunCommand).toHaveBeenCalledWith(
+        'git',
+        ['merge', '--abort'],
+        expect.objectContaining({ cwd: '/repo-worktrees/task-10' }),
+      );
+    });
+
+    it('swallows a failing merge --abort (nothing was in progress)', async () => {
+      withDispatch(async (_cmd, args) => {
+        if (args[0] === 'fetch') throw new Error('network down');
+        if (args[0] === 'merge' && args[1] === '--abort') throw new Error('no merge in progress');
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await syncWithBase('/repo', 10, 'epic/8-nimbus');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('network down');
     });
   });
 
@@ -446,6 +655,40 @@ describe('Worktree Service', () => {
       expect(result.success).toBe(true);
       expect(capturedTitle).toBe(adversarialTitle);
       expect(capturedBody).toBe(adversarialBody);
+    });
+
+    it('targets the given base branch with --base', async () => {
+      withDispatch(async (_cmd, args) => {
+        if (args.includes('--show-current')) return { stdout: 'task/1-test\n', stderr: '' };
+        return { stdout: 'https://github.com/o/r/pull/1\n', stderr: '' };
+      });
+
+      const result = await createPullRequest('/repo', 1, 'Title', 'Body', 'epic/8-nimbus');
+
+      expect(result.success).toBe(true);
+      const prCall = mockRunCommand.mock.calls.find((c) => c[0] === 'gh')!;
+      expect(prCall[1]).toEqual([
+        'pr',
+        'create',
+        '--title',
+        'Title',
+        '--body',
+        'Body',
+        '--base',
+        'epic/8-nimbus',
+      ]);
+    });
+
+    it('omits --base when no base branch is given', async () => {
+      withDispatch(async (_cmd, args) => {
+        if (args.includes('--show-current')) return { stdout: 'task/1-test\n', stderr: '' };
+        return { stdout: 'https://github.com/o/r/pull/1\n', stderr: '' };
+      });
+
+      await createPullRequest('/repo', 1, 'Title', 'Body');
+
+      const prCall = mockRunCommand.mock.calls.find((c) => c[0] === 'gh')!;
+      expect(prCall[1]).not.toContain('--base');
     });
 
     it('returns error on gh CLI failure', async () => {
@@ -507,88 +750,175 @@ describe('Worktree Service', () => {
   });
 
   describe('mergeAndCleanup', () => {
-    it('merges PR and cleans up worktree', async () => {
+    const openPr = {
+      url: 'https://github.com/o/r/pull/10',
+      state: 'OPEN',
+      mergeable: 'MERGEABLE',
+      headRefName: 'task/10-feature',
+      baseRefName: 'main',
+      mergeCommit: null,
+      mergedAt: null,
+    };
+    const mergedPr = {
+      ...openPr,
+      state: 'MERGED',
+      mergeCommit: { oid: 'abc123' },
+      mergedAt: '2026-08-24T12:00:00Z',
+    };
+
+    it('queries a durable PR URL from the main checkout', async () => {
+      withDispatch(async () => ({ stdout: JSON.stringify(mergedPr), stderr: '' }));
+
+      const result = await getPullRequestStatusByUrl('/repo', openPr.url);
+
+      expect(result).toMatchObject({
+        success: true,
+        exists: true,
+        state: 'MERGED',
+        headBranch: 'task/10-feature',
+        baseBranch: 'main',
+        mergeCommitSha: 'abc123',
+      });
+      expect(mockRunCommand).toHaveBeenCalledWith(
+        'gh',
+        ['pr', 'view', openPr.url, '--json', expect.stringContaining('mergeCommit')],
+        { cwd: '/repo' },
+      );
+    });
+
+    it('treats an ambiguous merge error as success when GitHub says MERGED', async () => {
+      let viewCount = 0;
+      withDispatch(async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return { stdout: JSON.stringify(viewCount++ === 0 ? openPr : mergedPr), stderr: '' };
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'merge') {
+          throw new Error('response timed out');
+        }
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      });
+
+      const result = await mergePullRequest('/repo', openPr.url);
+
+      expect(result).toMatchObject({ success: true, merged: true, state: 'MERGED' });
+    });
+
+    it('does not retry or re-merge a PR already reported MERGED', async () => {
+      withDispatch(async () => ({ stdout: JSON.stringify(mergedPr), stderr: '' }));
+
+      const result = await mergePullRequest('/repo', openPr.url);
+
+      expect(result.merged).toBe(true);
+      expect(mockRunCommand).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns the real merge error while the PR remains open', async () => {
+      withDispatch(async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return { stdout: JSON.stringify(openPr), stderr: '' };
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'merge') {
+          throw new Error('PR is not mergeable');
+        }
+        throw new Error('unexpected command');
+      });
+
+      const result = await mergePullRequest('/repo', openPr.url);
+
+      expect(result).toMatchObject({ success: false, merged: false });
+      expect(result.error).toContain('not mergeable');
+    });
+
+    it('does not complete from a zero exit until GitHub confirms MERGED', async () => {
+      withDispatch(async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return { stdout: JSON.stringify(openPr), stderr: '' };
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'merge') {
+          return { stdout: 'auto-merge enabled', stderr: '' };
+        }
+        throw new Error('unexpected command');
+      });
+
+      const result = await mergePullRequest('/repo', openPr.url);
+
+      expect(result).toMatchObject({ success: false, merged: false, state: 'OPEN' });
+      expect(result.error).toContain('has not confirmed');
+    });
+
+    it('gives large worktree removal its own ten-minute deadline', async () => {
+      mockExistsSync.mockReturnValue(true);
+      const calls: Array<[string, readonly string[], Record<string, unknown> | undefined]> = [];
+      mockRunCommand.mockImplementation(
+        async (cmd: string, args: readonly string[], options?: Record<string, unknown>) => {
+          calls.push([cmd, args, options]);
+          if (args.includes('symbolic-ref')) return { stdout: 'refs/remotes/origin/main\n', stderr: '' };
+          return { stdout: '', stderr: '' };
+        },
+      );
+
+      const result = await cleanupMergedWorktree('/repo', 10, 'task/10-feature', 'main');
+
+      expect(result.success).toBe(true);
+      expect(calls).toContainEqual([
+        'git',
+        ['worktree', 'remove', '/repo-worktrees/task-10', '--force'],
+        { cwd: '/repo', timeout: 600_000 },
+      ]);
+    });
+
+    it('reports cleanup failure without changing the already-merged fact', async () => {
+      mockExistsSync.mockReturnValue(true);
+      withDispatch(async (_cmd, args) => {
+        if (args[0] === 'worktree') throw new Error('cleanup timed out');
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await cleanupMergedWorktree('/repo', 10, 'task/10-feature', 'main');
+
+      expect(result).toEqual({ success: false, error: 'cleanup timed out' });
+    });
+
+    it('keeps the compatibility wrapper safe before touching GitHub', async () => {
+      mockAccess.mockResolvedValue(undefined);
       const calls: string[][] = [];
       withDispatch(async (cmd, args) => {
         calls.push([cmd, ...args]);
+        if (args[0] === 'status') return { stdout: '', stderr: '' };
         if (args.includes('--show-current')) return { stdout: 'task/10-feature\n', stderr: '' };
-        if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
+        if (args[0] === 'for-each-ref') return { stdout: 'refs/remotes/origin/main', stderr: '' };
+        if (args[0] === 'rev-list') return { stdout: '2\n', stderr: '' };
         return { stdout: '', stderr: '' };
       });
 
-      const result = await mergeAndCleanup('/repo', 10);
-
-      expect(result.success).toBe(true);
-      expect(calls.some((c) => c.join(' ').includes('gh pr merge --merge'))).toBe(true);
-      expect(calls.some((c) => c.join(' ').includes('git worktree remove'))).toBe(true);
-      expect(calls.some((c) => c.join(' ').includes('git branch -D task/10-feature'))).toBe(true);
-      expect(calls.some((c) => c.join(' ').includes('git checkout main'))).toBe(true);
-      expect(calls.some((c) => c.join(' ').includes('git pull'))).toBe(true);
+      await expect(mergeAndCleanup('/repo', 10)).rejects.toMatchObject({
+        code: 'worktree-has-unsaved-work',
+        safety: { dirtyFiles: 0, unpushedCommits: 2 },
+      });
+      expect(calls.some((c) => c[0] === 'gh')).toBe(false);
     });
 
-    it('retries merge on 502 and succeeds on second attempt', async () => {
-      let mergeCallCount = 0;
+    // Checked *before* `gh pr merge`: the merge lands the branch's remote head,
+    // so refusing afterwards would leave the PR merged and the work stranded.
+    it('refuses to merge before touching the PR when work is unpushed', async () => {
+      mockAccess.mockResolvedValue(undefined);
+      const calls: string[][] = [];
       withDispatch(async (cmd, args) => {
+        calls.push([cmd, ...args]);
+        if (args[0] === 'status') return { stdout: '', stderr: '' };
         if (args.includes('--show-current')) return { stdout: 'task/10-feature\n', stderr: '' };
+        if (args[0] === 'for-each-ref') return { stdout: 'refs/remotes/origin/main', stderr: '' };
+        if (args[0] === 'rev-list') return { stdout: '2\n', stderr: '' };
         if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
-        if (cmd === 'gh' && args.includes('merge')) {
-          mergeCallCount++;
-          if (mergeCallCount === 1) throw new Error('non-200 OK status code: 502 Bad Gateway');
-          return { stdout: '', stderr: '' };
-        }
-        if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return { stdout: 'abc123\n', stderr: '' };
-        }
-        if (cmd === 'git' && args[0] === 'branch' && args[1] === '-r') {
-          return { stdout: '', stderr: '' };
-        }
         return { stdout: '', stderr: '' };
       });
 
-      const result = await mergeAndCleanup('/repo', 10);
-
-      expect(result.success).toBe(true);
-      expect(mergeCallCount).toBe(2);
-    }, 20000);
-
-    it('detects merge landed on main after 502 without retrying merge', async () => {
-      withDispatch(async (cmd, args) => {
-        if (args.includes('--show-current')) return { stdout: 'task/10-feature\n', stderr: '' };
-        if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
-        if (cmd === 'gh' && args.includes('merge')) {
-          throw new Error('non-200 OK status code: 502 Bad Gateway');
-        }
-        if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return { stdout: 'abc123\n', stderr: '' };
-        }
-        if (cmd === 'git' && args[0] === 'branch' && args[1] === '-r') {
-          return { stdout: '  origin/main\n', stderr: '' };
-        }
-        return { stdout: '', stderr: '' };
+      await expect(mergeAndCleanup('/repo', 10)).rejects.toMatchObject({
+        code: 'worktree-has-unsaved-work',
+        safety: { dirtyFiles: 0, unpushedCommits: 2 },
       });
-
-      const result = await mergeAndCleanup('/repo', 10);
-
-      expect(result.success).toBe(true);
-    }, 20000);
-
-    it('returns error when non-502 merge fails without retrying', async () => {
-      let mergeCallCount = 0;
-      withDispatch(async (cmd, args) => {
-        if (args.includes('--show-current')) return { stdout: 'task/10-feature\n', stderr: '' };
-        if (args.includes('symbolic-ref')) return { stdout: 'main\n', stderr: '' };
-        if (cmd === 'gh' && args.includes('merge')) {
-          mergeCallCount++;
-          throw new Error('PR is not mergeable');
-        }
-        return { stdout: '', stderr: '' };
-      });
-
-      const result = await mergeAndCleanup('/repo', 10);
-
-      expect(result.success).toBe(false);
-      expect(result.error).toContain('not mergeable');
-      expect(mergeCallCount).toBe(1);
+      expect(calls.some((c) => c[0] === 'gh')).toBe(false);
+      expect(calls.some((c) => c.join(' ').includes('worktree remove'))).toBe(false);
     });
   });
 
@@ -658,5 +988,80 @@ describe('Worktree Service', () => {
       );
       expect(pushCall![1]).toEqual(['push', 'origin', 'task/1-test']);
     });
+  });
+});
+
+
+/**
+ * Who provisions a worktree.
+ *
+ * A worktree is only *runnable* once the gitignored files git does not carry
+ * are there — dependencies, env files, runtime directories. Which files those
+ * are is the project's business, not Bottega's, and git already has the right
+ * mechanism: `post-checkout` runs inside `git worktree add`, with the new
+ * worktree as cwd, for every worktree however it was created.
+ */
+describe('worktreeProvisioningMode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reports `hook` when the repo has an executable post-checkout hook', async () => {
+    mockRunCommand.mockResolvedValue({ stdout: '/repo/.git/hooks/post-checkout\n', stderr: '' });
+    mockAccess.mockResolvedValue(undefined);
+
+    expect(await worktreeProvisioningMode('/repo')).toBe('hook');
+  });
+
+  // Detection must ask git, not guess a path: that is what makes a COMMITTED
+  // hook work (`.githooks/post-checkout` + `core.hooksPath .githooks`), which
+  // is the only way the mechanism travels with the repo.
+  it('asks git for the path, from the repo root, so core.hooksPath is honoured', async () => {
+    mockRunCommand.mockResolvedValue({ stdout: '/repo/.githooks/post-checkout\n', stderr: '' });
+    mockAccess.mockResolvedValue(undefined);
+
+    await worktreeProvisioningMode('/repo');
+
+    expect(mockRunCommand).toHaveBeenCalledWith(
+      'git',
+      ['rev-parse', '--path-format=absolute', '--git-path', 'hooks/post-checkout'],
+      { cwd: '/repo' },
+    );
+  });
+
+  // git does not run a non-executable hook either, so neither do we.
+  it('reports `none` when the hook file is not executable', async () => {
+    mockRunCommand.mockResolvedValue({ stdout: '/repo/.git/hooks/post-checkout\n', stderr: '' });
+    mockAccess.mockRejectedValue(new Error('EACCES'));
+
+    expect(await worktreeProvisioningMode('/repo')).toBe('none');
+  });
+
+  it('reports `none` when there is no hook at all', async () => {
+    mockRunCommand.mockResolvedValue({ stdout: '/repo/.git/hooks/post-checkout\n', stderr: '' });
+    mockAccess.mockRejectedValue(new Error('ENOENT'));
+
+    expect(await worktreeProvisioningMode('/repo')).toBe('none');
+  });
+
+  // `--path-format` needs git >= 2.31.
+  it('falls back to the relative form on an older git', async () => {
+    mockRunCommand
+      .mockRejectedValueOnce(new Error('unknown option `path-format`'))
+      .mockResolvedValueOnce({ stdout: '.git/hooks/post-checkout\n', stderr: '' });
+    mockAccess.mockResolvedValue(undefined);
+
+    expect(await worktreeProvisioningMode('/repo')).toBe('hook');
+    expect(mockRunCommand).toHaveBeenLastCalledWith(
+      'git',
+      ['rev-parse', '--git-path', 'hooks/post-checkout'],
+      { cwd: '/repo' },
+    );
+  });
+
+  it('reports `none` when git cannot answer at all', async () => {
+    mockRunCommand.mockRejectedValue(new Error('not a git repository'));
+
+    expect(await worktreeProvisioningMode('/repo')).toBe('none');
   });
 });

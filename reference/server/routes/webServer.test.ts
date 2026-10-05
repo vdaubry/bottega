@@ -4,7 +4,7 @@ import express from 'express';
 
 // Mock the webServerManager service
 vi.mock('../services/webServerManager.js', () => ({
-  switchWorktree: vi.fn(),
+  switchServedTarget: vi.fn(),
   getActiveWorktree: vi.fn(),
   verifySymlink: vi.fn(),
   updateWebServerConfig: vi.fn()
@@ -12,7 +12,7 @@ vi.mock('../services/webServerManager.js', () => ({
 
 import webServerRoutes from './webServer.js';
 import {
-  switchWorktree,
+  switchServedTarget,
   getActiveWorktree,
   verifySymlink,
   updateWebServerConfig
@@ -175,7 +175,7 @@ describe('WebServer Routes', () => {
 
   describe('POST /api/projects/:id/web-server/switch', () => {
     it('should switch to a worktree', async () => {
-      vi.mocked(switchWorktree).mockResolvedValue({
+      vi.mocked(switchServedTarget).mockResolvedValue({
         success: true,
         activeTaskId: 10
       });
@@ -187,11 +187,11 @@ describe('WebServer Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.activeTaskId).toBe(10);
-      expect(switchWorktree).toHaveBeenCalledWith(1, 10, testUserId);
+      expect(switchServedTarget).toHaveBeenCalledWith(1, { kind: 'task', taskId: 10 }, testUserId);
     });
 
     it('should switch to main repo when taskId is null', async () => {
-      vi.mocked(switchWorktree).mockResolvedValue({
+      vi.mocked(switchServedTarget).mockResolvedValue({
         success: true,
         activeTaskId: null
       });
@@ -203,7 +203,7 @@ describe('WebServer Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.activeTaskId).toBe(null);
-      expect(switchWorktree).toHaveBeenCalledWith(1, null, testUserId);
+      expect(switchServedTarget).toHaveBeenCalledWith(1, { kind: 'main' }, testUserId);
     });
 
     it('should return 400 for invalid project ID', async () => {
@@ -225,7 +225,7 @@ describe('WebServer Routes', () => {
     });
 
     it('should return 400 when switch fails', async () => {
-      vi.mocked(switchWorktree).mockResolvedValue({
+      vi.mocked(switchServedTarget).mockResolvedValue({
         success: false,
         error: 'Worktree does not exist'
       });
@@ -239,7 +239,7 @@ describe('WebServer Routes', () => {
     });
 
     it('should return 500 on server error', async () => {
-      vi.mocked(switchWorktree).mockRejectedValue(new Error('System error'));
+      vi.mocked(switchServedTarget).mockRejectedValue(new Error('System error'));
 
       const response = await request(app)
         .post('/api/projects/1/web-server/switch')
@@ -249,8 +249,44 @@ describe('WebServer Routes', () => {
       expect(response.body.error).toBe('Failed to switch worktree');
     });
 
+    // The epic branch of the same endpoint: one symlink, one route, two kinds
+    // of worktree to point it at.
+    it('switches to an epic delivery worktree', async () => {
+      vi.mocked(switchServedTarget).mockResolvedValue({
+        success: true,
+        activeTaskId: null,
+        activeEpicId: 8,
+      });
+
+      const response = await request(app)
+        .post('/api/projects/1/web-server/switch')
+        .send({ epicId: 8 });
+
+      expect(response.status).toBe(200);
+      expect(switchServedTarget).toHaveBeenCalledWith(1, { kind: 'epic', epicId: 8 }, testUserId);
+    });
+
+    it('rejects serving a task and an epic at once', async () => {
+      const response = await request(app)
+        .post('/api/projects/1/web-server/switch')
+        .send({ taskId: 10, epicId: 8 });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/not both/);
+      expect(switchServedTarget).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-numeric epic ID', async () => {
+      const response = await request(app)
+        .post('/api/projects/1/web-server/switch')
+        .send({ epicId: 'not-a-number' });
+
+      expect(response.status).toBe(400);
+      expect(switchServedTarget).not.toHaveBeenCalled();
+    });
+
     it('should handle taskId provided as string number', async () => {
-      vi.mocked(switchWorktree).mockResolvedValue({
+      vi.mocked(switchServedTarget).mockResolvedValue({
         success: true,
         activeTaskId: 10
       });
@@ -260,7 +296,7 @@ describe('WebServer Routes', () => {
         .send({ taskId: '10' });
 
       expect(response.status).toBe(200);
-      expect(switchWorktree).toHaveBeenCalledWith(1, 10, testUserId);
+      expect(switchServedTarget).toHaveBeenCalledWith(1, { kind: 'task', taskId: 10 }, testUserId);
     });
   });
 

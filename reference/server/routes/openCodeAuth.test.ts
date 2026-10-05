@@ -208,11 +208,11 @@ describe('OpenCode auth routes', () => {
       });
       vi.mocked(listOpenCodeModels).mockResolvedValueOnce([
         {
-          id: 'opencode/kimi-k2.6',
-          bareModelId: 'kimi-k2.6',
-          name: 'Kimi K2.6',
+          id: 'opencode/kimi-k2.7-code',
+          bareModelId: 'kimi-k2.7-code',
+          name: 'Kimi K2.7 Code',
           status: 'active',
-          contextWindow: 200000,
+          contextWindow: 262144,
         },
         {
           id: 'opencode/qwen3.6-plus',
@@ -225,7 +225,7 @@ describe('OpenCode auth routes', () => {
       const res = await request(app).get('/api/opencode-auth/models');
       expect(res.status).toBe(200);
       expect(res.body.models).toHaveLength(2);
-      expect(res.body.models[0].id).toBe('opencode/kimi-k2.6');
+      expect(res.body.models[0].id).toBe('opencode/kimi-k2.7-code');
       expect(res.body.models[1].id).toBe('opencode/qwen3.6-plus');
       expect(listOpenCodeModels).toHaveBeenCalledWith(42);
     });

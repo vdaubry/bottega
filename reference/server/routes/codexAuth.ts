@@ -148,7 +148,7 @@ router.post(
       );
     }
 
-    // Shape check before persistence so we never write an unusable file.
+    // Shape check before persistence so we only accept ChatGPT OAuth files.
     const payload = parsed as {
       tokens?: { access_token?: unknown; id_token?: unknown };
       OPENAI_API_KEY?: unknown;
@@ -156,12 +156,20 @@ router.post(
     const hasOauth =
       typeof payload.tokens?.access_token === 'string' ||
       typeof payload.tokens?.id_token === 'string';
-    const hasApiKey = typeof payload.OPENAI_API_KEY === 'string';
-    if (!hasOauth && !hasApiKey) {
+    if (payload.OPENAI_API_KEY !== undefined && payload.OPENAI_API_KEY !== null) {
       return authErrorResponse(
         res as Response<CodexAuthErrorBody | ApiError>,
         new CodexCredentialsError(
-          'auth.json paste must contain tokens.access_token, tokens.id_token, or OPENAI_API_KEY',
+          'Codex API key authentication is disabled. Sign in with ChatGPT instead.',
+        ),
+        'CODEX_AUTH_INVALID_PAYLOAD',
+      );
+    }
+    if (!hasOauth) {
+      return authErrorResponse(
+        res as Response<CodexAuthErrorBody | ApiError>,
+        new CodexCredentialsError(
+          'auth.json paste must contain ChatGPT OAuth tokens',
         ),
         'CODEX_AUTH_INVALID_PAYLOAD',
       );

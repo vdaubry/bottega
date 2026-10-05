@@ -1,10 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UnifiedMessage } from '@shared/providers/types';
 
-vi.mock('../../database/db.js', () => ({
-  tasksDb: {
-    getWithProject: vi.fn(),
-  },
+vi.mock('../../database/conversations.js', () => ({
   conversationsDb: {
     create: vi.fn(),
     getById: vi.fn(),
@@ -13,12 +10,25 @@ vi.mock('../../database/db.js', () => ({
     updateModelEffort: vi.fn(),
     updateSessionPath: vi.fn(),
   },
-  agentRunsDb: {
-    getByTask: vi.fn(() => []),
-    updateStatus: vi.fn(),
-  },
-  userDb: { getUserById: vi.fn() },
+}));
+
+vi.mock('../../database/db.js', () => ({
   db: {},
+  tasksDb: {
+    getWithProject: vi.fn(),
+  },
+  userDb: {
+    getUserById: vi.fn().mockReturnValue({ id: 1, username: 'test', is_technical: 1 }),
+  },
+}));
+
+vi.mock('../../database/tasks.js', () => ({
+  tasksDb: {
+    getWithProject: vi.fn(),
+    getById: vi.fn(),
+    markRefinementComplete: vi.fn(),
+    blockWorkflow: vi.fn(),
+  },
 }));
 
 vi.mock('../agentModelSettings.js', () => ({
@@ -86,13 +96,20 @@ vi.mock('./slashCommands.js', () => ({
   resolveSlashCommand: vi.fn(async (m: string | null) => m),
 }));
 
-import { tasksDb, conversationsDb } from '../../database/db.js';
+import { tasksDb } from '../../database/db.js';
+import { conversationsDb } from '../../database/conversations.js';
+// The completion/fail paths dispatch through the owner-adapter registry.
+// Only the task adapter is registered: these are task-only provider flows,
+// and the epic adapter's import graph would drag the whole epic layer in.
+import { initTasks } from '../tasks/adapter.js';
+initTasks();
 import { openCodeProvider } from '../providers/opencode/index.js';
 import { mirrorOpenCodeEvent } from '../providers/opencode/messageMirror.js';
 import {
   startOpenCodeConversation,
   sendOpenCodeMessage,
 } from './startOpenCodeConversation.js';
+import { activeStreamingSessions } from './sessionState.js';
 
 const SID = 'sess_oc_xyz';
 
@@ -153,10 +170,11 @@ describe('startOpenCodeConversation', () => {
     vi.mocked(conversationsDb.create).mockReturnValue({
       id: 11,
       task_id: 1,
+      epic_id: null,
       claude_conversation_id: null,
       provider: 'opencode',
       provider_session_id: null,
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
     });
   });
@@ -206,12 +224,12 @@ describe('startOpenCodeConversation', () => {
     const out = await startOpenCodeConversation(1, 'hi', {
       userId: 1,
       provider: 'opencode',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       broadcastFn,
     });
     expect(out.conversationId).toBe(11);
     expect(out.claudeSessionId).toBe(SID);
-    expect(conversationsDb.create).toHaveBeenCalledWith(1, 'opencode', 'opencode/kimi-k2.6', null);
+    expect(conversationsDb.create).toHaveBeenCalledWith(1, 'opencode', 'opencode/kimi-k2.7-code', null);
     expect(conversationsDb.updateClaudeId).toHaveBeenCalledWith(11, SID);
     expect(conversationsDb.updateProviderSessionId).toHaveBeenCalledWith(11, SID);
   });
@@ -247,7 +265,7 @@ describe('startOpenCodeConversation', () => {
     await startOpenCodeConversation(1, 'hi', {
       userId: 1,
       provider: 'opencode',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       broadcastFn,
     });
     await waitForBroadcast(broadcastFn, 'claude-complete');
@@ -292,7 +310,7 @@ describe('startOpenCodeConversation', () => {
     await startOpenCodeConversation(1, 'hi', {
       userId: 1,
       provider: 'opencode',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       broadcastFn,
     });
     await waitForBroadcast(broadcastFn, 'claude-complete');
@@ -317,7 +335,7 @@ describe('startOpenCodeConversation', () => {
       session_path: '/repo',
       context_usage_json: null,
       name: null,
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       created_at: '',
     } as never);
@@ -354,7 +372,7 @@ describe('startOpenCodeConversation', () => {
     await sendOpenCodeMessage(11, 'follow-up', {
       userId: 1,
       provider: 'opencode',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       broadcastFn,
     });
     await waitForBroadcast(broadcastFn, 'claude-complete');
@@ -366,6 +384,63 @@ describe('startOpenCodeConversation', () => {
       prompt: 'follow-up',
       resumeSessionId: SID,
     });
+  });
+
+  // The durable ask_user answer path resolves its question row the moment the
+  // continuation turn is accepted, which it observes through this registration
+  // (`waitForContinuationTurnToStart`). It must happen before the stream is
+  // consumed, not when the turn ends.
+  it('registers the conversation as streaming before the resumed turn ends', async () => {
+    vi.mocked(conversationsDb.getById).mockReturnValue({
+      id: 11,
+      task_id: 1,
+      claude_conversation_id: SID,
+      provider: 'opencode',
+      provider_session_id: SID,
+      session_path: '/repo',
+      context_usage_json: null,
+      name: null,
+      model: 'opencode/kimi-k2.7-code',
+      effort: null,
+      created_at: '',
+    } as never);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sendSpy = vi.fn(async () => ({
+      providerSessionId$: Promise.resolve(SID),
+      abort: vi.fn(),
+      pid: null,
+      events: (async function* () {
+        await gate;
+        yield {
+          type: 'result',
+          id: 'r',
+          provider: 'opencode',
+          providerSessionId: SID,
+          raw: null,
+          isError: false,
+        };
+      })(),
+    }));
+    (openCodeProvider as unknown as { sendTurnMessage: typeof sendSpy }).sendTurnMessage = sendSpy;
+
+    const turn = sendOpenCodeMessage(11, 'User has answered your questions: "Tier?"="Pro".', {
+      userId: 1,
+      provider: 'opencode',
+      model: 'opencode/kimi-k2.7-code',
+      broadcastFn,
+    });
+    await waitForBroadcast(broadcastFn, 'streaming-started');
+
+    const streaming = () =>
+      [...activeStreamingSessions.values()].some((session) => session.conversationId === 11);
+    expect(streaming()).toBe(true);
+
+    release();
+    await turn;
+    expect(streaming()).toBe(false);
   });
 
   it('requests the OpenCode-shaped env from the opencode credential store (BOTTEGA_USER_ID + XDG_*)', async () => {
@@ -389,7 +464,7 @@ describe('startOpenCodeConversation', () => {
     await startOpenCodeConversation(1, 'hi', {
       userId: 1,
       provider: 'opencode',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       broadcastFn,
     });
 

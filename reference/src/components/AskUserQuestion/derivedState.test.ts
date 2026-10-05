@@ -134,6 +134,14 @@ describe('getAskWidgetState', () => {
     );
   });
 
+  it('indexes portable ask_user tool names from Codex and OpenCode', () => {
+    const messages: AskWidgetDisplayMessage[] = [
+      { ...askMsg('t1', [Q_DIRECTION]), toolName: 'ask_user' },
+      { ...askMsg('t2', [Q_LIB]), toolName: 'bottega_remote__ask_user' },
+    ];
+    expect([...indexAskWidgets(messages).keys()]).toEqual(['t1', 't2']);
+  });
+
   it('returns sensible defaults for unknown toolId', () => {
     const messages = [askMsg('t1', [Q_DIRECTION])];
     expect(getAskWidgetState('does-not-exist', [], messages)).toEqual({

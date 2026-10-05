@@ -58,8 +58,8 @@ That last script is what makes YOLO **terminal**: completing the run sets
 `pr_agent_complete`, the same flag the core PR agent sets, so there is nothing
 left to chain. The completion handler treats a finished `yolo` run like a
 finished `pr` run — `yolo` is *not* in the chainable agent-type set in
-`buildAgentRunCompletionHandler`
-([`../reference/server/services/conversation/agentRunLifecycle.ts`](../reference/server/services/conversation/agentRunLifecycle.ts)),
+`onTurnEnded`
+([`../reference/server/services/tasks/adapter.ts`](../reference/server/services/tasks/adapter.ts)),
 so when its stream ends the run is marked completed and the loop simply stops.
 YOLO never enters the implementation ⇄ review toggle or the
 `workflow_complete → (refinement) → PR` finish pipeline; it *is* the whole
@@ -132,7 +132,7 @@ finished YOLO run reads as done even though it never ran a separate PR step.
 | The prompt (5 phases + reused PR block) | `../reference/server/constants/prompts/yolo.md` |
 | Message assembly + shared PR block | `../reference/server/constants/agentPrompts.ts` (`generateYoloMessage`, `buildPrCreateOrVerifyBlock`) |
 | Run start + sub-agent ban | `../reference/server/services/agentRunner.ts` (`case 'yolo'`, `disallowedTools`) |
-| Terminal (not chained) | `../reference/server/services/conversation/agentRunLifecycle.ts` (`yolo` absent from `shouldChain`) |
+| Terminal (not chained) | `../reference/server/services/tasks/adapter.ts` (`yolo` absent from `shouldChain`) |
 | UI filtering + completion state | `../reference/src/components/AgentSection.tsx` |
 
 ## Boundaries (not in this spec)

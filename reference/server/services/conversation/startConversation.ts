@@ -4,10 +4,16 @@
 // `composeAsync`.
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { loadEnabledPlugins } from './pluginConfig.js';
 import { promises as fs } from 'fs';
-import { conversationsDb, tasksDb } from '../../database/db.js';
+import { conversationsDb } from '../../database/conversations.js';
+import { getOwnerAdapter } from './ownerAdapters.js';
+import {
+  resolveConversationScope,
+  targetFromConversation,
+  type ConversationTarget,
+} from './conversationScope.js';
 import { resolveResumeModelEffort } from '../agentModelSettings.js';
-import { getWorktreeProjectPath, worktreeExists } from '../worktree.js';
 import { generateConversationTitle } from '../titleGenerator.js';
 import { auditClaudeLaunch, buildClaudeSdkEnv, getQueryProcessPid } from '../claudeCredentials.js';
 import { createContextUsageTracker } from '../contextUsageTracker.js';
@@ -27,7 +33,11 @@ import {
   handleStreamingComplete,
   composeAsync,
 } from './streamingLifecycle.js';
-import { buildAgentRunCompletionHandler } from './agentRunLifecycle.js';
+import {
+  assertAgentRunTurnCanStart,
+  buildAgentRunCompletionHandler,
+  handleAgentRunTurnStarted,
+} from './agentRunLifecycle.js';
 import { runStreamingLoop } from './runStreamingLoop.js';
 import { isClaudeAuthError, delay, AUTH_RETRY_BACKOFF_MS } from './retryOn401.js';
 import { startCodexConversation, sendCodexMessage } from './startCodexConversation.js';
@@ -36,28 +46,35 @@ import {
   sendOpenCodeMessage,
 } from './startOpenCodeConversation.js';
 import type { ConversationOptions, StreamingContext } from './types.js';
+import { buildInteractionMcpServer } from './interactionMcpServer.js';
+import { consumeQuestionDeferred } from './portableQuestionTool.js';
 
 /**
- * Compose the streaming-complete handlers: universal broadcast + map cleanup,
- * then agent-run-aware status update / chaining / push notification.
+ * Compose the streaming-complete handlers: persist owner-domain completion,
+ * then release the conversation-busy guard and broadcast streaming-ended.
+ * This ordering prevents a message sent immediately after Stop from reopening
+ * a blocked epic run before the aborted turn has observed that block.
  *
- * Neither handler takes an isError argument anymore — failure is recorded
- * separately on the agent_run row by `abortSession` (user-Stop) or
- * the server-startup orphan recovery, not derived from a boolean threaded
- * through the streaming loop.
+ * Neither handler takes an isError argument. User interruption, technical
+ * failure and restart recovery are persisted through their owner-specific
+ * paths, not derived from a boolean threaded through the streaming loop.
  */
 function composeOnComplete(ctx: StreamingContext): () => Promise<void> {
   return composeAsync<void>(
-    () => handleStreamingComplete(ctx),
     buildAgentRunCompletionHandler(ctx),
+    () => handleStreamingComplete(ctx),
   );
 }
 
 /**
- * Start a new conversation for a task.
+ * Start a new conversation for a task or for an epic.
+ *
+ * The target decides the owner row, the working directory and which channel
+ * carries the lifecycle events; everything after that (streaming, transcripts,
+ * agent-run completion) is conversation-keyed and identical for both.
  */
 export async function startConversation(
-  taskId: number,
+  target: ConversationTarget,
   message: string,
   options: ConversationOptions = {},
 ): Promise<{ conversationId: number; claudeSessionId: string }> {
@@ -65,17 +82,21 @@ export async function startConversation(
   // function — preserved verbatim below. The 'openai' path lives in
   // `startCodexConversation.ts` and only re-uses provider-agnostic
   // pieces (streaming lifecycle, agent-run completion handler).
-  if (options.provider === 'openai') {
-    return startCodexConversation(taskId, message, options);
-  }
-  if (options.provider === 'opencode') {
-    return startOpenCodeConversation(taskId, message, options);
+  //
+  // The owner domain may still impose a provider restriction for a future
+  // domain, but task and epic conversations are both harness-agnostic.
+  if (options.provider === 'openai' || options.provider === 'opencode') {
+    getOwnerAdapter(target.kind).assertProviderAllowed(options.provider);
+    return options.provider === 'openai'
+      ? startCodexConversation(target, message, options)
+      : startOpenCodeConversation(target, message, options);
   }
 
   const normalizedOptions = validateAndNormalizeOptions(options, 'startConversation');
   const {
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     userId,
     permissionMode,
     images,
@@ -91,17 +112,10 @@ export async function startConversation(
     throw new Error('startConversation requires an explicit model');
   }
 
-  const taskWithProject = tasksDb.getWithProject(taskId);
-  if (!taskWithProject) {
-    throw new Error(`Task ${taskId} not found`);
-  }
-
-  let projectPath = taskWithProject.repo_folder_path;
-
-  // Use worktree path if one exists for this task.
-  if (await worktreeExists(projectPath, taskId)) {
-    projectPath = getWorktreeProjectPath(projectPath, taskId, taskWithProject.subproject_path);
-  }
+  // Owner (task worktree/repo, or the epic's main checkout), project and cwd.
+  const scope = await resolveConversationScope(target);
+  const { taskId, epicId } = scope;
+  const projectPath = scope.cwd;
 
   const claudeEnv = buildClaudeSdkEnv(userId);
 
@@ -110,14 +124,25 @@ export async function startConversation(
     // This is the Anthropic branch (the dispatch at the top routed
     // openai/opencode away), so the row is stamped 'anthropic' with the
     // explicit model+effort the turn will run on.
-    const conversation = conversationsDb.create(taskId, 'anthropic', model, effort);
+    const conversation =
+      target.kind === 'epic'
+        ? conversationsDb.createForEpic(target.epicId, 'anthropic', model, effort)
+        : conversationsDb.create(target.taskId, 'anthropic', model, effort);
     conversationId = conversation.id;
     console.log(
-      `[ConversationAdapter] Created conversation ${conversationId} for task ${taskId} (provider=anthropic, model=${model})`,
+      `[ConversationAdapter] Created conversation ${conversationId} for ${target.kind} ${
+        taskId ?? epicId
+      } (provider=anthropic, model=${model})`,
     );
   }
 
   const abortController = new AbortController();
+
+  // The owner domain's per-turn containment (e.g. the epic docs write gate,
+  // derived from the conversation's rows — the agent run is linked before
+  // this call — so the resume path below applies the identical hooks).
+  const ownerAdapter = getOwnerAdapter(scope.kind);
+  const ownerHooks = ownerAdapter.extraPreToolUseHooks(conversationId);
 
   const sdkOptions = mapOptionsToSDK({
     cwd: projectPath,
@@ -128,14 +153,39 @@ export async function startConversation(
     disallowedTools: normalizedOptions.disallowedTools,
     env: claudeEnv,
     canUseTool: buildCanUseTool({ conversationId, broadcastFn }),
+    ...(ownerHooks.length > 0 ? { extraPreToolUseHooks: ownerHooks } : {}),
   });
 
   let mcpServers = await loadMcpConfig(projectPath);
   if (mcpServers && videoConfig) {
     mcpServers = (injectVideoRecording(mcpServers as never, videoConfig) ?? null);
   }
+  // The owner domain merges its in-process MCP servers (atlas for tasks,
+  // bottega for epics).
+  mcpServers = ownerAdapter.augmentMcpServers(mcpServers, {
+    conversationId,
+    ownerId: (taskId ?? epicId)!,
+    userId,
+    broadcastFn,
+    broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
+  });
+  if (!ownerAdapter.extraDisallowedTools(conversationId).includes('AskUserQuestion')) {
+    mcpServers = {
+      ...(mcpServers ?? {}),
+      bottega_interaction: buildInteractionMcpServer(conversationId, broadcastFn),
+    };
+  }
   if (mcpServers) {
     sdkOptions.mcpServers = mcpServers;
+  }
+
+  // The operator's plugins (the Figma MCP) are named explicitly on every turn.
+  // A fresh turn would find them through `settingSources` anyway; the resume
+  // path below would not — see `pluginConfig.ts`.
+  const plugins = await loadEnabledPlugins();
+  if (plugins.length > 0) {
+    sdkOptions.plugins = plugins;
   }
 
   const imageResult = await handleImages(message, images, projectPath);
@@ -186,10 +236,12 @@ export async function startConversation(
     const ctx: StreamingContext = {
       conversationId: conversationId,
       taskId,
+      epicId,
       claudeSessionId: null,
       userId,
       broadcastFn,
       broadcastToTaskSubscribersFn,
+      broadcastToEpicSubscribersFn,
       isNewSession: true,
       videoConfig,
     };
@@ -211,7 +263,8 @@ export async function startConversation(
         tempDir,
         conversationId,
         taskId,
-        projectId: taskWithProject.project_id,
+        epicId,
+        projectId: scope.projectId,
         userId: userId ?? null,
       });
 
@@ -230,15 +283,16 @@ export async function startConversation(
       // Fire-and-forget AI title generation. Dual-emits the rename on the
       // conversation channel (chat header) and task channel (task viewer's
       // conversation list).
-      generateConversationTitle(
-        conversationId,
-        message,
+      generateConversationTitle(conversationId, message, {
         broadcastFn,
         userId,
-        taskId,
+        ...(taskId != null ? { taskId } : {}),
+        ...(epicId != null ? { epicId } : {}),
         broadcastToTaskSubscribersFn,
-      );
+        broadcastToEpicSubscribersFn,
+      });
 
+      await handleAgentRunTurnStarted(ctx);
       handleStreamingStarted(ctx);
 
       if (broadcastFn) {
@@ -249,15 +303,25 @@ export async function startConversation(
         });
       }
 
-      if (broadcastToTaskSubscribersFn) {
+      // `conversation-added` goes to the owning entity's channel: the task
+      // viewer's conversation list, or the epic page's.
+      const summary = {
+        id: conversationId,
+        task_id: taskId,
+        epic_id: epicId,
+        claude_conversation_id: sid,
+        created_at: new Date().toISOString(),
+      };
+      if (broadcastToTaskSubscribersFn && taskId != null) {
         broadcastToTaskSubscribersFn(taskId, {
           type: 'conversation-added',
-          conversation: {
-            id: conversationId,
-            task_id: taskId,
-            claude_conversation_id: sid,
-            created_at: new Date().toISOString(),
-          },
+          conversation: summary,
+        });
+      }
+      if (broadcastToEpicSubscribersFn && epicId != null) {
+        broadcastToEpicSubscribersFn(epicId, {
+          type: 'conversation-added',
+          conversation: summary,
         });
       }
 
@@ -298,6 +362,10 @@ export async function startConversation(
         }
 
         await cleanupTempFiles(tempImagePaths, tempDir);
+        if (consumeQuestionDeferred(conversationId)) {
+          await handleStreamingComplete(ctx);
+          return;
+        }
         await patchThinking(ctx.claudeSessionId, projectPath, userId, thinkingAcc);
 
         if (ctx.videoConfig) {
@@ -321,6 +389,11 @@ export async function startConversation(
           activeSessions.delete(ctx.claudeSessionId);
         }
         await cleanupTempFiles(tempImagePaths, tempDir);
+
+        if (consumeQuestionDeferred(conversationId)) {
+          await handleStreamingComplete(ctx);
+          return;
+        }
 
         if (ctx.videoConfig?.tempDir) {
           await fs.rm(ctx.videoConfig.tempDir, { recursive: true, force: true }).catch(() => {});
@@ -356,10 +429,10 @@ export async function startConversation(
           });
         }
 
-        // Run the same completion handler the success path does — the agent
-        // run row was either already marked 'failed' by abortSession (no
-        // chain) or is still 'running' and will be marked 'completed' here
-        // (chain continues, next agent picks up the recovery).
+        // Run the same completion handler the success path does. A user Stop
+        // has already persisted the owner-specific terminal/interrupted state;
+        // a technical SDK error leaves the row running so the established
+        // recovery/chaining behavior can pick it up.
         await composeOnComplete(ctx)();
       } finally {
         rejectPendingAskUserQuestion(conversationId, 'streaming ended');
@@ -384,6 +457,9 @@ export async function sendMessage(
   if (!conversationForProvider) {
     throw new Error(`Conversation ${conversationId} not found`);
   }
+  // Owner policy is checked before provider setup. In particular, reopening
+  // an old PR-review conversation cannot overlap the epic's current reviewer.
+  assertAgentRunTurnCanStart(conversationId);
   // The row's provider is the source of truth on resume (NOT NULL column);
   // an explicit options.provider override only matters for internal callers.
   const resolvedProvider = options.provider ?? conversationForProvider.provider;
@@ -398,6 +474,7 @@ export async function sendMessage(
   const {
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     userId,
     images,
     permissionMode,
@@ -430,40 +507,39 @@ export async function sendMessage(
   }
 
   const claudeSessionId = conversation.claude_conversation_id;
-  const taskId = conversation.task_id;
 
-  // Always resolve the parent task so we can stamp `projectId` onto the
-  // ActiveSession entry — WS auth (`abort-session`,
+  // Always resolve the owner (task or epic) so we can stamp `projectId` onto
+  // the ActiveSession entry — WS auth (`abort-session`,
   // `check-session-status`, `get-active-sessions`) and the filtered
   // `/api/streaming-sessions` REST endpoint depend on it.
-  if (!taskId) {
-    throw new Error(`Conversation ${conversationId} has no task_id`);
-  }
-  const taskWithProject = tasksDb.getWithProject(taskId);
-  if (!taskWithProject) {
-    throw new Error(`Task ${taskId} not found`);
-  }
-  const projectId = taskWithProject.project_id;
-
-  let projectPath: string;
+  const scope = await resolveConversationScope(targetFromConversation(conversation));
+  const { taskId, epicId, projectId } = scope;
 
   // Prefer the stored session_path so worktree-started sessions resume in the
   // same cwd.
-  if (conversation.session_path) {
-    projectPath = conversation.session_path;
-  } else {
-    projectPath = taskWithProject.repo_folder_path;
-
-    if (await worktreeExists(projectPath, taskId)) {
-      projectPath = getWorktreeProjectPath(projectPath, taskId, taskWithProject.subproject_path);
-    }
-  }
+  const projectPath = conversation.session_path ?? scope.cwd;
 
   const abortController = new AbortController();
   const claudeEnv = buildClaudeSdkEnv(userId);
 
-  // Resume reads transcripts from sqliteSessionStore.load() — no per-user
-  // CLAUDE_CONFIG_DIR materialization required.
+  // Same rows, same hooks as the run's first turn — a revision request typed
+  // into a specification conversation is contained exactly like the run that
+  // opened it. The owner's tool denials are merged with (never replaced by)
+  // the caller's own list, so they cannot be weakened on a wake or revision
+  // turn.
+  const ownerAdapter = getOwnerAdapter(scope.kind);
+  const ownerHooks = ownerAdapter.extraPreToolUseHooks(conversationId);
+  const resumeDisallowedTools = [
+    ...new Set([
+      ...(normalizedOptions.disallowedTools ?? []),
+      ...ownerAdapter.extraDisallowedTools(conversationId),
+    ]),
+  ];
+
+  // Resume reads transcripts from sqliteSessionStore.load(). The SDK then
+  // materializes them into a temporary CLAUDE_CONFIG_DIR of its own
+  // (`/tmp/claude-resume-<uuid>/`) for the subprocess — which is why the
+  // operator's plugins have to be named explicitly below (`pluginConfig.ts`).
   const sdkOptions = mapOptionsToSDK({
     cwd: projectPath,
     sessionId: claudeSessionId,
@@ -472,11 +548,35 @@ export async function sendMessage(
     canUseTool: buildCanUseTool({ conversationId, broadcastFn }),
     model: resumeModel,
     effort: resumeEffort,
+    ...(resumeDisallowedTools.length > 0 ? { disallowedTools: resumeDisallowedTools } : {}),
+    ...(ownerHooks.length > 0 ? { extraPreToolUseHooks: ownerHooks } : {}),
   });
 
-  const mcpServers = await loadMcpConfig(projectPath);
+  let mcpServers = await loadMcpConfig(projectPath);
+  mcpServers = ownerAdapter.augmentMcpServers(mcpServers, {
+    conversationId,
+    ownerId: (taskId ?? epicId)!,
+    userId,
+    broadcastFn,
+    broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
+  });
+  if (!ownerAdapter.extraDisallowedTools(conversationId).includes('AskUserQuestion')) {
+    mcpServers = {
+      ...(mcpServers ?? {}),
+      bottega_interaction: buildInteractionMcpServer(conversationId, broadcastFn),
+    };
+  }
   if (mcpServers) {
     sdkOptions.mcpServers = mcpServers;
+  }
+
+  // Without this a resumed turn has no plugin MCP server at all: the SDK's
+  // temporary config dir carries no `plugins/`, so the Figma tools the first
+  // turn had are removed from the catalog on the second.
+  const plugins = await loadEnabledPlugins();
+  if (plugins.length > 0) {
+    sdkOptions.plugins = plugins;
   }
 
   // Skip image handling when sending a synthesised tool_result for an orphan
@@ -494,14 +594,14 @@ export async function sendMessage(
   const ctx: StreamingContext = {
     conversationId,
     taskId,
+    epicId,
     claudeSessionId,
     userId,
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     isNewSession: false,
   };
-
-  handleStreamingStarted(ctx);
 
   // Deferred prompt: wait for MCP servers before delivering the user message.
   // When askUserQuestionToolResult is set, yield a tool_result block instead
@@ -562,9 +662,23 @@ export async function sendMessage(
     tempDir,
     conversationId,
     taskId,
+    epicId,
     projectId,
     userId: userId ?? null,
   });
+
+  try {
+    await handleAgentRunTurnStarted(ctx);
+  } catch (error) {
+    // A final owner-domain concurrency check can still lose its preflight
+    // race to another conversation. No stream has been announced yet: abort
+    // this just-created provider turn and leave the winning run untouched.
+    abortController.abort();
+    activeSessions.delete(claudeSessionId);
+    await cleanupTempFiles(tempImagePaths, tempDir);
+    throw error;
+  }
+  handleStreamingStarted(ctx);
 
   const thinkingAcc = new ThinkingAccumulator();
   const contextUsageTracker = createContextUsageTracker({ conversationId, broadcastFn });
@@ -593,6 +707,10 @@ export async function sendMessage(
 
     activeSessions.delete(claudeSessionId);
     await cleanupTempFiles(tempImagePaths, tempDir);
+    if (consumeQuestionDeferred(conversationId)) {
+      await handleStreamingComplete(ctx);
+      return;
+    }
     await patchThinking(claudeSessionId, projectPath, userId, thinkingAcc);
 
     if (broadcastFn) {
@@ -610,6 +728,11 @@ export async function sendMessage(
 
     activeSessions.delete(claudeSessionId);
     await cleanupTempFiles(tempImagePaths, tempDir);
+
+    if (consumeQuestionDeferred(conversationId)) {
+      await handleStreamingComplete(ctx);
+      return;
+    }
 
     // Subprocess auth credential aged out mid-stream: recycle it and resume
     // once in a fresh subprocess. Skip for AskUserQuestion-resume turns —

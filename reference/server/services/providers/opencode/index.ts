@@ -30,6 +30,21 @@ import {
   type OpenCodeServerHandle,
 } from '../../openCodeServerPool.js';
 import { createOpenCodeEventMapper } from './mapEvent.js';
+import {
+  toOpenCodeMcpConfig,
+  type OperatorMcpServer,
+} from '@shared/providers/operatorMcpServers';
+
+/**
+ * How long a turn may sit in OpenCode's retry backoff before we stop it.
+ *
+ * Chosen from the two outages on record: the recoverable one (2026-08-25
+ * 14:56) never waited more than 64s and finished normally; the fatal one
+ * (21:01, ticket #1664) was at 128s and doubling when it was cut off. Any
+ * threshold between the two separates them, and two minutes is the round
+ * number in that gap.
+ */
+export const RETRY_WAIT_LIMIT_MS = 120_000;
 
 export class InvalidOpenCodeModelError extends Error {
   constructor(received: string | undefined) {
@@ -56,7 +71,7 @@ export interface ParsedOpenCodeModel {
  * keep the full tail; only the first segment is consumed as the
  * providerID prefix.
  *
- * `parseOpenCodeModel('opencode/kimi-k2.6')` → `{ providerID: 'opencode', modelID: 'kimi-k2.6' }`.
+ * `parseOpenCodeModel('opencode/kimi-k2.7-code')` → `{ providerID: 'opencode', modelID: 'kimi-k2.7-code' }`.
  *
  * @throws InvalidOpenCodeModelError if `model` is empty or does not start
  *  with the `'opencode/'` prefix.
@@ -204,10 +219,46 @@ interface MinimalConfigApi {
   >;
 }
 
+/**
+ * Mirrors the SDK's `McpLocalConfig | McpRemoteConfig` union
+ * (`@opencode-ai/sdk/dist/gen/types.gen.d.ts`). Both arms are used: `remote`
+ * for Bottega's per-turn gateway, and either arm for the operator's own
+ * servers (Playwright is `local`).
+ */
+type MinimalMcpConfig =
+  | {
+      type: 'local';
+      command: string[];
+      environment?: Record<string, string>;
+      enabled?: boolean;
+    }
+  | {
+      type: 'remote';
+      url: string;
+      enabled?: boolean;
+      headers?: Record<string, string>;
+      oauth?: false;
+    };
+
+interface MinimalMcpApi {
+  add(options: {
+    body: {
+      name: string;
+      config: MinimalMcpConfig;
+    };
+    query?: { directory?: string };
+  }): Promise<unknown>;
+  disconnect(options: {
+    path: { name: string };
+    query?: { directory?: string };
+  }): Promise<unknown>;
+}
+
 interface MinimalOpencodeClient {
   session: MinimalSessionApi;
   event: MinimalEventApi;
   config: MinimalConfigApi;
+  mcp: MinimalMcpApi;
 }
 
 function clientOf(handle: OpenCodeServerHandle): MinimalOpencodeClient {
@@ -242,6 +293,45 @@ async function* streamUnified(
   const parsed = parseOpenCodeModel(options.model);
   const client = clientOf(handle);
   const mapper = createOpenCodeEventMapper(sessionId);
+  const gateway = options.extras?.mcpGateway as
+    | { name: string; url: string; token: string }
+    | undefined;
+  const operatorServers = (options.extras?.operatorMcpServers ?? []) as OperatorMcpServer[];
+
+  if (gateway) {
+    await client.mcp.add({
+      body: {
+        name: gateway.name,
+        config: {
+          type: 'remote',
+          url: gateway.url,
+          enabled: true,
+          headers: { Authorization: `Bearer ${gateway.token}` },
+          oauth: false,
+        },
+      },
+      ...(options.cwd ? { query: { directory: options.cwd } } : {}),
+    });
+  }
+
+  // The operator's own servers (Playwright above all). Registered one by one
+  // and best-effort: an OpenCode server that refuses one entry must not cost
+  // the turn its Bottega gateway, and a review agent that finds no browser
+  // reports it rather than dying here.
+  for (const server of operatorServers) {
+    if (server.name === gateway?.name) continue;
+    try {
+      await client.mcp.add({
+        body: { name: server.name, config: toOpenCodeMcpConfig(server) },
+        ...(options.cwd ? { query: { directory: options.cwd } } : {}),
+      });
+    } catch (err) {
+      console.error(
+        `[OpenCodeProvider] Could not register operator MCP server '${server.name}':`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
 
   // 2. Subscribe to the SSE stream BEFORE firing the prompt so events
   //    emitted between the prompt response and the session.idle aren't
@@ -257,34 +347,54 @@ async function* streamUnified(
   //    `node_modules/.../core/serverSentEvents.gen.js` from silently
   //    reconnecting forever on transient errors so the `finally` below can
   //    fire and yield the synthetic stream-closed `result`.
-  const subscription = await client.event.subscribe({
-    ...(options.cwd ? { query: { directory: options.cwd } } : {}),
-    signal: abortController.signal,
-    sseMaxRetryAttempts: 1,
-    onSseError: (err) => {
-      console.warn('[OpenCodeProvider] SSE error', err);
-    },
-  });
+  let subscription;
+  try {
+    subscription = await client.event.subscribe({
+      ...(options.cwd ? { query: { directory: options.cwd } } : {}),
+      signal: abortController.signal,
+      sseMaxRetryAttempts: 1,
+      onSseError: (err) => {
+        console.warn('[OpenCodeProvider] SSE error', err);
+      },
+    });
+  } catch (error) {
+    if (gateway) {
+      await client.mcp
+        .disconnect({
+          path: { name: gateway.name },
+          ...(options.cwd ? { query: { directory: options.cwd } } : {}),
+        })
+        .catch(() => {});
+    }
+    throw error;
+  }
 
   // 3. Send the prompt via `promptAsync` — fire-and-forget at the HTTP
   //    layer. The synchronous `session.prompt` is also exposed by the
   //    SDK but it blocks until end-of-turn, and Node's `fetch` headers
   //    timeout (default 5 min) trips long turns with tool use or large
   //    context (observed live: UND_ERR_HEADERS_TIMEOUT on opencode/
-  //    kimi-k2.6 planification). With `promptAsync` the HTTP call
+  //    kimi-k2.7-code planification). With `promptAsync` the HTTP call
   //    returns immediately and the turn's events flow exclusively
   //    through the SSE subscription opened above.
   //
-  // Always disable OpenCode's built-in `question` tool. It parks the
-  // turn at `tool: running` waiting for an answer through OpenCode's
-  // question API, which Bottega has no UI for (capability
-  // `supportsAskUserQuestion = false`, D8). Models like qwen3.6-plus
-  // reach for it on their own when they see "ask clarifying questions"
-  // in a system prompt; without this line the turn hangs until the
-  // idle reaper kills the server.
+  // Always disable OpenCode's built-in `question` tool. Epic and task turns
+  // use Bottega's portable `ask_user` MCP tool instead, which persists the
+  // question and resumes the provider session through the shared UI.
   const disabledTools: Record<string, false> = { question: false };
   for (const t of options.disallowedTools ?? []) {
     disabledTools[t] = false;
+    const aliases: Record<string, string[]> = {
+      Bash: ['bash'],
+      Write: ['write'],
+      Edit: ['edit', 'patch'],
+      MultiEdit: ['edit', 'patch'],
+      NotebookEdit: ['edit'],
+      Agent: ['task'],
+      Task: ['task'],
+      AskUserQuestion: ['question'],
+    };
+    for (const alias of aliases[t] ?? []) disabledTools[alias] = false;
   }
 
   // Re-assert the workspace directory on every prompt call. OpenCode's
@@ -332,6 +442,7 @@ async function* streamUnified(
         sessionID?: string;
         info?: { sessionID?: string };
         part?: { sessionID?: string };
+        status?: { type?: string; message?: string; attempt?: number; next?: number };
       };
     }>) {
       if (!event || typeof event !== 'object') continue;
@@ -361,6 +472,60 @@ async function* streamUnified(
         sawTerminator = true;
         break;
       }
+      // A failing LLM call never reaches us as `session.error` — OpenCode's
+      // `SessionProcessor` retries it internally and reports each attempt as
+      // `session.status` with `{type:'retry', attempt, message, next}`.
+      //
+      // Retrying is normal and usually transient: on 2026-08-25 at 14:56 six
+      // consecutive "Endpoint is unavailable" errors resolved on the seventh
+      // attempt and the turn finished clean. What is not survivable is the
+      // backoff doubling away — 2s, 4, 8, 16, 32, 64, 128, 256, 512… — with
+      // Bottega streaming nothing meanwhile. That is how epic 4 ticket
+      // #1664's PR agent spent fifteen silent minutes before dying on an
+      // unrelated socket close, its whole ticket left uncommitted.
+      //
+      // So we let OpenCode retry while the waits are short and stop the turn
+      // the moment it schedules one longer than we are willing to wait. The
+      // doubling backoff makes the wait itself the counter, so this needs no
+      // state of its own: one subtraction, one comparison.
+      if (event.type === 'session.status' && eventSessionId === sessionId) {
+        const status = event.properties?.status;
+        // `next` is an absolute epoch-ms timestamp, not a delay: the retry
+        // policy sets `next: Date.now() + backoff`. Subtract to get the wait.
+        const waitMs =
+          status?.type === 'retry' && typeof status.next === 'number'
+            ? status.next - Date.now()
+            : 0;
+        if (waitMs > RETRY_WAIT_LIMIT_MS) {
+          sawTerminator = true;
+          // Stop OpenCode retrying behind our back — otherwise the pooled
+          // server keeps the loop alive for a turn nobody is reading.
+          await client.session
+            .abort({
+              path: { id: sessionId },
+              ...(options.cwd ? { query: { directory: options.cwd } } : {}),
+            })
+            .catch(() => {});
+          const reason = status?.message?.trim();
+          yield {
+            type: 'result',
+            id: `opencode_retry_gave_up:${sessionId}:${Math.random()}`,
+            provider: 'opencode',
+            providerSessionId: sessionId,
+            raw: event,
+            isError: true,
+            errors: [
+              {
+                message:
+                  `The model provider kept failing and OpenCode is now waiting ` +
+                  `${Math.round(waitMs / 1000)}s before attempt ${(status?.attempt ?? 0) + 1}. ` +
+                  `Giving up instead of stalling${reason ? `: ${reason}` : '.'}`,
+              },
+            ],
+          };
+          break;
+        }
+      }
     }
   } finally {
     // Best-effort: cancel the SSE long-poll on the way out.
@@ -370,6 +535,14 @@ async function* streamUnified(
       // ignore
     }
     await promptPromise.catch(() => {});
+    if (gateway) {
+      await client.mcp
+        .disconnect({
+          path: { name: gateway.name },
+          ...(options.cwd ? { query: { directory: options.cwd } } : {}),
+        })
+        .catch(() => {});
+    }
     if (!sawTerminator) {
       // The stream ended without an explicit terminator (network drop,
       // server crash) — emit a synthetic error result so the
@@ -425,7 +598,7 @@ export class OpenCodeProvider implements LlmProvider {
     const providerSessionId$ = new Promise<string>((resolve) => {
       resolveSessionId = resolve;
     });
-    providerSessionId$.then((id) => {
+    void providerSessionId$.then((id) => {
       ACTIVE_SESSIONS.set(id, {
         handle: ctx.handle,
         abortController,
@@ -457,7 +630,7 @@ export class OpenCodeProvider implements LlmProvider {
       get pid() {
         return pid;
       },
-    } as ProviderRunResult;
+    };
   }
 
   abortTurn(providerSessionId: string): boolean {
@@ -513,7 +686,7 @@ export interface OpenCodeModelListEntry {
   id: string;
   /** Raw Zen ID without the `opencode/` prefix — what the SDK consumes. */
   bareModelId: string;
-  /** Human label as returned by OpenCode (e.g. "Kimi K2.6"). */
+  /** Human label as returned by OpenCode (e.g. "Kimi K2.7 Code"). */
   name: string;
   /** Upstream lifecycle marker. `'deprecated'` rows are kept so existing
    * settings still resolve, but the UI can grey them out. */

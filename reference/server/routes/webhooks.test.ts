@@ -5,28 +5,40 @@ import express from 'express';
 const {
   mockValidateSignature,
   mockParseTaskId,
+  mockParseEpicId,
   mockHasTriggerMention,
   mockGetConfiguredTrigger,
   mockTriggerPrAgent,
   mockTriggerPrAgentFromReview,
+  mockTriggerEpicDelivery,
+  mockTriggerEpicDeliveryFromReview,
   mockRunCommand,
 } = vi.hoisted(() => ({
   mockValidateSignature: vi.fn(),
   mockParseTaskId: vi.fn(),
+  mockParseEpicId: vi.fn(),
   mockHasTriggerMention: vi.fn(),
   mockGetConfiguredTrigger: vi.fn(),
   mockTriggerPrAgent: vi.fn(),
   mockTriggerPrAgentFromReview: vi.fn(),
+  mockTriggerEpicDelivery: vi.fn(),
+  mockTriggerEpicDeliveryFromReview: vi.fn(),
   mockRunCommand: vi.fn(),
 }));
 
 vi.mock('../services/webhookService.js', () => ({
   validateGitHubWebhookSignature: mockValidateSignature,
   parseTaskIdFromBranch: mockParseTaskId,
+  parseEpicIdFromBranch: mockParseEpicId,
   hasTriggerMention: mockHasTriggerMention,
   getConfiguredTrigger: mockGetConfiguredTrigger,
   triggerPrAgentFromComment: mockTriggerPrAgent,
   triggerPrAgentFromReview: mockTriggerPrAgentFromReview,
+}));
+
+vi.mock('../services/epics/deliveryWebhook.js', () => ({
+  triggerEpicDeliveryFromComment: mockTriggerEpicDelivery,
+  triggerEpicDeliveryFromReview: mockTriggerEpicDeliveryFromReview,
 }));
 
 vi.mock('../services/shell.js', () => ({
@@ -54,6 +66,15 @@ describe('Webhooks Routes', () => {
 
     vi.mocked(mockValidateSignature).mockReturnValue(true);
     vi.mocked(mockParseTaskId).mockReturnValue(123);
+    vi.mocked(mockParseEpicId).mockReturnValue(null);
+    vi.mocked(mockTriggerEpicDelivery).mockResolvedValue({
+      conversationId: 300,
+      agentRunId: 301,
+    });
+    vi.mocked(mockTriggerEpicDeliveryFromReview).mockResolvedValue({
+      conversationId: 400,
+      agentRunId: 401,
+    });
     vi.mocked(mockHasTriggerMention).mockReturnValue(true);
     vi.mocked(mockGetConfiguredTrigger).mockReturnValue('bottega');
     vi.mocked(mockTriggerPrAgent).mockResolvedValue({
@@ -193,14 +214,51 @@ describe('Webhooks Routes', () => {
       expect(response.body.reason).toBe('no @mybot mention');
     });
 
-    it('ignores branches not matching task pattern', async () => {
+    it('ignores branches belonging to no task and no epic', async () => {
       vi.mocked(mockParseTaskId).mockReturnValue(null);
+      vi.mocked(mockParseEpicId).mockReturnValue(null);
 
       const response = await makeRequest(validPayload);
 
       expect(response.status).toBe(200);
       expect(response.body.status).toBe('ignored');
-      expect(response.body.reason).toBe('branch not in task format');
+      expect(response.body.reason).toBe('branch not in task or epic format');
+      expect(mockTriggerPrAgent).not.toHaveBeenCalled();
+      expect(mockTriggerEpicDelivery).not.toHaveBeenCalled();
+    });
+
+    // The comment landed on the epic's FINAL pull request, whose head is
+    // `epic/{id}-…`. Before delivery existed this answered `ignored` and
+    // nothing happened anywhere.
+    it('starts the epic delivery agent on an epic feature branch', async () => {
+      vi.mocked(mockParseTaskId).mockReturnValue(null);
+      vi.mocked(mockParseEpicId).mockReturnValue(42);
+
+      const response = await makeRequest(validPayload);
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('triggered');
+      expect(response.body.epicId).toBe(42);
+      expect(response.body.conversationId).toBe(300);
+      expect(mockTriggerPrAgent).not.toHaveBeenCalled();
+      expect(mockTriggerEpicDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ epicId: 42, commentAuthor: 'octocat' }),
+      );
+    });
+
+    // A run already in flight is a refusal, not a failure: a 500 would make
+    // GitHub retry into the same state.
+    it('acknowledges a delivery refused because the epic is already running', async () => {
+      vi.mocked(mockParseTaskId).mockReturnValue(null);
+      vi.mocked(mockParseEpicId).mockReturnValue(42);
+      vi.mocked(mockTriggerEpicDelivery).mockRejectedValue(
+        new Error('Epic 42 is already running: a epic-delivery agent (run 9) is running on this epic'),
+      );
+
+      const response = await makeRequest(validPayload);
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('ignored');
     });
 
     it('triggers PR agent for valid webhook and passes gh args as argv (no shell)', async () => {
@@ -448,14 +506,31 @@ describe('Webhooks Routes', () => {
       expect(response.body.reason).toBe('not a submitted event');
     });
 
-    it('ignores review on non-task branches', async () => {
+    it('ignores a review on a branch belonging to no task and no epic', async () => {
       vi.mocked(mockParseTaskId).mockReturnValue(null);
+      vi.mocked(mockParseEpicId).mockReturnValue(null);
 
       const response = await makeReviewRequest(validReviewPayload);
 
       expect(response.status).toBe(200);
       expect(response.body.status).toBe('ignored');
-      expect(response.body.reason).toBe('branch not in task format');
+      expect(response.body.reason).toBe('branch not in task or epic format');
+    });
+
+    it('starts the epic delivery agent for a review on the final pull request', async () => {
+      vi.mocked(mockParseTaskId).mockReturnValue(null);
+      vi.mocked(mockParseEpicId).mockReturnValue(42);
+
+      const response = await makeReviewRequest(validReviewPayload);
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('triggered');
+      expect(response.body.epicId).toBe(42);
+      expect(response.body.conversationId).toBe(400);
+      expect(mockTriggerPrAgentFromReview).not.toHaveBeenCalled();
+      expect(mockTriggerEpicDeliveryFromReview).toHaveBeenCalledWith(
+        expect.objectContaining({ epicId: 42 }),
+      );
     });
 
     it('handles review with empty comments array', async () => {

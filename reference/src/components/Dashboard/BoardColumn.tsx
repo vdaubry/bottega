@@ -142,7 +142,9 @@ function BoardColumn({
               <BoardTaskCard
                 key={task.id}
                 task={task}
-                isLive={isTaskLive?.(task.id) ?? false}
+                // A completed task never shows the live dot, even if a stale
+                // streaming session momentarily slips through (Bug #1 guard).
+                isLive={(isTaskLive?.(task.id) ?? false) && task.status !== 'completed'}
                 isBlocked={!!task.workflow_blocked}
                 conversationCount={
                   taskConversationCounts[task.id] ??

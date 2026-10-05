@@ -39,6 +39,60 @@ flowchart TD
     classDef done fill:#e7f6ec,stroke:#3f9d63,stroke-width:1px,color:#143524;
 ```
 
+## Explore: review a plan as an interactive page
+
+A plan is a long markdown file, and it is the one thing a human has to read
+carefully before the agents start. **Explore** makes that review easier: an
+agent reads the plan *and the code it cites*, then writes a self-contained,
+interactive HTML page for it — phase cards with click-to-detail, an animated
+flowchart of the request path, or a clickable architecture map of the modules
+involved.
+
+The page is shown next to a read-only view of the repository. Click any file
+reference in it and the source opens beside it, at the right line. Keep
+chatting with the agent to refine the page ("redo this as an architecture
+diagram"), or ask it a question and watch it open and highlight the code that
+answers it.
+
+There is no diagram format behind this: the agent authors a complete HTML
+document, and Bottega displays it in a sandboxed iframe. See
+[`extra/explore.md`](extra/explore.md).
+
+## Epics: features bigger than one task
+
+Some features don't fit in one task. An **epic** is a layer on top of tasks that
+takes a functional specification all the way to one final pull request:
+
+```
+functional spec ─▶ architecture ─▶ technical spec ─▶ stories ─▶ spec review
+                                                                     │
+        ┌────────────────────────────────────────────────────────────┘
+        ▼
+orchestrator: each ticket, in order ─▶ plan ─▶ implement ⇄ review ─▶ PR
+                                       ─▶ PR reviewer: review, fix, merge
+        │
+        ▼
+final PR ─▶ QA on the whole feature ─▶ a human merges
+```
+
+- **Framing is a conversation.** Four stages, each one conversation with an
+  agent that writes documents you approve: an architecture document, a
+  technical specification, the list of tickets, and a consistency review of all
+  of it. Stages are forward-only, and the approved documents are the only thing
+  handed from one stage to the next.
+- **Implementation is unattended.** An orchestrator agent drives each ticket
+  through the normal task pipeline exactly as a human would — it starts
+  planning, answers the planner's questions from the specification, reviews and
+  approves the plan. A separate PR-reviewer agent then checks the pull request
+  against the specification, fixes what it finds, and merges it into the epic's
+  feature branch. You are called back only on escalation.
+- **Tasks stay agnostic.** A ticket is an ordinary task. The task layer imports
+  nothing from the epic layer: epics act through the same API the UI uses and
+  listen to task events. Ticket-level agents cannot tell whether a human or the
+  orchestrator is on the other side.
+
+See [`extra/epics.md`](extra/epics.md).
+
 ## A spec-first project
 
 **The specification is the product.** This project ships specs so you can build
@@ -54,8 +108,8 @@ build your own version.
 - **[`core/`](core)** specifies the universal orchestration engine — the
   `planning → (implementation ⇄ review loop) → pull request`.
 - **[`extra/`](extra)** specifies opinionated, optional features (the Kanban
-  board, different harness integrations, multi-user auth, …). Pick the ones you want;
-  skip the rest.
+  board, different harness integrations, multi-user auth, Explore, Epics, …).
+  Pick the ones you want; skip the rest.
 - **[`reference/`](reference)** is one complete, working implementation. It's the implementation we use daily internally, with our own set of preferences. It's a *citation* for the spec, not the
   canonical version.
 
@@ -186,6 +240,18 @@ keeps the project small:
 
 In short: **grow the spec, fix the reference, fork for everything else.**
 
+### CI on your PR
+
+The `Unit Tests` workflow is path-filtered. A PR whose every changed file is
+prose — `SPEC.md`, `README.md`, `core/`, `extra/`, `reference/docs/` — runs no
+CI at all, so seeing zero checks on a spec-only PR is expected, not a failure.
+Touch a single source file and the full suite runs as usual.
+
+One exception worth knowing: markdown under
+`reference/server/constants/prompts/` is *not* documentation. Those files are
+agent templates loaded at runtime, and their text is asserted by the test
+suite, so editing them does trigger CI.
+
 ## Get in touch
 
 Questions, ideas, feedback, or want to share what you built? **[GitHub
@@ -210,11 +276,11 @@ There is a lot of overlap with what we built. For us, this is a huge confirmatio
 
 Where Bottega differs:
 
-**Remote-first and multi-player.** While you can run it on your laptop, Bottega is remote-first by design — we run it on a shared dev box. 
+**Remote-first and multi-player.** While you can run it on your laptop, Bottega is remote-first by design — we run it on a shared server. 
 It supports multiple concurrent users out of the box. 
 Side benefit 1: sandboxing autonomous agents on a remote server was easier for us than sandboxing them on each laptop.
 Side benefit 2: a lot of non-technical people use it internally.
-Side benefit 3: because it's always-on, reacting to GitHub is trivial: a PR review posted on GitHub fires a webhook at the box and kicks off a fresh agent run to address the comments. No laptop needs to be awake.
+Side benefit 3: because it's always-on, reacting to GitHub is trivial: a PR review posted on GitHub fires a webhook at the server and kicks off a fresh agent run to address the comments. No laptop needs to be awake.
 
 **Multi-harness.** Bottega drives Claude Code, Codex, and OpenCode behind one interface, so you can assign a different model to each role on the same task.
 

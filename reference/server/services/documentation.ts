@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 
 const TASKS_FOLDER = 'tasks';
+export const EPICS_FOLDER = 'epics';
 const RECORDINGS_FOLDER = 'recordings';
 const INPUT_FILES_FOLDER = 'input_files';
 const TMP_FOLDER = 'tmp';
@@ -14,11 +15,11 @@ const TMP_FOLDER = 'tmp';
  *
  * Override with BOTTEGA_ARCHIVE_ROOT in tests.
  */
-function getArchiveRoot(): string {
+export function getArchiveRoot(): string {
   return process.env.BOTTEGA_ARCHIVE_ROOT || path.join(os.homedir(), '.bottega');
 }
 
-function getProjectArchivePath(projectId: number): string {
+export function getProjectArchivePath(projectId: number): string {
   return path.join(getArchiveRoot(), 'projects', String(projectId));
 }
 
@@ -28,6 +29,10 @@ function getArchiveTasksFolderPath(projectId: number): string {
 
 function getArchiveRecordingsFolderPath(projectId: number): string {
   return path.join(getProjectArchivePath(projectId), RECORDINGS_FOLDER);
+}
+
+function getArchiveEpicsFolderPath(projectId: number): string {
+  return path.join(getProjectArchivePath(projectId), EPICS_FOLDER);
 }
 
 export function getTaskDocPath(projectId: number, taskId: number): string {
@@ -212,9 +217,10 @@ export interface InputFileInfo {
   name: string;
   size: number;
   mimeType: string;
+  modifiedAtMs: number;
 }
 
-function listInputFiles(inputFilesPath: string): InputFileInfo[] {
+export function listInputFiles(inputFilesPath: string): InputFileInfo[] {
   if (!fs.existsSync(inputFilesPath)) {
     return [];
   }
@@ -229,11 +235,12 @@ function listInputFiles(inputFilesPath: string): InputFileInfo[] {
         name: entry.name,
         size: stats.size,
         mimeType: getMimeType(ext),
+        modifiedAtMs: stats.mtimeMs,
       };
     });
 }
 
-function saveInputFile(
+export function saveInputFile(
   inputFilesPath: string,
   filename: string,
   buffer: Buffer,
@@ -244,15 +251,17 @@ function saveInputFile(
   fs.writeFileSync(filePath, buffer);
 
   const ext = path.extname(sanitizedName).toLowerCase();
+  const stats = fs.statSync(filePath);
 
   return {
     name: sanitizedName,
     size: buffer.length,
     mimeType: getMimeType(ext),
+    modifiedAtMs: stats.mtimeMs,
   };
 }
 
-function deleteInputFile(inputFilesPath: string, filename: string): boolean {
+export function deleteInputFile(inputFilesPath: string, filename: string): boolean {
   const filePath = path.join(inputFilesPath, path.basename(filename));
 
   if (!fs.existsSync(filePath)) {
@@ -297,6 +306,16 @@ export function deleteTaskInputFile(
  */
 export function getDevServerPort(taskId: number): number {
   return 3100 + (taskId % 900);
+}
+
+/**
+ * Calculate the dev server port for an epic's QA execution runs.
+ * Uses 4100 + (epic_id % 900) — ports 4100-4999, a band deliberately disjoint
+ * from the task band above (3100-3999) so an epic's QA server can never
+ * collide with a ticket agent's dev server.
+ */
+export function getEpicDevServerPort(epicId: number): number {
+  return 4100 + (epicId % 900);
 }
 
 /**
@@ -345,12 +364,25 @@ When running Playwright MCP tests, start the project's dev server on port ${devS
 When running the project's test suite:
 
 1. **Run targeted tests first**: Only run test files related to your changes. This gives fast feedback.
-2. **Full suite = background**: When running the complete test suite, ALWAYS use \`run_in_background: true\` on the Bash tool. Full suites can take 5-15 minutes and will exceed the default timeout.
-3. **Wait for backgrounded tests before re-launching**: If a test command gets backgrounded (you receive a task ID), wait for it to complete using TaskOutput with \`block: true\`. Do NOT start another test run while one is still running — parallel suites compete for resources and take even longer. Only re-launch if the previous run completed and failed.
-4. **Use fail-fast flags**: If the test framework supports it, use a fail-fast option to exit on first failure.
-5. **Set generous timeouts**: If not using run_in_background, set \`timeout: 600000\` (10 minutes) for full test suites.`);
+2. **Run the full suite in the foreground**: When running the complete test suite, run it in the foreground with the Bash tool and a generous \`timeout\` (up to the SDK max, \`timeout: 600000\`, i.e. 10 minutes). Do NOT background the suite and do NOT use a monitor/watcher tool to wait for it: backgrounded and monitored tasks are terminated when the turn ends in this environment and never deliver a completion notification, so a backgrounded suite silently dies and the turn deadlocks waiting for a result that never arrives.
+3. **Do not launch a second suite while one is running**: Parallel suites compete for resources and take even longer. Only re-run the suite after the previous foreground run has returned.
+4. **Use fail-fast flags**: If the test framework supports it, use a fail-fast option to exit on first failure.`);
 
   return sections.join('\n\n---\n\n');
+}
+
+// ---------------------------------------------------------------------------
+// Epic archive
+// ---------------------------------------------------------------------------
+
+export function sortByName(files: InputFileInfo[]): InputFileInfo[] {
+  return [...files].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function readFileInFolder(folder: string, filename: string): string | null {
+  const filePath = path.join(folder, path.basename(filename));
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return null;
+  return fs.readFileSync(filePath, 'utf8');
 }
 
 // Export path helper functions for testing
@@ -361,4 +393,5 @@ export const _internal = {
   getProjectArchivePath,
   getArchiveTasksFolderPath,
   getArchiveRecordingsFolderPath,
+  getArchiveEpicsFolderPath,
 };

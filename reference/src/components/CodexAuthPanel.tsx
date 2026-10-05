@@ -1,11 +1,9 @@
 // Settings → Providers — Codex auth status + Path B (paste auth.json).
 //
-// The PTY-driven `codex login --device-auth` UI is Phase 10 part 3 work.
-// This panel ships Path B as the primary auth path today: the user
-// runs `codex login` on their workstation, pastes the resulting
-// `~/.codex/auth.json` contents into the textarea, and Bottega
-// persists it under the per-user CODEX_HOME (`~/.config/bottega/users/
-// {userId}/codex/auth.json`).
+// The primary path runs `codex login --device-auth`; users can also paste
+// OAuth-only `auth.json` contents from another developer machine. Bottega
+// persists credentials under the per-user CODEX_HOME
+// (`~/.config/bottega/users/{userId}/codex/auth.json`).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2, AlertCircle, CheckCircle2, Trash2, ExternalLink, Copy } from 'lucide-react';
@@ -225,7 +223,7 @@ export function CodexAuthPanel() {
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  navigator.clipboard.writeText(status.login!.deviceCode!);
+                  void navigator.clipboard.writeText(status.login!.deviceCode!);
                   setInfo('Code copied to clipboard');
                 }}
               >
@@ -267,8 +265,8 @@ export function CodexAuthPanel() {
         <p className="text-xs text-muted-foreground">
           Run <code>codex login</code> on a developer machine, then paste the
           full contents of <code>~/.codex/auth.json</code> here. The JSON must
-          carry <code>tokens.access_token</code>, <code>tokens.id_token</code>,
-          or <code>OPENAI_API_KEY</code>.
+          carry ChatGPT OAuth credentials under <code>tokens</code>. API-key
+          authentication is not accepted.
         </p>
         <textarea
           id="codex-auth-paste"

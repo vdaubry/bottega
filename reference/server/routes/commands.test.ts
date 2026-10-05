@@ -17,15 +17,21 @@ describe('Commands Routes', () => {
   });
 
   describe('POST /api/commands/list', () => {
-    it('returns an empty builtIn array (built-ins are not wired to the SDK pipeline)', async () => {
+    it('returns Bottega\'s own .claude/commands/ as built-in commands', async () => {
       const res = await request(app)
         .post('/api/commands/list')
         .send({ projectPath: '' });
 
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.builtIn)).toBe(true);
-      expect(res.body.builtIn).toHaveLength(0);
       expect(Array.isArray(res.body.custom)).toBe(true);
+
+      // /implement ships at the repo root and should always be discovered,
+      // independent of the project the user is chatting about.
+      const builtInNames = res.body.builtIn.map((c: { name: string }) => c.name);
+      expect(builtInNames).toContain('/implement');
+      const implement = res.body.builtIn.find((c: { name: string }) => c.name === '/implement');
+      expect(implement.namespace).toBe('builtin');
     });
 
     it('surfaces user-level commands written under ~/.claude/commands/', async () => {

@@ -22,13 +22,12 @@ import type { ProviderCredentialStore } from './types.js';
 export const codexCredentialStore: ProviderCredentialStore = {
   read(userId) {
     const { payload, authPath } = readCodexAuth(userId);
-    // We surface the access_token as the "token" since that's what
-    // every cross-provider call shape expects. If only an
-    // OPENAI_API_KEY is present, that becomes the token.
+    // We surface an OAuth token as the "token" since that's what every
+    // cross-provider call shape expects. API-key auth is rejected by
+    // readCodexAuth before this point.
     const token =
       payload.tokens?.access_token ??
       payload.tokens?.id_token ??
-      payload.OPENAI_API_KEY ??
       '';
     return { token, tokenPath: authPath };
   },

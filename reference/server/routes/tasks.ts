@@ -1,14 +1,18 @@
 import express, { type Request, type Response } from 'express';
 import { promises as fs } from 'fs';
 import fsSync from 'fs';
-import { tasksDb, conversationsDb } from '../database/db.js';
-import { purgeConversationMessages } from '../services/conversationContentStore.js';
+import { tasksDb, conversationsDb, taskAgentRunsDb } from '../database/db.js';
 import { hasProjectAccess, getProject } from '../services/projectService.js';
-import { getAllTasks } from '../services/taskService.js';
+import {
+  createTaskWithWorktree,
+  deleteTaskCompletely,
+  getAllTasks,
+} from '../services/taskService.js';
+import { resolveBaseBranch } from '../services/tasks/baseBranch.js';
+import { retryWorktreeSetup } from '../services/tasks/worktreeSetup.js';
 import {
   readTaskDoc,
   writeTaskDoc,
-  deleteTaskArchive,
   listTaskInputFiles,
   saveTaskInputFile,
   deleteTaskInputFile,
@@ -17,22 +21,36 @@ import {
 import { upload } from '../middleware/upload.js';
 import { notifyTaskStatusChange } from '../services/notifications.js';
 import { forceCompleteRunningAgents } from '../services/agentRunner.js';
+import { clearStreamingSessionsForTask } from '../services/conversation/sessionControl.js';
+import type { BroadcastToTaskSubscribersFn } from '../services/conversation/types.js';
 import {
-  isGitRepository,
-  createWorktree,
   removeWorktree,
   worktreeExists,
   getWorktreeStatus,
-  syncWithMain,
+  syncWithBase,
   getPullRequestStatus,
-  mergeAndCleanup,
-  hasUncommittedChanges,
   pushChanges,
 } from '../services/worktree.js';
+import { mergeTask } from '../services/tasks/index.js';
+import {
+  isUnsavedWorktreeWorkError,
+  describeUnsavedWork,
+  type UnsavedWorktreeWorkError,
+} from '../services/worktreeSafety.js';
 import { createOrUpdatePR } from '../services/prService.js';
-import { switchWorktree } from '../services/webServerManager.js';
+import { switchServedTarget } from '../services/webServerManager.js';
 import type { TaskUpdates } from '../database/db.js';
 import type { ApiError } from '../../shared/api/_common.js';
+import type {
+  PhaseName,
+  PhaseStatus,
+  PhaseStatusValue,
+  GetTaskPhasesResponse,
+  GetTaskPlanResponse,
+  UnsavedWorktreeWorkResponse,
+} from '../../shared/api/tasks.js';
+import { UNSAVED_WORKTREE_WORK } from '../../shared/api/tasks.js';
+import type { AgentType } from '../../shared/types/db.js';
 import { validateBody, validateParams, validateQuery } from '../middleware/validate.js';
 import {
   IdParamsSchema,
@@ -47,8 +65,8 @@ import {
   type CreatePullRequestBody,
   CreateTaskBodySchema,
   type CreateTaskBody,
-  DiscardWorktreeQuerySchema,
-  type DiscardWorktreeQuery,
+  ForceQuerySchema,
+  type ForceQuery,
   ListTasksQuerySchema,
   type ListTasksQuery,
   PushChangesBodySchema,
@@ -66,6 +84,46 @@ import {
 } from '../../shared/schemas/tasks.js';
 
 const router = express.Router();
+
+/**
+ * Translate an `UnsavedWorktreeWorkError` into the uniform 409 body.
+ *
+ * Every worktree-destroying endpoint answers with this exact shape so the
+ * client needs a single modal rather than one per action. The PR lookup is what
+ * lets that modal offer the right verb — "push to PR #123" when a PR exists,
+ * "push the branch" when it does not — and is best-effort: failing to reach
+ * `gh` must not turn a recoverable 409 into a 500.
+ */
+async function sendUnsavedWorkConflict(
+  res: Response<unknown>,
+  err: UnsavedWorktreeWorkError,
+  repoPath: string,
+): Promise<Response<unknown>> {
+  let prUrl: string | null = null;
+  try {
+    const pr = await getPullRequestStatus(repoPath, err.taskId);
+    prUrl = pr.success && pr.exists ? (pr.url ?? null) : null;
+  } catch (prError) {
+    console.warn(`[Tasks] Could not resolve PR for task ${err.taskId}:`, prError);
+  }
+
+  const prNumberMatch = prUrl?.match(/\/pull\/(\d+)/);
+
+  const body: UnsavedWorktreeWorkResponse = {
+    error: UNSAVED_WORKTREE_WORK,
+    summary: describeUnsavedWork(err.safety),
+    taskId: err.taskId,
+    branch: err.safety.branch,
+    dirtyPaths: err.safety.files,
+    dirtyFiles: err.safety.dirtyFiles,
+    unpushedCommits: err.safety.unpushedCommits,
+    prUrl,
+    prNumber: prNumberMatch ? Number(prNumberMatch[1]) : null,
+  };
+
+  return res.status(409).json(body);
+}
+
 
 router.get(
   '/tasks',
@@ -128,41 +186,19 @@ router.post(
 
       const { title, description, yolo_mode } = req.validated!.body as CreateTaskBody;
 
-      const isGit = await isGitRepository(project.repo_folder_path);
-
-      const task = tasksDb.create(
-        projectId,
-        title?.trim() || null,
-        !!yolo_mode,
+      const result = await createTaskWithWorktree(
+        project,
+        { title, description, yoloMode: yolo_mode },
         userId,
-      ) as unknown as { id: number; [k: string]: unknown };
+      );
 
-      if (isGit) {
-        const result = await createWorktree(
-          project.repo_folder_path,
-          task.id,
-          title,
-          project.subproject_path,
-        );
-
-        if (!result.success) {
-          tasksDb.delete(task.id);
-          return res.status(500).json({
-            error: `Failed to create worktree: ${result.error}`,
-          } satisfies ApiError);
-        }
-
-        task.worktree_path = result.worktreePath;
-        task.worktree_branch = result.branch;
+      if (!result.success) {
+        return res
+          .status(500)
+          .json({ error: result.error ?? 'Failed to create task' } satisfies ApiError);
       }
 
-      try {
-        writeTaskDoc(projectId, task.id, description?.trim() || '');
-      } catch (fileError) {
-        console.error('Failed to create task documentation file:', fileError);
-      }
-
-      res.status(201).json(task);
+      res.status(201).json(result.task);
     } catch (error) {
       console.error('Error creating task:', error);
       res.status(500).json({ error: 'Failed to create task' } satisfies ApiError);
@@ -246,6 +282,32 @@ router.put(
         );
       }
 
+      // Reconcile liveness on completion (Bug #1 — stale-ON). A leaked
+      // `activeStreamingSessions` entry (a lost `streaming-ended`) would
+      // otherwise keep the live dot lit until a server restart. Clear the
+      // in-memory map for this task and re-emit the task-channel
+      // `streaming-ended` so subscribed clients drop it from `liveTaskIds`.
+      // A genuinely in-flight turn is unaffected (no abort, no agent-run
+      // mutation); its own completion handler re-broadcasts idempotently.
+      if (updates.status === 'completed' && oldStatus !== 'completed') {
+        const broadcastToTaskSubscribers =
+          req.app.locals.broadcastToTaskSubscribers as
+            | BroadcastToTaskSubscribersFn
+            | undefined;
+        const cleared = clearStreamingSessionsForTask(taskId);
+        for (const { conversationId } of cleared) {
+          broadcastToTaskSubscribers?.(taskId, {
+            type: 'streaming-ended',
+            conversationId,
+          });
+        }
+        if (cleared.length > 0) {
+          console.log(
+            `[Tasks] Cleared ${cleared.length} stale streaming session(s) for completed task ${taskId}`,
+          );
+        }
+      }
+
       res.json(task);
     } catch (error) {
       console.error('Error updating task:', error);
@@ -257,10 +319,14 @@ router.put(
 router.delete(
   '/tasks/:id',
   validateParams(IdParamsSchema),
+  validateQuery(ForceQuerySchema),
   async (req: Request, res: Response<unknown>) => {
+    // Hoisted so the catch can build the 409 without re-reading the row.
+    let repoPath: string | null = null;
     try {
       const userId = req.user!.id;
       const { id: taskId } = req.validated!.params as IdParams;
+      const { force } = req.validated!.query as ForceQuery;
 
       const taskWithProject = tasksDb.getWithProject(taskId);
 
@@ -271,39 +337,17 @@ router.delete(
       if (!hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
       }
+      repoPath = taskWithProject.repo_folder_path;
 
       const project = getProject(taskWithProject.project_id, userId);
       const wasActiveServer = project?.active_worktree_task_id === taskId;
 
-      if (await worktreeExists(taskWithProject.repo_folder_path, taskId)) {
-        const result = await removeWorktree(taskWithProject.repo_folder_path, taskId);
-        if (!result.success) {
-          console.error(`Failed to remove worktree for task ${taskId}:`, result.error);
-        }
-      }
-
-      const conversationsForTask = conversationsDb.getByTask(taskId);
-      for (const conv of conversationsForTask) {
-        try {
-          await purgeConversationMessages(conv, taskWithProject.repo_folder_path);
-        } catch (purgeError) {
-          console.error(
-            `Failed to purge messages for conversation ${conv.id}:`,
-            purgeError,
-          );
-        }
-      }
-
-      const deleted = tasksDb.delete(taskId);
+      const deleted = await deleteTaskCompletely(taskWithProject, {
+        force: force === 'true',
+      });
 
       if (!deleted) {
         return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
-      }
-
-      try {
-        deleteTaskArchive(taskWithProject.project_id, taskId);
-      } catch (fileError) {
-        console.error('Failed to delete task archive:', fileError);
       }
 
       const response: {
@@ -315,7 +359,7 @@ router.delete(
       } = { success: true };
 
       if (wasActiveServer && project?.serve_symlink_path) {
-        const switchResult = await switchWorktree(taskWithProject.project_id, null, userId);
+        const switchResult = await switchServedTarget(taskWithProject.project_id, { kind: 'main' }, userId);
         if (switchResult.success) {
           response.serverSwitched = true;
           if (switchResult.warning) {
@@ -332,6 +376,9 @@ router.delete(
 
       res.json(response);
     } catch (error) {
+      if (isUnsavedWorktreeWorkError(error) && repoPath) {
+        return sendUnsavedWorkConflict(res, error, repoPath);
+      }
       console.error('Error deleting task:', error);
       res.status(500).json({ error: 'Failed to delete task' } satisfies ApiError);
     }
@@ -363,6 +410,141 @@ router.get(
       res
         .status(500)
         .json({ error: 'Failed to read task documentation' } satisfies ApiError);
+    }
+  },
+);
+
+// The five workflow phases the phases endpoint exposes, in fixed workflow
+// order. Each maps a user-facing label onto the real `AgentType` and (where
+// applicable) the `tasks` workflow flag that stands in for a completed phase
+// when no `task_agent_runs` row exists yet. `yolo` is deliberately excluded —
+// it's the single-pass alternative workflow, not one of these phases.
+const PHASE_CONFIG: ReadonlyArray<{
+  phase: PhaseName;
+  agentType: AgentType;
+  label: string;
+  // The workflow flag that, when set, means this phase is complete even
+  // without a run row. `null` for phases with no such flag (implementation,
+  // review).
+  completeFlag:
+    | 'planification_complete'
+    | 'refinement_complete'
+    | 'pr_agent_complete'
+    | null;
+}> = [
+  { phase: 'planification', agentType: 'planification', label: 'Classification', completeFlag: 'planification_complete' },
+  { phase: 'implementation', agentType: 'implementation', label: 'Implementation', completeFlag: null },
+  { phase: 'review', agentType: 'review', label: 'Code Review', completeFlag: null },
+  { phase: 'refinement', agentType: 'refinement', label: 'Refinement', completeFlag: 'refinement_complete' },
+  { phase: 'pr', agentType: 'pr', label: 'Pull Request', completeFlag: 'pr_agent_complete' },
+];
+
+router.get(
+  '/tasks/:id/phases',
+  validateParams(IdParamsSchema),
+  (req: Request, res: Response<unknown>) => {
+    try {
+      const userId = req.user!.id;
+      const { id: taskId } = req.validated!.params as IdParams;
+
+      // `getWithProject` returns a `TaskWithProject` (a superset of `TaskRow`),
+      // so it doubles as the task row used below for the workflow flags.
+      const task = tasksDb.getWithProject(taskId);
+
+      if (!task) {
+        return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
+      }
+
+      if (!hasProjectAccess(task.project_id, userId)) {
+        return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
+      }
+
+      // Both already ORDER BY created_at DESC (newest first).
+      const agentRuns = taskAgentRunsDb.getByTask(taskId);
+      const conversationRank = new Map<number, number>(
+        conversationsDb.getByTask(taskId).map((c, index) => [c.id, index]),
+      );
+
+      const phases: PhaseStatus[] = PHASE_CONFIG.map((cfg) => {
+        const runsForType = agentRuns.filter((r) => r.agent_type === cfg.agentType);
+
+        // `agentRunsDb.getByTask` is created_at DESC, so the first match is the
+        // most recent run for this phase.
+        let status: PhaseStatusValue;
+        if (runsForType.length > 0) {
+          status = runsForType[0]!.status;
+        } else if (cfg.completeFlag && task[cfg.completeFlag] === 1) {
+          status = 'completed';
+        } else {
+          status = 'not_started';
+        }
+
+        // Collect this phase's conversation ids (dedup), then order them by the
+        // conversation sidebar order (created_at DESC); ids missing from the
+        // conversation list (defensive) sort last in run order.
+        const ids = Array.from(
+          new Set(
+            runsForType
+              .map((r) => r.conversation_id)
+              .filter((id): id is number => id !== null),
+          ),
+        );
+        const rankOf = (id: number) => conversationRank.get(id) ?? Number.MAX_SAFE_INTEGER;
+        ids.sort((a, b) => rankOf(a) - rankOf(b));
+
+        return {
+          phase: cfg.phase,
+          label: cfg.label,
+          status,
+          conversation_ids: ids,
+        };
+      });
+
+      res.json({ phases } satisfies GetTaskPhasesResponse);
+    } catch (error) {
+      console.error('Error getting task phases:', error);
+      res.status(500).json({ error: 'Failed to get task phases' } satisfies ApiError);
+    }
+  },
+);
+
+router.get(
+  '/tasks/:id/plan',
+  validateParams(IdParamsSchema),
+  (req: Request, res: Response<unknown>) => {
+    try {
+      const userId = req.user!.id;
+      const { id: taskId } = req.validated!.params as IdParams;
+
+      // `getWithProject` returns a `TaskWithProject` (a superset of `TaskRow`),
+      // so it provides both the access check and the `planification_complete` flag.
+      const task = tasksDb.getWithProject(taskId);
+
+      if (!task) {
+        return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
+      }
+
+      if (!hasProjectAccess(task.project_id, userId)) {
+        return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
+      }
+
+      // The task doc file is seeded with the description at creation
+      // (`writeTaskDoc` above), so "file exists" is not a readiness signal.
+      // `planification_complete` is the truthful "the plan is ready" flag —
+      // set by `scripts/complete-plan.ts` after the planification phase
+      // overwrites the doc with the structured plan.
+      if (task.planification_complete !== 1) {
+        return res.json({
+          status: 'not_ready',
+          content: null,
+        } satisfies GetTaskPlanResponse);
+      }
+
+      const content = readTaskDoc(task.project_id, taskId);
+      res.json({ status: 'ready', content } satisfies GetTaskPlanResponse);
+    } catch (error) {
+      console.error('Error getting task plan:', error);
+      res.status(500).json({ error: 'Failed to get task plan' } satisfies ApiError);
     }
   },
 );
@@ -536,42 +718,38 @@ router.delete(
         return res.json({ deletedCount: 0, message: 'No old completed tasks to delete' });
       }
 
+      // A sweep must not be all-or-nothing: one ticket still holding unsaved
+      // work should be skipped and reported, not abort the other N deletions.
+      // Nothing here forces — a batch job is the last place to discard work
+      // silently, and the user can still delete a skipped task individually.
       let deletedCount = 0;
+      const skipped: Array<{ taskId: number; reason: string }> = [];
       for (const taskId of taskIdsToDelete) {
-        if (await worktreeExists(project.repo_folder_path, taskId)) {
-          const result = await removeWorktree(project.repo_folder_path, taskId);
-          if (!result.success) {
-            console.error(`Failed to remove worktree for task ${taskId}:`, result.error);
+        const task = tasksDb.getWithProject(taskId);
+        if (!task) continue;
+        try {
+          if (await deleteTaskCompletely(task)) {
+            deletedCount++;
           }
-        }
-
-        const conversationsForTask = conversationsDb.getByTask(taskId);
-        for (const conv of conversationsForTask) {
-          try {
-            await purgeConversationMessages(conv, project.repo_folder_path);
-          } catch (purgeError) {
-            console.error(
-              `Failed to purge messages for conversation ${conv.id}:`,
-              purgeError,
-            );
-          }
-        }
-
-        const deleted = tasksDb.delete(taskId);
-
-        if (deleted) {
-          deletedCount++;
-          try {
-            deleteTaskArchive(projectId, taskId);
-          } catch (fileError) {
-            console.error(`Failed to delete archive for task ${taskId}:`, fileError);
-          }
+        } catch (deleteError) {
+          if (!isUnsavedWorktreeWorkError(deleteError)) throw deleteError;
+          skipped.push({
+            taskId,
+            reason: describeUnsavedWork(deleteError.safety),
+          });
         }
       }
 
+      const skippedNote = skipped.length
+        ? `; skipped ${skipped.length} with unsaved work`
+        : '';
+
       res.json({
         deletedCount,
-        message: `Deleted ${deletedCount} old completed task(s), kept the ${keepCount} most recent`,
+        skipped,
+        message:
+          `Deleted ${deletedCount} old completed task(s), kept the ${keepCount} most recent` +
+          skippedNote,
       });
     } catch (error) {
       console.error('Error cleaning up old completed tasks:', error);
@@ -788,7 +966,15 @@ router.get(
         return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
       }
 
-      const status = await getWorktreeStatus(taskWithProject.repo_folder_path, taskId);
+      const baseBranch = await resolveBaseBranch(
+        taskWithProject,
+        taskWithProject.repo_folder_path,
+      );
+      const status = await getWorktreeStatus(
+        taskWithProject.repo_folder_path,
+        taskId,
+        baseBranch,
+      );
       res.json(status);
     } catch (error) {
       console.error('Error getting worktree status:', error);
@@ -817,11 +1003,15 @@ router.post(
         return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
       }
 
-      const result = await syncWithMain(taskWithProject.repo_folder_path, taskId);
-      res.json(result);
+      const baseBranch = await resolveBaseBranch(
+        taskWithProject,
+        taskWithProject.repo_folder_path,
+      );
+      const result = await syncWithBase(taskWithProject.repo_folder_path, taskId, baseBranch);
+      res.json({ ...result, baseBranch });
     } catch (error) {
-      console.error('Error syncing with main:', error);
-      res.status(500).json({ error: 'Failed to sync with main' } satisfies ApiError);
+      console.error('Error syncing with base branch:', error);
+      res.status(500).json({ error: 'Failed to sync with the base branch' } satisfies ApiError);
     }
   },
 );
@@ -898,10 +1088,14 @@ router.get(
 router.post(
   '/tasks/:id/merge-cleanup',
   validateParams(IdParamsSchema),
+  validateQuery(ForceQuerySchema),
   async (req: Request, res: Response<unknown>) => {
+    // Hoisted so the catch can build the 409 without re-reading the row.
+    let repoPath: string | null = null;
     try {
       const userId = req.user!.id;
       const { id: taskId } = req.validated!.params as IdParams;
+      const { force } = req.validated!.query as ForceQuery;
 
       const taskWithProject = tasksDb.getWithProject(taskId);
 
@@ -912,14 +1106,17 @@ router.post(
       if (!hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
       }
+      repoPath = taskWithProject.repo_folder_path;
 
       const project = getProject(taskWithProject.project_id, userId);
       const wasActiveServer = project?.active_worktree_task_id === taskId;
 
-      const result = (await mergeAndCleanup(
-        taskWithProject.repo_folder_path,
-        taskId,
-      )) as {
+      const result = (await mergeTask(taskId, {
+        force: force === 'true',
+        userId,
+        broadcastToTaskSubscribersFn: req.app.locals
+          .broadcastToTaskSubscribers as BroadcastToTaskSubscribersFn | undefined,
+      })) as {
         success: boolean;
         serverSwitched?: boolean;
         serverSwitchWarning?: string;
@@ -929,7 +1126,7 @@ router.post(
       };
 
       if (result.success && wasActiveServer && project?.serve_symlink_path) {
-        const switchResult = await switchWorktree(taskWithProject.project_id, null, userId);
+        const switchResult = await switchServedTarget(taskWithProject.project_id, { kind: 'main' }, userId);
         if (switchResult.success) {
           result.serverSwitched = true;
           if (switchResult.warning) {
@@ -946,6 +1143,9 @@ router.post(
 
       res.json(result);
     } catch (error) {
+      if (isUnsavedWorktreeWorkError(error) && repoPath) {
+        return sendUnsavedWorkConflict(res, error, repoPath);
+      }
       console.error('Error merging and cleaning up:', error);
       res.status(500).json({ error: 'Failed to merge and cleanup' } satisfies ApiError);
     }
@@ -989,15 +1189,17 @@ router.post(
 router.delete(
   '/tasks/:id/worktree',
   validateParams(IdParamsSchema),
-  validateQuery(DiscardWorktreeQuerySchema),
+  validateQuery(ForceQuerySchema),
   async (
     req: Request,
     res: Response<unknown>,
   ) => {
+    // Hoisted so the catch can build the 409 without re-reading the row.
+    let repoPath: string | null = null;
     try {
       const userId = req.user!.id;
       const { id: taskId } = req.validated!.params as IdParams;
-      const { force } = req.validated!.query as DiscardWorktreeQuery;
+      const { force } = req.validated!.query as ForceQuery;
 
       const taskWithProject = tasksDb.getWithProject(taskId);
 
@@ -1008,30 +1210,61 @@ router.delete(
       if (!hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
       }
+      repoPath = taskWithProject.repo_folder_path;
+
+      if (taskWithProject.worktree_state === 'provisioning') {
+        return res.status(409).json({
+          error: 'The worktree is still being set up',
+        } satisfies ApiError);
+      }
 
       const exists = await worktreeExists(taskWithProject.repo_folder_path, taskId);
       if (!exists) {
         return res.status(404).json({ error: 'Worktree not found' } satisfies ApiError);
       }
 
-      const changesResult = await hasUncommittedChanges(
-        taskWithProject.repo_folder_path,
-        taskId,
-      );
-      const forceDelete = force === 'true';
-
-      if (changesResult.success && changesResult.hasChanges && !forceDelete) {
-        return res.status(409).json({
-          error: 'Worktree has uncommitted changes',
-          hasChanges: true,
-        });
-      }
-
-      const result = await removeWorktree(taskWithProject.repo_folder_path, taskId);
+      // The unsaved-work check lives inside `removeWorktree`; this route only
+      // decides whether the user asked to override it.
+      const result = await removeWorktree(taskWithProject.repo_folder_path, taskId, {
+        force: force === 'true',
+      });
       res.json(result);
     } catch (error) {
+      if (isUnsavedWorktreeWorkError(error) && repoPath) {
+        return sendUnsavedWorkConflict(res, error, repoPath);
+      }
       console.error('Error discarding worktree:', error);
       res.status(500).json({ error: 'Failed to discard worktree' } satisfies ApiError);
+    }
+  },
+);
+
+// Retry a failed worktree setup. The setup runs in the background: the reply
+// is the task row, now 'provisioning', and the outcome arrives as a
+// `task-worktree-updated` WebSocket event.
+router.post(
+  '/tasks/:id/worktree/retry',
+  validateParams(IdParamsSchema),
+  (req: Request, res: Response<unknown>) => {
+    try {
+      const userId = req.user!.id;
+      const { id: taskId } = req.validated!.params as IdParams;
+
+      const taskWithProject = tasksDb.getWithProject(taskId);
+      if (!taskWithProject || !hasProjectAccess(taskWithProject.project_id, userId)) {
+        return res.status(404).json({ error: 'Task not found' } satisfies ApiError);
+      }
+
+      if (!retryWorktreeSetup(taskId)) {
+        return res.status(409).json({
+          error: 'Only a failed worktree setup can be retried',
+        } satisfies ApiError);
+      }
+
+      res.json(tasksDb.getById(taskId));
+    } catch (error) {
+      console.error('Error retrying worktree setup:', error);
+      res.status(500).json({ error: 'Failed to retry the worktree setup' } satisfies ApiError);
     }
   },
 );

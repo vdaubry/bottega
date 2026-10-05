@@ -23,6 +23,8 @@ export interface CreateProjectRequest {
   name: string;
   repoFolderPath: string;
   subprojectPath?: string;
+  // The non-technical planning guardrail list (see ProjectRow.sensitive_areas).
+  sensitiveAreas?: string;
 }
 
 export type CreateProjectResponse = ProjectRow;
@@ -31,6 +33,8 @@ export interface UpdateProjectRequest {
   name?: string | undefined;
   repoFolderPath?: string | undefined;
   subprojectPath?: string | undefined;
+  // Blank or null clears the list (guardrail off); omit to leave it unchanged.
+  sensitiveAreas?: string | null | undefined;
 }
 
 export type UpdateProjectResponse = ProjectRow;
@@ -80,7 +84,16 @@ export interface UploadProjectFileResponse {
 
 export interface WebServerStatusSuccess {
   success: true;
+  // What the serving symlink points at. At most one is non-null: a ticket
+  // worktree, an epic's delivery worktree, or neither (the main checkout).
   activeTaskId: number | null;
+  activeEpicId: number | null;
+  // What to call it — the ticket title or the epic name — or null for main.
+  // Resolved server-side so every surface says the same thing.
+  activeName: string | null;
+  // 'hook' — the project's own post-checkout hook provisions its worktrees.
+  // 'none' — no hook; worktrees are bare checkouts (git-tracked files only).
+  worktreeProvisioning: 'hook' | 'none';
   serveSymlinkPath: string | null;
   systemdServiceName: string | null;
   // Public URL of the deployed app; opened in a new tab after a successful
@@ -107,15 +120,18 @@ export type UpdateWebServerConfigResponse =
   | { success: false; error: string };
 
 export interface SwitchWebServerRequest {
-  // `null` switches back to the main repo; a number switches to that
-  // task's worktree.
+  // Both `null` switches back to the main repo; `taskId` switches to that
+  // task's worktree; `epicId` to that epic's delivery worktree (its feature
+  // branch — every merged ticket together). Setting both is a 400.
   taskId: number | null;
+  epicId?: number | null;
 }
 
 export type SwitchWebServerResponse =
   | {
       success: true;
       activeTaskId: number | null;
+      activeEpicId?: number | null;
       // Present when the symlink updated but the systemd restart warned.
       warning?: string;
     }

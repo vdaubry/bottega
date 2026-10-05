@@ -13,7 +13,6 @@ import { mapMessage } from './mapMessage.js';
 import { loadAnthropicTranscript } from './sessionStore.js';
 import { mapOptionsToSDK } from './sdkOptionsBuilder.js';
 import { activeSessions } from '../../conversation/sessionState.js';
-import { agentRunsDb } from '../../../database/db.js';
 import { getCapabilities } from '@shared/providers/capabilities';
 import type {
   ProviderCapabilities,
@@ -120,13 +119,9 @@ export class AnthropicProvider implements LlmProvider {
   abortTurn(providerSessionId: string): boolean {
     const active = activeSessions.get(providerSessionId);
     if (!active) return false;
-    // Mirror `abortSession` in sessionControl.ts: the agent_run row is the
-    // source of truth for "did the user stop this run", so write it
-    // synchronously before the abort lands.
-    const linked = agentRunsDb.getByConversationId(active.conversationId);
-    if (linked && linked.status === 'running') {
-      agentRunsDb.updateStatus(linked.id, 'failed');
-    }
+    // Transport only. User intent is recorded by sessionControl before it
+    // dispatches here; portable AskUserQuestion also aborts transport without
+    // being misclassified as a Stop.
     active.abortController.abort();
     active.status = 'aborted';
     return true;

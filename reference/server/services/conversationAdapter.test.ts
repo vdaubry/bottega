@@ -40,11 +40,19 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => {
     }
   };
   const proxiedQuery = new Proxy(queryFn, handler);
-  return { query: proxiedQuery };
+  return {
+    query: proxiedQuery,
+    createSdkMcpServer: vi.fn((config) => config),
+    tool: vi.fn((name, description, inputSchema, handler) => ({
+      name,
+      description,
+      inputSchema,
+      handler,
+    })),
+  };
 });
 
-vi.mock('../database/db.js', () => ({
-  db: {},
+vi.mock('../database/conversations.js', () => ({
   conversationsDb: {
     create: vi.fn(),
     getById: vi.fn(),
@@ -55,17 +63,25 @@ vi.mock('../database/db.js', () => ({
     updateContextUsage: vi.fn(),
     getContextUsage: vi.fn()
   },
+}));
+
+vi.mock('../database/tasks.js', () => ({
   tasksDb: {
     getById: vi.fn(),
     getWithProject: vi.fn(),
     markRefinementComplete: vi.fn()
   },
-  agentRunsDb: {
+  taskAgentRunsDb: {
     getByTask: vi.fn(),
     getByConversationId: vi.fn(),
+    getByStatus: vi.fn().mockReturnValue([]),
     updateStatus: vi.fn(),
     create: vi.fn()
   },
+}));
+
+vi.mock('../database/db.js', () => ({
+  db: {},
   userDb: {
     getUserById: vi.fn().mockReturnValue({ id: 1, username: 'test', is_technical: 1 }),
     isAdmin: vi.fn().mockReturnValue(true),
@@ -110,6 +126,12 @@ vi.mock('./sqliteSessionStore.js', () => ({
   }
 }));
 
+// The operator-plugins loader reads ~/.claude on the real box; pin it so the
+// start/resume wiring is asserted against a known list.
+vi.mock('./conversation/pluginConfig.js', () => ({
+  loadEnabledPlugins: vi.fn().mockResolvedValue([])
+}));
+
 vi.mock('./conversationContentStore.js', () => ({
   conversationContentStore: {},
   resolveProjectKey: vi.fn((p) => String(p ?? '').replace(/[/.]/g, '-'))
@@ -139,10 +161,19 @@ const RESOLVED_DEFAULT_MODEL = 'claude-opus-4-7';
 
 // Import after mocks
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { conversationsDb, tasksDb, agentRunsDb } from '../database/db.js';
+import { conversationsDb } from '../database/conversations.js';
+import { tasksDb, taskAgentRunsDb } from '../database/tasks.js';
+// Register the real owner adapters over the mocked tables: this suite
+// exercises the true start/resume flow, adapters included.
+import { initTasks } from './tasks/adapter.js';
+import { registerEpicOwnerAdapter } from './epics/adapter.js';
+initTasks();
+registerEpicOwnerAdapter();
 import { notifyClaudeComplete } from './notifications.js';
 import { auditClaudeLaunch, buildClaudeSdkEnv } from './claudeCredentials.js';
 import { sqliteSessionStore } from './sqliteSessionStore.js';
+import { FIGMA_WRITE_TOOLS } from '../constants/figmaTools.js';
+import { loadEnabledPlugins } from './conversation/pluginConfig.js';
 
 import {
   startConversation,
@@ -159,6 +190,20 @@ import {
 } from './conversationAdapter.js';
 import { isClaudeAuthError, AUTH_RETRY_BACKOFF_MS } from './conversation/retryOn401.js';
 
+// The completion handler looks the linked run up by CONVERSATION id (task runs
+// and epic runs share one table), while several assertions here still describe
+// the task's runs. This helper keeps both accessors in sync from one list.
+function setLinkedRuns(runs: unknown): void {
+  vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue(runs as never);
+  vi.mocked(taskAgentRunsDb.getByConversationId).mockImplementation(((
+    conversationId: number,
+  ) =>
+    (runs as Array<{ conversation_id: number | null }>).find(
+      (r) => r.conversation_id === conversationId,
+    )) as never);
+}
+
+
 describe('conversationAdapter', () => {
   const mockTaskWithProject = {
     id: 1,
@@ -172,7 +217,9 @@ describe('conversationAdapter', () => {
 
   const mockConversation = {
     id: 1,
+    owner_kind: 'task' as const,
     task_id: 1,
+    epic_id: null,
     claude_conversation_id: null,
     provider: 'anthropic' as const,
     provider_session_id: null,
@@ -182,7 +229,9 @@ describe('conversationAdapter', () => {
 
   const mockConversationWithSession = {
     id: 1,
+    owner_kind: 'task' as const,
     task_id: 1,
+    epic_id: null,
     claude_conversation_id: 'existing-session-123',
     provider: 'anthropic' as const,
     provider_session_id: 'existing-session-123',
@@ -211,22 +260,29 @@ describe('conversationAdapter', () => {
     return iter;
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    // The in-memory session maps are module singletons; a test that leaves a
+    // turn hanging must not leak its session into the next test's view.
+    const { activeSessions, activeStreamingSessions } = await import(
+      './conversation/sessionState.js'
+    );
+    activeSessions.clear();
+    activeStreamingSessions.clear();
   });
 
   describe('startConversation', () => {
     beforeEach(() => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(conversationsDb.create).mockReturnValue(mockConversation);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
+      setLinkedRuns([]);
       vi.mocked(tasksDb.getById).mockReturnValue(mockTaskWithProject as never);
     });
 
     it('should throw error if task not found', async () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(null as never);
 
-      await expect(startConversation(999, 'Hello', { model: 'opus' })).rejects.toThrow('Task 999 not found');
+      await expect(startConversation({ kind: 'task', taskId: 999 }, 'Hello', { model: 'opus' })).rejects.toThrow('Task 999 not found');
     });
 
     it('should create conversation if conversationId not provided', async () => {
@@ -245,7 +301,7 @@ describe('conversationAdapter', () => {
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      const result = await startConversation(1, 'Hello', { model: 'opus' });
+      const result = await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
       expect(conversationsDb.create).toHaveBeenCalledWith(1, 'anthropic', 'opus', null);
       expect(result.conversationId).toBe(1);
@@ -266,7 +322,7 @@ describe('conversationAdapter', () => {
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      const result = await startConversation(1, 'Hello', { model: 'opus', conversationId: 5 });
+      const result = await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 5 });
 
       expect(conversationsDb.create).not.toHaveBeenCalled();
       expect(result.conversationId).toBe(5);
@@ -287,7 +343,7 @@ describe('conversationAdapter', () => {
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      const result = await startConversation(1, 'Hello', { model: 'opus' });
+      const result = await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
       expect(conversationsDb.updateClaudeId).toHaveBeenCalledWith(1, 'session-456');
       expect(result.claudeSessionId).toBe('session-456');
@@ -309,7 +365,7 @@ describe('conversationAdapter', () => {
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -349,7 +405,7 @@ describe('conversationAdapter', () => {
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus' });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
       // waitForMcpServers runs concurrently — wait for it to complete
       await new Promise(resolve => setTimeout(resolve, 700));
@@ -385,7 +441,7 @@ describe('conversationAdapter', () => {
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus' });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
       // Wait for async streaming loop
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -409,7 +465,7 @@ describe('conversationAdapter', () => {
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -439,7 +495,7 @@ describe('conversationAdapter', () => {
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -472,7 +528,7 @@ describe('conversationAdapter', () => {
       } as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
       await new Promise(resolve => setTimeout(resolve, 30));
 
       const canUseTool = vi.mocked(query).mock.calls[0]![0].options!.canUseTool!;
@@ -505,7 +561,7 @@ describe('conversationAdapter', () => {
       } as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
       await new Promise(resolve => setTimeout(resolve, 30));
 
       const canUseTool = vi.mocked(query).mock.calls[0]![0].options!.canUseTool!;
@@ -518,7 +574,11 @@ describe('conversationAdapter', () => {
       };
 
       const signal = new AbortController().signal;
-      const callbackPromise = canUseTool('AskUserQuestion', input, { signal, toolUseID: 'tool-abc' });
+      const callbackPromise = canUseTool('AskUserQuestion', input, {
+        signal,
+        toolUseID: 'tool-abc',
+        requestId: 'req-abc'
+      });
 
       // Should NOT resolve immediately — it's parked.
       let settled = false;
@@ -586,14 +646,15 @@ describe('conversationAdapter', () => {
       } as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
       await new Promise(resolve => setTimeout(resolve, 30));
 
       const canUseTool = vi.mocked(query).mock.calls[0]![0].options!.canUseTool!;
       const ac = new AbortController();
       const promise = canUseTool('AskUserQuestion', { questions: [{ question: 'Q?', header: 'H' }] }, {
         signal: ac.signal,
-        toolUseID: 'tool-abort-1'
+        toolUseID: 'tool-abort-1',
+        requestId: 'req-abort-1'
       });
 
       ac.abort();
@@ -619,7 +680,7 @@ describe('conversationAdapter', () => {
         })
       } as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn: vi.fn() });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn: vi.fn() });
       await new Promise(resolve => setTimeout(resolve, 30));
 
       const canUseTool = vi.mocked(query).mock.calls[0]![0].options!.canUseTool!;
@@ -643,7 +704,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -674,7 +735,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -705,7 +766,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -734,7 +795,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', customSystemPrompt: 'Custom prompt' });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', customSystemPrompt: 'Custom prompt' });
 
       // prompt is now an async generator (deferred until MCP servers ready)
       const callArgs = vi.mocked(query).mock.calls[0]![0];
@@ -765,7 +826,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus' });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
       const callOptions = vi.mocked(query).mock.calls[0]![0].options;
       expect(callOptions!.model).toBe('opus');
@@ -786,7 +847,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', permissionMode: 'bypassPermissions' });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', permissionMode: 'bypassPermissions' });
 
       const callOptions = vi.mocked(query).mock.calls[0]![0].options;
       expect(callOptions).toEqual(expect.objectContaining({
@@ -810,7 +871,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       // Call without permissionMode
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn: vi.fn() });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn: vi.fn() });
 
       // Should default to bypassPermissions
       const callOptions = vi.mocked(query).mock.calls[0]![0].options;
@@ -837,7 +898,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       // Call without permissionMode
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn: vi.fn() });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn: vi.fn() });
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('[ConversationAdapter] Options validation (startConversation):'),
@@ -862,13 +923,16 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', disallowedTools: ['Agent'] });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', disallowedTools: ['Agent'] });
 
       const callOptions = vi.mocked(query).mock.calls[0]![0].options;
-      expect(callOptions!.disallowedTools).toEqual(['Agent']);
+      // The caller's denials survive; the global Figma write denial rides along.
+      expect(callOptions!.disallowedTools).toEqual(
+        expect.arrayContaining(['Agent', ...FIGMA_WRITE_TOOLS]),
+      );
     });
 
-    it('should not include disallowedTools in SDK options when empty', async () => {
+    it('should still deny the Figma write tools when disallowedTools is empty', async () => {
       const mockMessages = [
         { session_id: 'session-123', type: 'message' },
         { type: 'result', modelUsage: {} }
@@ -883,10 +947,60 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', disallowedTools: [] });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', disallowedTools: [] });
 
       const callOptions = vi.mocked(query).mock.calls[0]![0].options;
-      expect(callOptions).not.toHaveProperty('disallowedTools');
+      // Previously this asserted the property was omitted entirely. That was
+      // the hole: agentRunner passes [] for every non-implementation agent, so
+      // omitting on empty left those agents able to write to Figma.
+      expect(callOptions!.disallowedTools).toEqual([...FIGMA_WRITE_TOOLS]);
+    });
+
+    it('names the operator plugins explicitly on a new session', async () => {
+      vi.mocked(loadEnabledPlugins).mockResolvedValueOnce([
+        { type: 'local', path: '/home/op/.claude/plugins/cache/official/figma/2.2.96' },
+      ]);
+      const mockMessages = [
+        { session_id: 'session-123', type: 'message' },
+        { type: 'result', modelUsage: {} }
+      ];
+      const mockIterator = {
+        [Symbol.asyncIterator]: () => ({
+          next: vi.fn()
+            .mockResolvedValueOnce({ value: mockMessages[0], done: false })
+            .mockResolvedValueOnce({ value: mockMessages[1], done: false })
+            .mockResolvedValueOnce({ done: true })
+        })
+      };
+      vi.mocked(query).mockReturnValue(mockIterator as never);
+
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
+
+      const callOptions = vi.mocked(query).mock.calls[0]![0].options as { plugins?: unknown };
+      expect(callOptions.plugins).toEqual([
+        { type: 'local', path: '/home/op/.claude/plugins/cache/official/figma/2.2.96' },
+      ]);
+    });
+
+    it('omits the plugins option when the operator has none enabled', async () => {
+      const mockMessages = [
+        { session_id: 'session-123', type: 'message' },
+        { type: 'result', modelUsage: {} }
+      ];
+      const mockIterator = {
+        [Symbol.asyncIterator]: () => ({
+          next: vi.fn()
+            .mockResolvedValueOnce({ value: mockMessages[0], done: false })
+            .mockResolvedValueOnce({ value: mockMessages[1], done: false })
+            .mockResolvedValueOnce({ done: true })
+        })
+      };
+      vi.mocked(query).mockReturnValue(mockIterator as never);
+
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
+
+      const callOptions = vi.mocked(query).mock.calls[0]![0].options as { plugins?: unknown };
+      expect(callOptions.plugins).toBeUndefined();
     });
 
     it('should inject per-user Claude env into new SDK sessions', async () => {
@@ -904,7 +1018,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', userId: 42 });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', userId: 42 });
 
       expect(buildClaudeSdkEnv).toHaveBeenCalledWith(42);
       expect(vi.mocked(query).mock.calls[0]![0].options!.env).toEqual(expect.objectContaining({
@@ -926,7 +1040,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         throw new Error('Claude credentials are not provisioned for user 42');
       });
 
-      await expect(startConversation(1, 'Hello', { model: 'opus', userId: 42 }))
+      await expect(startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', userId: 42 }))
         .rejects.toThrow('Claude credentials are not provisioned for user 42');
 
       expect(conversationsDb.create).not.toHaveBeenCalled();
@@ -948,7 +1062,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', userId: 42 });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', userId: 42 });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -970,7 +1084,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         agent_type: 'implementation',
         status: 'running'
       };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([mockAgentRun] as never);
+      setLinkedRuns([mockAgentRun] as never);
 
       const mockMessages = [
         { session_id: 'session-123', type: 'message' },
@@ -986,12 +1100,24 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1 });
+      const broadcastFn = vi.fn();
+      await startConversation(
+        { kind: 'task', taskId: 1 },
+        'Hello',
+        { model: 'opus', conversationId: 1, broadcastFn },
+      );
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(5, 'completed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(5, 'completed');
+      const streamingEndedIndex = broadcastFn.mock.calls.findIndex(
+        ([, message]) => message.type === 'streaming-ended',
+      );
+      expect(streamingEndedIndex).toBeGreaterThanOrEqual(0);
+      expect(vi.mocked(taskAgentRunsDb.updateStatus).mock.invocationCallOrder[0]).toBeLessThan(
+        broadcastFn.mock.invocationCallOrder[streamingEndedIndex]!,
+      );
     });
 
     it("marks agent run 'completed' on SDK error and lets the loop chain to the next agent", async () => {
@@ -1006,7 +1132,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         agent_type: 'implementation',
         status: 'running'
       };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([mockAgentRun] as never);
+      setLinkedRuns([mockAgentRun] as never);
 
       // First message returns session, then throws error
       let callCount = 0;
@@ -1024,13 +1150,13 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
 
       // Wait for error handling
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(5, 'completed');
-      expect(agentRunsDb.updateStatus).not.toHaveBeenCalledWith(5, 'failed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(5, 'completed');
+      expect(taskAgentRunsDb.updateStatus).not.toHaveBeenCalledWith(5, 'failed');
     });
 
     it('should timeout if session ID not received', async () => {
@@ -1052,7 +1178,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       }) as never);
 
       try {
-        await expect(startConversation(1, 'Hello', { model: 'opus' })).rejects.toThrow('Session creation timeout');
+        await expect(startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' })).rejects.toThrow('Session creation timeout');
         expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 60000);
       } finally {
         setTimeoutSpy.mockRestore();
@@ -1081,7 +1207,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
 
       // Wait for streaming to complete
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -1097,17 +1223,26 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       );
     });
 
-    it('falls back to baseline from result.modelUsage when getContextUsage rejects', async () => {
+    it('falls back to the assistant message per-request usage (not the cumulative modelUsage) when getContextUsage rejects', async () => {
       const getContextUsage = vi.fn().mockRejectedValue(new Error('SDK gone'));
       const mockMessages = [
-        { session_id: 'session-456', type: 'assistant', message: { id: 'm1' } },
+        {
+          session_id: 'session-456',
+          type: 'assistant',
+          // Point-in-time prompt size of the last request: 1000+200+100 = 1300.
+          message: {
+            id: 'm1',
+            usage: { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 200, cache_creation_input_tokens: 100 },
+          },
+        },
         {
           type: 'result',
           modelUsage: {
             [RESOLVED_DEFAULT_MODEL]: {
               inputTokens: 1000,
               outputTokens: 500,
-              cacheReadInputTokens: 200,
+              // Cumulative across the turn's round-trips — must NOT be summed.
+              cacheReadInputTokens: 2_000_000,
               cacheCreationInputTokens: 100,
               contextWindow: 200000
             }
@@ -1118,7 +1253,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(getContextUsage).toHaveBeenCalled();
@@ -1128,13 +1263,13 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       expect(contextUsageCalls).toHaveLength(1);
       expect(contextUsageCalls[0]![1].data).toEqual(expect.objectContaining({
         model: RESOLVED_DEFAULT_MODEL,
-        totalTokens: 1300, // input + cacheRead + cacheCreate
+        totalTokens: 1300, // last request's input + cache_read + cache_creation, NOT 2_001_100
         maxTokens: 200000,
         categories: []
       }));
     });
 
-    it('broadcasts baseline-only when no assistant message arrives (no live capture)', async () => {
+    it('reports 0 (never the cumulative modelUsage sum) when no assistant message arrives', async () => {
       const getContextUsage = vi.fn().mockResolvedValue({ totalTokens: 999 });
       const mockMessages = [
         { session_id: 'session-789', type: 'system' },
@@ -1155,16 +1290,17 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', broadcastFn });
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // No assistant message → captureContextUsage was never invoked
+      // No assistant message → no per-request usage captured. getSessionTokenUsage
+      // reports 0 here; we match it rather than summing the modelUsage aggregate.
       expect(getContextUsage).not.toHaveBeenCalled();
       const contextUsageCalls = broadcastFn.mock.calls.filter(
         ([, payload]) => payload?.type === 'context-usage'
       );
       expect(contextUsageCalls).toHaveLength(1);
-      expect(contextUsageCalls[0]![1].data.totalTokens).toBe(50);
+      expect(contextUsageCalls[0]![1].data.totalTokens).toBe(0);
       expect(contextUsageCalls[0]![1].data.maxTokens).toBe(200000);
     });
   });
@@ -1174,7 +1310,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(conversationsDb.getById).mockReturnValue(mockConversationWithSession as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(tasksDb.getById).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
+      setLinkedRuns([]);
     });
 
     it('should throw error if conversation not found', async () => {
@@ -1272,6 +1408,39 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         cwd: '/path/to/project',
         resume: 'existing-session-123'
       }));
+    });
+
+    it('names the operator plugins explicitly on resume — the turn that would otherwise lose them', async () => {
+      // The SDK resumes a store-backed session in a temporary CLAUDE_CONFIG_DIR
+      // with no plugins/, so without this the Figma MCP the first turn had is
+      // gone on the second (pluginConfig.ts).
+      vi.mocked(loadEnabledPlugins).mockResolvedValueOnce([
+        { type: 'local', path: '/home/op/.claude/plugins/cache/official/figma/2.2.96' },
+      ]);
+      const mockMessages = [
+        { session_id: 'existing-session-123', type: 'message' },
+        { type: 'result', modelUsage: {} }
+      ];
+      const mockIterator = {
+        [Symbol.asyncIterator]: () => ({
+          next: vi.fn()
+            .mockResolvedValueOnce({ value: mockMessages[0], done: false })
+            .mockResolvedValueOnce({ value: mockMessages[1], done: false })
+            .mockResolvedValueOnce({ done: true })
+        })
+      };
+      vi.mocked(query).mockReturnValue(mockIterator as never);
+
+      await sendMessage(1, 'Hello');
+
+      const callOptions = vi.mocked(query).mock.calls[0]![0].options as {
+        resume?: string;
+        plugins?: unknown;
+      };
+      expect(callOptions.resume).toBe('existing-session-123');
+      expect(callOptions.plugins).toEqual([
+        { type: 'local', path: '/home/op/.claude/plugins/cache/official/figma/2.2.96' },
+      ]);
     });
 
     it('should inject per-user Claude env into resumed SDK sessions', async () => {
@@ -1419,7 +1588,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         agent_type: 'review',
         status: 'running'
       };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([mockAgentRun] as never);
+      setLinkedRuns([mockAgentRun] as never);
 
       const mockMessages = [
         { session_id: 'existing-session-123', type: 'message' },
@@ -1437,7 +1606,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
 
       await sendMessage(1, 'Hello');
 
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(3, 'completed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(3, 'completed');
     });
 
     it('should throw error on SDK failure', async () => {
@@ -1461,7 +1630,9 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       // Conversation has a stored session_path (from worktree)
       const mockConversationWithWorktree = {
         id: 1,
+        owner_kind: 'task' as const,
         task_id: 1,
+        epic_id: null,
         claude_conversation_id: 'existing-session-123',
         session_path: '/path/to/project-worktrees/task-1',
         provider: 'anthropic' as const,
@@ -1506,7 +1677,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       // First start a session to track it
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(conversationsDb.create).mockReturnValue(mockConversation);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
+      setLinkedRuns([]);
       vi.mocked(tasksDb.getById).mockReturnValue(mockTaskWithProject as never);
 
       const mockMessages = [
@@ -1528,10 +1699,15 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       // Start conversation (don't await, it will hang)
-      startConversation(1, 'Hello', { model: 'opus' });
+      startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
-      // Wait for session to be tracked
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Wait deterministically for the session to be tracked instead of a
+      // fixed sleep — the setup before the first mocked SDK message touches
+      // real fs (loadMcpConfig reads ~/.claude.json), so its timing isn't
+      // bounded, especially under full-suite load.
+      await vi.waitFor(() => {
+        expect(isSessionActive('abort-test-session')).toBe(true);
+      });
 
       // Now abort
       const result = await abortSession('abort-test-session');
@@ -1546,7 +1722,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
     beforeEach(() => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(conversationsDb.create).mockReturnValue(mockConversation);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
+      setLinkedRuns([]);
       vi.mocked(tasksDb.getById).mockReturnValue(mockTaskWithProject as never);
     });
 
@@ -1586,14 +1762,15 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       // Start conversation (don't await)
-      startConversation(1, 'Hello', { model: 'opus' });
+      startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
-      // Wait for session to be tracked
-      await new Promise(resolve => setTimeout(resolve, 100));
-
-      // Now check getActiveStreamingByConversation
-      const result = getActiveStreamingByConversation(1);
-      expect(result).not.toBeNull();
+      // Wait deterministically for the session to be tracked instead of a
+      // fixed sleep — see the abort test above for why the timing isn't bounded.
+      const result = await vi.waitFor(() => {
+        const found = getActiveStreamingByConversation(1);
+        expect(found).not.toBeNull();
+        return found;
+      });
       expect(result!.sessionId).toBe('streaming-session-123');
       expect(result!.taskId).toBe(1);
       expect(result!.conversationId).toBe(1);
@@ -1619,16 +1796,16 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
       // Start conversation (don't await)
-      startConversation(1, 'Hello', { model: 'opus' });
+      startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
-      // Wait for session to be tracked
-      await new Promise(resolve => setTimeout(resolve, 100));
-
-      // Now check getAllActiveStreamingSessions
-      const sessions = getAllActiveStreamingSessions(undefined);
-      expect(sessions.length).toBeGreaterThan(0);
-      const session = sessions.find(s => s.sessionId === 'all-sessions-test-123');
-      expect(session).toBeDefined();
+      // Wait deterministically for the session to be tracked instead of a
+      // fixed sleep — see the abort test above for why the timing isn't bounded.
+      const session = await vi.waitFor(() => {
+        const sessions = getAllActiveStreamingSessions(undefined);
+        const found = sessions.find(s => s.sessionId === 'all-sessions-test-123');
+        expect(found).toBeDefined();
+        return found;
+      });
       expect(session!.taskId).toBe(1);
       expect(session!.conversationId).toBe(1);
     });
@@ -1650,10 +1827,13 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      startConversation(1, 'Hello', { model: 'opus' });
-      await new Promise(resolve => setTimeout(resolve, 100));
+      startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
-      expect(isSessionActive('active-check-session')).toBe(true);
+      // Wait deterministically for the session to be tracked instead of a
+      // fixed sleep — see the abort test above for why the timing isn't bounded.
+      await vi.waitFor(() => {
+        expect(isSessionActive('active-check-session')).toBe(true);
+      });
     });
 
     it('getActiveSessions should return session IDs', async () => {
@@ -1673,11 +1853,13 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      startConversation(1, 'Hello', { model: 'opus' });
-      await new Promise(resolve => setTimeout(resolve, 100));
+      startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus' });
 
-      const sessions = getActiveSessions();
-      expect(sessions).toContain('get-active-session-id');
+      // Wait deterministically for the session to be tracked instead of a
+      // fixed sleep — see the abort test above for why the timing isn't bounded.
+      await vi.waitFor(() => {
+        expect(getActiveSessions()).toContain('get-active-session-id');
+      });
     });
   });
 
@@ -1848,7 +2030,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         agent_type: 'implementation',
         status: 'running'
       };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([mockAgentRun] as never);
+      setLinkedRuns([mockAgentRun] as never);
 
       const mockMessages = [
         { session_id: 'session-chain', type: 'message' },
@@ -1864,7 +2046,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1 });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1 });
 
       // Wait for potential chaining
       await new Promise(resolve => setTimeout(resolve, 1500));
@@ -1880,7 +2062,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         agent_type: 'planification',
         status: 'running'
       };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([mockAgentRun] as never);
+      setLinkedRuns([mockAgentRun] as never);
 
       const mockMessages = [
         { session_id: 'session-plan', type: 'message' },
@@ -1896,7 +2078,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       };
       vi.mocked(query).mockReturnValue(mockIterator as never);
 
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1 });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1 });
 
       // Wait for potential chaining
       await new Promise(resolve => setTimeout(resolve, 1500));
@@ -1918,6 +2100,15 @@ it('should broadcast streaming-ended event when streaming completes', async () =
 
     it('should return unknown slash commands unchanged', async () => {
       expect(await _resolveSlashCommand('/nonexistent-command-xyz', '/tmp')).toBe('/nonexistent-command-xyz');
+    });
+
+    it('should expand /implement from Bottega\'s built-in commands directory', async () => {
+      const result = await _resolveSlashCommand('/implement', '/tmp/no-project');
+      // The built-in implement.md tells the agent to execute the plan and open a PR.
+      // Asserting on the leading sentence (rather than the full body) keeps the
+      // test stable if the command's wording is tweaked.
+      expect(result).not.toBe('/implement');
+      expect(result).toMatch(/Execute the plan/i);
     });
 
     it('should expand a command from user commands directory', async () => {
@@ -1963,7 +2154,9 @@ it('should broadcast streaming-ended event when streaming completes', async () =
     beforeEach(() => {
       vi.mocked(conversationsDb.getById).mockReturnValue({
         id: 1,
+        owner_kind: 'task' as const,
         task_id: 1,
+        epic_id: null,
         claude_conversation_id: 'orphan-session-1',
         session_path: '/path/to/project',
         provider: 'anthropic' as const,
@@ -1973,7 +2166,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       } as never);
       vi.mocked(tasksDb.getById).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
+      setLinkedRuns([]);
     });
 
     it('throws when no pending callback and no orphan tool_use is present', async () => {
@@ -2142,8 +2335,8 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(tasksDb.getById).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(conversationsDb.create).mockReturnValue(mockConversation);
       vi.mocked(conversationsDb.getById).mockReturnValue(mockConversationWithSession as never);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
-      vi.mocked(agentRunsDb.getByConversationId).mockReturnValue(undefined);
+      setLinkedRuns([]);
+      vi.mocked(taskAgentRunsDb.getByConversationId).mockReturnValue(undefined);
     });
 
     it('startConversation: retries once in a fresh subprocess on a 401, transparently', async () => {
@@ -2155,7 +2348,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       vi.mocked(query).mockReturnValueOnce(dead as never).mockReturnValueOnce(alive as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
       // First attempt streams, hits the 401, waits the backoff, then resumes.
       await new Promise((resolve) => setTimeout(resolve, AUTH_RETRY_BACKOFF_MS + 150));
 
@@ -2179,20 +2372,20 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       // conversation transcript. The next agent in the loop reads that
       // message and decides what to do.
       const agentRun = { id: 5, conversation_id: 1, agent_type: 'planification', status: 'running', task_id: 1 };
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([agentRun] as never);
+      setLinkedRuns([agentRun] as never);
 
       vi.mocked(query)
         .mockReturnValueOnce(iteratorThatYieldsThenThrows([{ session_id: 'session-123' }], new Error(AUTH_401_MESSAGE)) as never)
         .mockReturnValueOnce(iteratorThatYieldsThenThrows([{ session_id: 'existing-session-123' }], new Error(AUTH_401_MESSAGE)) as never);
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
       await new Promise((resolve) => setTimeout(resolve, AUTH_RETRY_BACKOFF_MS + 150));
 
       expect(query).toHaveBeenCalledTimes(2);
       expect(broadcastFn).toHaveBeenCalledWith(1, expect.objectContaining({ type: 'claude-error' }));
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(5, 'completed');
-      expect(agentRunsDb.updateStatus).not.toHaveBeenCalledWith(5, 'failed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(5, 'completed');
+      expect(taskAgentRunsDb.updateStatus).not.toHaveBeenCalledWith(5, 'failed');
     });
 
     it('startConversation: does not retry non-auth streaming errors', async () => {
@@ -2201,7 +2394,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
       );
 
       const broadcastFn = vi.fn();
-      await startConversation(1, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
+      await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       expect(query).toHaveBeenCalledTimes(1);
@@ -2269,7 +2462,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         vi.mocked(query).mockReturnValueOnce(dead as never).mockReturnValueOnce(alive as never);
 
         const broadcastFn = vi.fn();
-        await startConversation(1, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
+        await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
         await new Promise((resolve) => setTimeout(resolve, AUTH_RETRY_BACKOFF_MS + 150));
 
         expect(query).toHaveBeenCalledTimes(2);
@@ -2297,7 +2490,7 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         // synthetic sdk_error message into the transcript and marks the run
         // 'completed' so the loop can chain to the next agent.
         const agentRun = { id: 7, conversation_id: 1, agent_type: 'planification', status: 'running', task_id: 1 };
-        vi.mocked(agentRunsDb.getByTask).mockReturnValue([agentRun] as never);
+        setLinkedRuns([agentRun] as never);
 
         const dead1 = createMockIterator([
           { session_id: 'session-123' },
@@ -2307,13 +2500,13 @@ it('should broadcast streaming-ended event when streaming completes', async () =
         vi.mocked(query).mockReturnValueOnce(dead1 as never).mockReturnValueOnce(dead2 as never);
 
         const broadcastFn = vi.fn();
-        await startConversation(1, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
+        await startConversation({ kind: 'task', taskId: 1 }, 'Hello', { model: 'opus', conversationId: 1, broadcastFn });
         await new Promise((resolve) => setTimeout(resolve, AUTH_RETRY_BACKOFF_MS + 150));
 
         expect(query).toHaveBeenCalledTimes(2);
         expect(broadcastFn).toHaveBeenCalledWith(1, expect.objectContaining({ type: 'claude-error' }));
-        expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(7, 'completed');
-        expect(agentRunsDb.updateStatus).not.toHaveBeenCalledWith(7, 'failed');
+        expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(7, 'completed');
+        expect(taskAgentRunsDb.updateStatus).not.toHaveBeenCalledWith(7, 'failed');
       });
 
       it('sendMessage: in-band 401 transparently retries', async () => {

@@ -201,6 +201,14 @@ async function updateUserBadge(userId: number): Promise<unknown | null> {
 export interface NotifyClaudeCompleteOptions {
   agentType?: string | null;
   workflowComplete?: boolean;
+  /**
+   * Who drove the run whose turn just ended. 'automation' mutes the banner —
+   * the driver (the epic orchestrator today) reviews these turns itself, and
+   * a twelve-ticket epic would otherwise notify the user two dozen times
+   * about work they explicitly delegated. Badge updates stay unsuppressed.
+   * A conversation with no run behind it passes 'human' (or nothing).
+   */
+  driver?: 'human' | 'automation';
 }
 
 /**
@@ -214,7 +222,7 @@ async function notifyClaudeComplete(
   projectId: number | null,
   options: NotifyClaudeCompleteOptions = {},
 ): Promise<unknown | null> {
-  const { agentType = null, workflowComplete = false } = options;
+  const { agentType = null, workflowComplete = false, driver = 'human' } = options;
 
   // Determine if we should send notification
   // 1. User-initiated conversations (no agent) - always notify
@@ -225,6 +233,15 @@ async function notifyClaudeComplete(
     console.log(
       `[OneSignal] Skipping notification for ${agentType} agent (only PR and planification agents send notifications)`,
     );
+    return null;
+  }
+
+  // 5. An automation-driven run - skip (driver policy 3). Its driver reviews
+  // these turns; only the automation's own escalations and completions reach
+  // the user. A manual chat on the same task still notifies: the person asked
+  // directly, they get their answer.
+  if (driver === 'automation') {
+    console.log(`[OneSignal] Skipping notification for automation-driven run on task ${taskId}`);
     return null;
   }
 

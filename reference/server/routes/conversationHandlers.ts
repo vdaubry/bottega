@@ -7,6 +7,7 @@
 import type { Request, Response } from 'express';
 import { getWorktreeProjectPath, worktreeExists } from '../services/worktree.js';
 import { hasProjectAccess } from '../services/projectService.js';
+import { TaskWorktreeNotReadyError } from '../database/db.js';
 import { validateClaudeCredentials } from '../services/claudeCredentials.js';
 import type {
   ServerToClientMessage,
@@ -51,6 +52,10 @@ interface CreateConversationBody {
   // `CreateConversationBodySchema`); manual conversations pick both in the modal.
   provider: Provider;
   model: string;
+  // Explore-initiated conversation — stamped on the row right after creation
+  // (before any session starts) so the SDK injection sees the flag.
+  // Zod-refined upstream to provider === 'anthropic'.
+  atlas?: boolean;
 }
 
 // The `Request` generic accepts any param dictionary so the adapter can
@@ -89,6 +94,9 @@ export interface ConversationAdapter {
     options: StartSessionOptions,
   ): Promise<StartSessionResult>;
   getConversationById(conversationId: ConversationId): ConversationRecord;
+  // Stamp a freshly created conversation as Explore-initiated (atlas tools).
+  // Optional — only the task adapter supports it.
+  markAtlasEnabled?: (conversationId: number) => void;
   cleanupConversationOnSessionError?: boolean;
   deleteConversation(conversationId: number): void;
   sessionErrorLogPrefix: string;
@@ -123,7 +131,15 @@ export function createConversationHandler(adapter: ConversationAdapter) {
     try {
       const userId = req.user!.id;
       const entityId = adapter.getId(req);
-      const { message, projectPath, permissionMode, provider, model } = req.body || {};
+      const { message, projectPath, permissionMode, provider, model, atlas } = req.body || {};
+
+      // Stamp atlas BEFORE any session starts — the SDK injection reads the
+      // flag off the row when the first turn spawns.
+      const stampAtlas = (conv: ConversationRecord | null): void => {
+        if (conv && atlas === true && adapter.markAtlasEnabled) {
+          adapter.markAtlasEnabled(conv.id);
+        }
+      };
       // Backend + model are always explicit and zod-validated upstream
       // (provider ∈ anthropic|openai|opencode, model matches provider). Manual
       // conversations don't pick an effort, so it's null.
@@ -167,6 +183,7 @@ export function createConversationHandler(adapter: ConversationAdapter) {
         // conversation is fully determined from creation (resume reads all three
         // back off the row).
         conversation = adapter.createConversation(entityId, resolvedProvider, model, resolvedEffort);
+        stampAtlas(conversation);
         if (adapter.onConversationCreated) {
           adapter.onConversationCreated({ userId, entityId, conversation, entityWithProject });
         }
@@ -175,6 +192,7 @@ export function createConversationHandler(adapter: ConversationAdapter) {
       if (!message) {
         if (!conversation) {
           conversation = adapter.createConversation(entityId, resolvedProvider, model, resolvedEffort);
+          stampAtlas(conversation);
           if (adapter.onConversationCreated) {
             adapter.onConversationCreated({ userId, entityId, conversation, entityWithProject });
           }
@@ -236,6 +254,11 @@ export function createConversationHandler(adapter: ConversationAdapter) {
           .json({ error: 'Session creation failed: ' + sessionMessage });
       }
     } catch (error) {
+      // A task whose worktree is not ready refuses new conversations
+      // (`conversationsDb.create` checks before writing anything).
+      if (error instanceof TaskWorktreeNotReadyError) {
+        return res.status(409).json({ error: error.message });
+      }
       console.error(adapter.generalErrorLogPrefix, error);
       res.status(500).json({ error: adapter.generalErrorMessage });
     }

@@ -10,6 +10,41 @@
 
 import type { TypedResponse } from '../../shared/api/_common';
 import type {
+  AtlasFileResponse,
+  AtlasTreeResponse,
+  GenerateArtifactRequest,
+  GenerateArtifactResponse,
+  GetTaskArtifactsResponse,
+  GetTaskArtifactResponse,
+} from '../../shared/api/atlas';
+import type { ArtifactKind } from '../../shared/types/atlas';
+import type {
+  CompleteEpicPRRequest,
+  OrchestrationResponse,
+  PauseOrchestrationRequest,
+  CompleteEpicPRResponse,
+  CompleteEpicStageResponse,
+  CreateEpicAgentRunRequest,
+  CreateEpicAgentRunResponse,
+  CreateEpicResponse,
+  DeleteEpicResponse,
+  DeleteEpicSpecFileResponse,
+  GetEpicFileResponse,
+  GetEpicResponse,
+  ListEpicAgentRunsResponse,
+  ListEpicArchitectureDocsResponse,
+  ListEpicDocsResponse,
+  ListEpicQaFilesResponse,
+  ListEpicReviewDocsResponse,
+  ListEpicSpecFilesResponse,
+  ListEpicTasksResponse,
+  ListEpicsResponse,
+  UpdateEpicRequest,
+  UpdateEpicResponse,
+  UploadEpicSpecFilesResponse,
+} from '../../shared/api/epics';
+import type { EpicStageName } from '../../shared/schemas/epics';
+import type {
   AuthStatusResponse,
   AuthSuccessResponse,
   GetCurrentUserResponse,
@@ -71,8 +106,9 @@ import type {
   PushChangesRequest,
   PushChangesResponse,
   DiscardWorktreeResponse,
+  RetryWorktreeSetupResponse,
 } from '../../shared/api/tasks';
-import type { TaskStatus } from '../../shared/types/db';
+import type { ConversationRow, TaskStatus } from '../../shared/types/db';
 import type {
   ListConversationsResponse,
   CreateConversationRequest,
@@ -320,8 +356,16 @@ export const api = {
   projects: {
     list: (): TypedFetch<ListProjectsResponse> =>
       authenticatedFetch<ListProjectsResponse>('/api/projects'),
-    create: (name: string, repoFolderPath: string): TypedFetch<CreateProjectResponse> => {
-      const body: CreateProjectRequest = { name, repoFolderPath };
+    create: (
+      name: string,
+      repoFolderPath: string,
+      sensitiveAreas?: string,
+    ): TypedFetch<CreateProjectResponse> => {
+      const body: CreateProjectRequest = {
+        name,
+        repoFolderPath,
+        ...(sensitiveAreas ? { sensitiveAreas } : {}),
+      };
       return authenticatedFetch<CreateProjectResponse>('/api/projects', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -349,11 +393,16 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(config),
       }),
+    /**
+     * Point the project's served symlink at a ticket worktree, an epic's
+     * delivery worktree, or (both null) the main checkout.
+     */
     switchWebServer: (
       id: number,
-      taskId: number | null
+      taskId: number | null,
+      epicId: number | null = null
     ): TypedFetch<SwitchWebServerResponse> => {
-      const body: SwitchWebServerRequest = { taskId };
+      const body: SwitchWebServerRequest = { taskId, epicId };
       return authenticatedFetch<SwitchWebServerResponse>(`/api/projects/${id}/web-server/switch`, {
         method: 'POST',
         body: JSON.stringify(body),
@@ -415,8 +464,10 @@ export const api = {
         body: JSON.stringify(body),
       });
     },
-    delete: (id: number): TypedFetch<DeleteTaskResponse> =>
-      authenticatedFetch<DeleteTaskResponse>(`/api/tasks/${id}`, {
+    // Deleting a task deletes its worktree — same 409 contract as
+    // `mergeAndCleanup`/`discardWorktree` when it still holds work.
+    delete: (id: number, force = false): TypedFetch<DeleteTaskResponse> =>
+      authenticatedFetch<DeleteTaskResponse>(`/api/tasks/${id}${force ? '?force=true' : ''}`, {
         method: 'DELETE',
       }),
     getDoc: (id: number): TypedFetch<GetTaskDocResponse> =>
@@ -452,8 +503,16 @@ export const api = {
     },
     getPR: (id: number): TypedFetch<GetPRResponse> =>
       authenticatedFetch<GetPRResponse>(`/api/tasks/${id}/pull-request`),
-    mergeAndCleanup: (id: number): TypedFetch<MergeAndCleanupResponse> =>
-      authenticatedFetch<MergeAndCleanupResponse>(`/api/tasks/${id}/merge-cleanup`, {
+    // `force` discards uncommitted/unpushed work in the worktree; without it the
+    // server answers 409 `UnsavedWorktreeWorkResponse` (see `useWorktreeGuard`).
+    mergeAndCleanup: (id: number, force = false): TypedFetch<MergeAndCleanupResponse> =>
+      authenticatedFetch<MergeAndCleanupResponse>(
+        `/api/tasks/${id}/merge-cleanup${force ? '?force=true' : ''}`,
+        { method: 'POST' },
+      ),
+    // Retry a failed worktree setup; it runs in the background again.
+    retryWorktreeSetup: (id: number): TypedFetch<RetryWorktreeSetupResponse> =>
+      authenticatedFetch<RetryWorktreeSetupResponse>(`/api/tasks/${id}/worktree/retry`, {
         method: 'POST',
       }),
     discardWorktree: (id: number, force = false): TypedFetch<DiscardWorktreeResponse> =>
@@ -505,16 +564,25 @@ export const api = {
   conversations: {
     list: (taskId: number): TypedFetch<ListConversationsResponse> =>
       authenticatedFetch<ListConversationsResponse>(`/api/tasks/${taskId}/conversations`),
+    // An <img> cannot send the Authorization header, so the URL carries
+    // `?token=` — the query-token auth path the review-recording player uses.
+    imageUrl: (conversationId: number, fileName: string): string => {
+      const token = localStorage.getItem('auth-token');
+      return `/api/conversations/${conversationId}/images/${encodeURIComponent(fileName)}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    },
     // Pre-create an empty conversation row stamped with an explicit backend +
-    // model (no message → no LLM session is started yet).
+    // model (no message → no LLM session is started yet). `atlas: true` flags
+    // an Explore-initiated conversation (anthropic-only) so its sessions get
+    // the code-atlas MCP tools.
     create: (
       taskId: number,
       provider: Provider,
       model: string,
+      options: { atlas?: boolean } = {},
     ): TypedFetch<CreateConversationResponse> =>
       authenticatedFetch<CreateConversationResponse>(`/api/tasks/${taskId}/conversations`, {
         method: 'POST',
-        body: JSON.stringify({ provider, model }),
+        body: JSON.stringify({ provider, model, ...options }),
       }),
     // Create conversation with first message - returns conversation with real claude_conversation_id
     createWithMessage: (
@@ -553,6 +621,35 @@ export const api = {
       authenticatedFetch<GetContextUsageResponse>(`/api/conversations/${id}/context-usage`),
   },
 
+  // Explore (code-atlas) endpoints — task-scoped read-only workspace access
+  // plus the schema-generation conversation starter.
+  atlas: {
+    tree: (taskId: number, path = ''): TypedFetch<AtlasTreeResponse> => {
+      const params = new URLSearchParams();
+      if (path) params.append('path', path);
+      const queryString = params.toString();
+      return authenticatedFetch<AtlasTreeResponse>(
+        `/api/tasks/${taskId}/atlas/tree${queryString ? '?' + queryString : ''}`,
+      );
+    },
+    file: (taskId: number, path: string): TypedFetch<AtlasFileResponse> =>
+      authenticatedFetch<AtlasFileResponse>(
+        `/api/tasks/${taskId}/atlas/file?${new URLSearchParams({ path }).toString()}`,
+      ),
+    getArtifacts: (taskId: number): TypedFetch<GetTaskArtifactsResponse> =>
+      authenticatedFetch<GetTaskArtifactsResponse>(`/api/tasks/${taskId}/atlas/artifacts`),
+    getArtifact: (taskId: number, kind: ArtifactKind): TypedFetch<GetTaskArtifactResponse> =>
+      authenticatedFetch<GetTaskArtifactResponse>(`/api/tasks/${taskId}/atlas/artifact/${kind}`),
+    generateArtifact: (
+      taskId: number,
+      body: GenerateArtifactRequest,
+    ): TypedFetch<GenerateArtifactResponse> =>
+      authenticatedFetch<GenerateArtifactResponse>(`/api/tasks/${taskId}/atlas/generate-artifact`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+  },
+
   // Agent Runs API (for automated agent workflows on tasks)
   agentRuns: {
     list: (taskId: number): TypedFetch<ListAgentRunsResponse> =>
@@ -589,6 +686,121 @@ export const api = {
     delete: (id: number): TypedFetch<DeleteAgentRunResponse> =>
       authenticatedFetch<DeleteAgentRunResponse>(`/api/agent-runs/${id}`, {
         method: 'DELETE',
+      }),
+  },
+
+  // Epics. `create` is multipart — authenticatedFetch skips Content-Type for
+  // FormData so the browser sets the boundary. Creating an epic starts no
+  // agent; stages are started explicitly via `startAgentRun`.
+  epics: {
+    create: (projectId: number, formData: FormData): TypedFetch<CreateEpicResponse> =>
+      authenticatedFetch<CreateEpicResponse>(`/api/projects/${projectId}/epics`, {
+        method: 'POST',
+        body: formData,
+      }),
+    list: (projectId: number): TypedFetch<ListEpicsResponse> =>
+      authenticatedFetch<ListEpicsResponse>(`/api/projects/${projectId}/epics`),
+    get: (id: number): TypedFetch<GetEpicResponse> =>
+      authenticatedFetch<GetEpicResponse>(`/api/epics/${id}`),
+    update: (id: number, updates: UpdateEpicRequest): TypedFetch<UpdateEpicResponse> =>
+      authenticatedFetch<UpdateEpicResponse>(`/api/epics/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updates),
+      }),
+    delete: (id: number): TypedFetch<DeleteEpicResponse> =>
+      authenticatedFetch<DeleteEpicResponse>(`/api/epics/${id}`, {
+        method: 'DELETE',
+      }),
+    completeStage: (id: number, stage: EpicStageName): TypedFetch<CompleteEpicStageResponse> =>
+      authenticatedFetch<CompleteEpicStageResponse>(`/api/epics/${id}/stages/${stage}/complete`, {
+        method: 'POST',
+      }),
+    listSpecFiles: (id: number): TypedFetch<ListEpicSpecFilesResponse> =>
+      authenticatedFetch<ListEpicSpecFilesResponse>(`/api/epics/${id}/spec-files`),
+    getSpecFile: (id: number, filename: string): TypedFetch<GetEpicFileResponse> =>
+      authenticatedFetch<GetEpicFileResponse>(
+        `/api/epics/${id}/spec-files/${encodeURIComponent(filename)}`,
+      ),
+    uploadSpecFiles: (id: number, formData: FormData): TypedFetch<UploadEpicSpecFilesResponse> =>
+      authenticatedFetch<UploadEpicSpecFilesResponse>(`/api/epics/${id}/spec-files`, {
+        method: 'POST',
+        body: formData,
+      }),
+    deleteSpecFile: (id: number, filename: string): TypedFetch<DeleteEpicSpecFileResponse> =>
+      authenticatedFetch<DeleteEpicSpecFileResponse>(
+        `/api/epics/${id}/spec-files/${encodeURIComponent(filename)}`,
+        { method: 'DELETE' },
+      ),
+    listArchitectureDocs: (id: number): TypedFetch<ListEpicArchitectureDocsResponse> =>
+      authenticatedFetch<ListEpicArchitectureDocsResponse>(`/api/epics/${id}/architecture`),
+    getArchitectureDoc: (id: number, filename: string): TypedFetch<GetEpicFileResponse> =>
+      authenticatedFetch<GetEpicFileResponse>(
+        `/api/epics/${id}/architecture/${encodeURIComponent(filename)}`,
+      ),
+    listDocs: (id: number): TypedFetch<ListEpicDocsResponse> =>
+      authenticatedFetch<ListEpicDocsResponse>(`/api/epics/${id}/docs`),
+    getDoc: (id: number, filename: string): TypedFetch<GetEpicFileResponse> =>
+      authenticatedFetch<GetEpicFileResponse>(
+        `/api/epics/${id}/docs/${encodeURIComponent(filename)}`,
+      ),
+    listReviewDocs: (id: number): TypedFetch<ListEpicReviewDocsResponse> =>
+      authenticatedFetch<ListEpicReviewDocsResponse>(`/api/epics/${id}/review`),
+    getReviewDoc: (id: number, filename: string): TypedFetch<GetEpicFileResponse> =>
+      authenticatedFetch<GetEpicFileResponse>(
+        `/api/epics/${id}/review/${encodeURIComponent(filename)}`,
+      ),
+    listQaFiles: (id: number): TypedFetch<ListEpicQaFilesResponse> =>
+      authenticatedFetch<ListEpicQaFilesResponse>(`/api/epics/${id}/qa`),
+    getQaFile: (id: number, filename: string): TypedFetch<GetEpicFileResponse> =>
+      authenticatedFetch<GetEpicFileResponse>(
+        `/api/epics/${id}/qa/${encodeURIComponent(filename)}`,
+      ),
+    // A plain <a href> cannot send the Authorization header, so the download
+    // link carries `?token=` — the query-token auth path the review-recording
+    // player already uses.
+    qaFileDownloadUrl: (id: number, filename: string): string => {
+      const token = localStorage.getItem('auth-token');
+      return `/api/epics/${id}/qa/${encodeURIComponent(filename)}/download${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    },
+    listTasks: (id: number): TypedFetch<ListEpicTasksResponse> =>
+      authenticatedFetch<ListEpicTasksResponse>(`/api/epics/${id}/tasks`),
+    listAgentRuns: (id: number): TypedFetch<ListEpicAgentRunsResponse> =>
+      authenticatedFetch<ListEpicAgentRunsResponse>(`/api/epics/${id}/agent-runs`),
+    startAgentRun: (
+      id: number,
+      agentType: CreateEpicAgentRunRequest['agentType'],
+    ): TypedFetch<CreateEpicAgentRunResponse> => {
+      const body: CreateEpicAgentRunRequest = { agentType };
+      return authenticatedFetch<CreateEpicAgentRunResponse>(`/api/epics/${id}/agent-runs`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    listConversations: (id: number): TypedFetch<ConversationRow[]> =>
+      authenticatedFetch<ConversationRow[]>(`/api/epics/${id}/conversations`),
+    startOrchestration: (id: number): TypedFetch<OrchestrationResponse> =>
+      authenticatedFetch<OrchestrationResponse>(`/api/epics/${id}/orchestrator/start`, {
+        method: 'POST',
+      }),
+    pauseOrchestration: (
+      id: number,
+      request: PauseOrchestrationRequest = {},
+    ): TypedFetch<OrchestrationResponse> =>
+      authenticatedFetch<OrchestrationResponse>(`/api/epics/${id}/orchestrator/pause`, {
+        method: 'POST',
+        body: JSON.stringify(request),
+      }),
+    resumeOrchestration: (id: number): TypedFetch<OrchestrationResponse> =>
+      authenticatedFetch<OrchestrationResponse>(`/api/epics/${id}/orchestrator/resume`, {
+        method: 'POST',
+      }),
+    completePR: (
+      id: number,
+      request: CompleteEpicPRRequest = {},
+    ): TypedFetch<CompleteEpicPRResponse> =>
+      authenticatedFetch<CompleteEpicPRResponse>(`/api/epics/${id}/complete-pr`, {
+        method: 'POST',
+        body: JSON.stringify(request),
       }),
   },
 

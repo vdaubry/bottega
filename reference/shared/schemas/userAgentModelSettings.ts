@@ -8,12 +8,15 @@
 
 import { z } from 'zod';
 import { isModelForProvider, isEffortForProvider } from '../providers/models.js';
-import { AGENT_TYPES_WITH_SETTINGS } from '../types/agentModelSettings.js';
-import type { AgentType } from '../types/db.js';
+import {
+  AGENT_TYPES_WITH_SETTINGS,
+  ANTHROPIC_LOCKED_KEYS,
+  type AgentModelKey,
+} from '../types/agentModelSettings.js';
 
 // One (provider, model, effort) triple. `model`/`effort` are validated against
 // the provider's catalog (reusing the same guards the loader uses) so a
-// cross-provider mismatch (e.g. anthropic + gpt-5.5) is rejected at the
+// cross-provider mismatch (e.g. anthropic + gpt-6.1-sol) is rejected at the
 // boundary. effort is null when the provider has no reasoning dimension.
 const AgentModelSettingSchema = z
   .object({
@@ -43,8 +46,21 @@ export const PutUserAgentModelSettingsBodySchema = z
   .object(
     Object.fromEntries(
       AGENT_TYPES_WITH_SETTINGS.map((agent) => [agent, AgentModelSettingSchema]),
-    ) as Record<AgentType, typeof AgentModelSettingSchema>,
+    ) as Record<AgentModelKey, typeof AgentModelSettingSchema>,
   )
-  .strict();
+  .strict()
+  // The Explore/schema entry remains Anthropic-only because code-atlas is an
+  // in-process Claude service. Epic stages use the portable MCP runtime.
+  .superRefine((body, ctx) => {
+    for (const key of ANTHROPIC_LOCKED_KEYS) {
+      if (body[key].provider !== 'anthropic') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `'${key}' is Anthropic-only (its provider must be 'anthropic')`,
+          path: [key, 'provider'],
+        });
+      }
+    }
+  });
 
 export type PutUserAgentModelSettingsBody = z.infer<typeof PutUserAgentModelSettingsBodySchema>;

@@ -7,12 +7,10 @@
 // OpenCode.
 //
 // Per docs/tasks/codex-support.md § D2 + § D5:
-//   - Anthropic models: Sonnet, Opus (no Haiku).
-//   - OpenAI models: GPT-5.5, GPT-5.4, GPT-5.4 mini.
+//   - Anthropic models: Sonnet, Opus, Fable (no Haiku).
+//   - OpenAI models: GPT-6 Astra, GPT-6.1 Sol.
 //   - Anthropic efforts: low / medium / high / xhigh / max.
-//   - OpenAI efforts: minimal / low / medium / high / xhigh
-//     (mirrors the TS Codex SDK's `ModelReasoningEffort` union — see
-//     `openai/codex/sdk/typescript/src/threadOptions.ts`).
+//   - OpenAI efforts: medium / high / xhigh.
 //
 // Per docs/opencode/00-context-decisions.md § R15 + § D5 + § D6:
 //   - OpenCode models: curated subset of the Zen catalog, prefixed
@@ -22,16 +20,34 @@
 
 import type { Provider } from './types.js';
 
-export const ANTHROPIC_MODELS = ['sonnet', 'opus'] as const;
+export const ANTHROPIC_MODELS = ['sonnet', 'opus', 'fable'] as const;
 export type AnthropicModel = (typeof ANTHROPIC_MODELS)[number];
 
 export const ANTHROPIC_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type AnthropicEffort = (typeof ANTHROPIC_EFFORTS)[number];
 
-export const OPENAI_MODELS = ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] as const;
+// Newest first: index 0 is what `firstModelFor` offers as the default model
+// for a fresh OpenAI conversation.
+//
+// A model id is only usable if the codex binary bundled with the pinned
+// `@openai/codex-sdk` knows it — an id the binary has never heard of fails at
+// the SDK boundary, not here (see `reference_codex_model_version_gate`).
+// `gpt-6.1-sol` requires @openai/codex-sdk >= 0.159.x; the 0.156 binary this
+// repo shipped before carried `gpt-6-sol` but not `gpt-6.1-sol`. Retired ids
+// (GPT-5.5, GPT-5.6 Sol, GPT-5.4, GPT-5.4 mini, GPT-6 Sol) are rewritten on persisted
+// settings by `migrateRetiredOpenAiModels`.
+export const OPENAI_MODELS = ['gpt-6-astra', 'gpt-6.1-sol'] as const;
 export type OpenAIModel = (typeof OPENAI_MODELS)[number];
 
-export const OPENAI_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+// The intersection every model in `OPENAI_MODELS` accepts, so one flat
+// per-provider list stays correct whichever model a row is paired with.
+// `minimal` and `low` were retired when GPT-6 Astra landed: Astra's documented
+// `reasoning.effort` range starts at `low` and it rejects the Codex CLI's
+// `minimal`. Rows persisted under the old list are rewritten by
+// `migrateRetiredOpenAiEfforts` — the settings loader is fail-loud, so an
+// effort dropped from here without that rewrite would break every agent run
+// for the user who had selected it.
+export const OPENAI_EFFORTS = ['medium', 'high', 'xhigh'] as const;
 export type OpenAIEffort = (typeof OPENAI_EFFORTS)[number];
 
 // The Zen catalog is owned by OpenCode (≈40 models, churned by their

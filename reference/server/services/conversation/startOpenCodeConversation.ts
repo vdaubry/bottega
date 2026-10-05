@@ -21,20 +21,23 @@
 //   - Drives `activeSessions`, the streaming lifecycle, and the
 //     agent-run completion handler.
 //
+// Provider-neutral features supplied by Bottega:
+//   - AskUserQuestion semantics through the durable `ask_user` MCP tool.
+//   - Owner-domain tools through a per-turn loopback MCP gateway.
+//
 // What this branch does NOT do (capability flags from D8 + R1):
-//   - No AskUserQuestion / canUseTool (OpenCode has no canUseTool).
-//   - No MCP wait (OpenCode's MCP isn't wired through Bottega in v1).
 //   - No image attachments (v1).
 //   - No thinking-delta accumulator (ReasoningPart is emitted whole).
 //   - No live `getContextUsage()` breakdown.
-//   - Review agents are allowed (R1) but `videoConfig` is dropped for
-//     them — Playwright capture isn't wired through OpenCode's worktree
-//     reflection.
+//
+// Review agents DO get the operator's MCP servers (Playwright included) and a
+// `videoConfig`: `loadOperatorMcpServers` translates `~/.claude.json` into
+// OpenCode's `mcp.add` shape on every turn, so the old "degraded review" R1
+// carve-out no longer applies.
 
 import { promises as fs } from 'fs';
-import { agentRunsDb, conversationsDb, tasksDb } from '../../database/db.js';
+import { conversationsDb } from '../../database/conversations.js';
 import { resolveResumeModelEffort } from '../agentModelSettings.js';
-import { getWorktreeProjectPath, worktreeExists } from '../worktree.js';
 import { generateConversationTitle } from '../titleGenerator.js';
 import { createContextUsageTracker } from '../contextUsageTracker.js';
 import { getCredentialStore } from '../credentials/registry.js';
@@ -48,16 +51,27 @@ import {
   handleStreamingComplete,
   composeAsync,
 } from './streamingLifecycle.js';
-import { buildAgentRunCompletionHandler } from './agentRunLifecycle.js';
+import {
+  buildAgentRunCompletionHandler,
+  failLinkedAgentRunIfRunning,
+  handleAgentRunTurnStarted,
+} from './agentRunLifecycle.js';
 import { resolveSlashCommand } from './slashCommands.js';
+import {
+  type ConversationTarget,
+} from './conversationScope.js';
+import { resolveProviderResumeScope, resolveProviderStartScope } from './providerScope.js';
+import { mcpGatewayExtras, ownerDisallowedTools, startOwnerMcpGateway } from './portableMcpForTurn.js';
+import { loadOperatorMcpServers } from './operatorMcpForTurn.js';
+import { consumeQuestionDeferred, isQuestionDeferred } from './portableQuestionTool.js';
 import type { ConversationOptions, StreamingContext } from './types.js';
 import type { BroadcastFn } from '@shared/websocket/messages';
 import type { UnifiedMessage } from '@shared/providers/types';
 
 function composeOnComplete(ctx: StreamingContext): () => Promise<void> {
   return composeAsync<void>(
-    () => handleStreamingComplete(ctx),
     buildAgentRunCompletionHandler(ctx),
+    () => handleStreamingComplete(ctx),
   );
 }
 
@@ -147,6 +161,8 @@ function unifiedToWireMessage(unified: UnifiedMessage): Record<string, unknown> 
       };
     case 'stream_delta':
       return null;
+    case 'assistant_image':
+      return null; // Only Codex reports generated images today.
   }
 }
 
@@ -170,37 +186,6 @@ function broadcastUnified(
 }
 
 /**
- * Pre-mark a still-running agent run as 'failed' the instant we see a
- * `result` event with `isError: true`. Without this the streaming loop
- * ends normally (no thrown exception — OpenCode reports model errors as
- * SSE events, not HTTP errors), composeOnComplete sees status='running'
- * → marks 'completed' → auto-chains → next agent fails the same way →
- * runaway loop until MAX_WORKFLOW_RUNS=25 trips. Setting the status
- * here makes composeOnComplete's "status === 'failed' → no-op" branch
- * fire instead. Safe to call when there is no taskId or no linked
- * agent run (no-op).
- */
-function failLinkedAgentRunIfRunning(
-  taskId: number | undefined,
-  conversationId: number,
-): void {
-  if (!taskId) return;
-  try {
-    const runs = agentRunsDb.getByTask(taskId);
-    const linked = runs.find((r) => r.conversation_id === conversationId);
-    if (linked && linked.status === 'running') {
-      agentRunsDb.updateStatus(linked.id, 'failed');
-    }
-  } catch (err) {
-    // Best-effort: never throw out of an error-handling path.
-    console.warn(
-      '[ConversationAdapter] failed to pre-mark OpenCode agent run as failed:',
-      err,
-    );
-  }
-}
-
-/**
  * Resume an existing OpenCode conversation. Mirrors `sendMessage` for
  * the Anthropic path: looks the conversation up, builds the per-user
  * env, and calls `openCodeProvider.sendTurnMessage(resumeSessionId)`.
@@ -211,8 +196,14 @@ export async function sendOpenCodeMessage(
   options: ConversationOptions = {},
 ): Promise<void> {
   const normalizedOptions = validateAndNormalizeOptions(options, 'sendOpenCodeMessage');
-  const { broadcastFn, broadcastToTaskSubscribersFn, userId, permissionMode } =
-    normalizedOptions;
+  const {
+    broadcastFn,
+    broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
+    userId,
+    permissionMode,
+    videoConfig,
+  } = normalizedOptions;
 
   const conversation = conversationsDb.getById(conversationId);
   if (!conversation) {
@@ -226,26 +217,9 @@ export async function sendOpenCodeMessage(
     );
   }
 
-  const taskId = conversation.task_id;
-  const taskWithProject = taskId ? tasksDb.getWithProject(taskId) : null;
-  if (!taskWithProject) {
-    throw new Error(`Task for conversation ${conversationId} not found`);
-  }
-  const projectId = taskWithProject.project_id;
-
-  let projectPath: string;
-  if (conversation.session_path) {
-    projectPath = conversation.session_path;
-  } else {
-    projectPath = taskWithProject.repo_folder_path;
-    if (await worktreeExists(projectPath, taskId!)) {
-      projectPath = getWorktreeProjectPath(
-        projectPath,
-        taskId!,
-        taskWithProject.subproject_path,
-      );
-    }
-  }
+  const scope = await resolveProviderResumeScope(conversation);
+  const { taskId, epicId, projectId } = scope;
+  const projectPath = conversation.session_path ?? scope.cwd;
 
   const openCodeEnv = getCredentialStore('opencode').buildSdkEnv(userId);
   const promptText = message ?? '';
@@ -263,29 +237,49 @@ export async function sendOpenCodeMessage(
   }
 
   const abortController = new AbortController();
-  const run = await openCodeProvider.sendTurnMessage({
-    cwd: projectPath,
-    prompt: promptText,
-    resumeSessionId,
-    model,
-    effort: null,
-    ...(permissionMode !== undefined ? { permissionMode } : {}),
-    env: openCodeEnv,
-    abortController,
-  });
+  const mcpGateway = await startOwnerMcpGateway(scope, conversationId, normalizedOptions);
+  // The operator's own MCP servers (Playwright above all) — the Claude path
+  // gets these through `sdkOptions.mcpServers`; OpenCode gets them here.
+  const operatorMcpServers = await loadOperatorMcpServers(projectPath, videoConfig);
+  const disallowedTools = [
+    ...new Set([
+      ...(normalizedOptions.disallowedTools ?? []),
+      ...ownerDisallowedTools(scope, conversationId),
+    ]),
+  ];
+  let run;
+  try {
+    run = await openCodeProvider.sendTurnMessage({
+      cwd: projectPath,
+      prompt: promptText,
+      resumeSessionId,
+      model,
+      effort: null,
+      ...(permissionMode !== undefined ? { permissionMode } : {}),
+      env: openCodeEnv,
+      abortController,
+      extras: mcpGatewayExtras(mcpGateway, operatorMcpServers),
+      disallowedTools,
+    });
+  } catch (error) {
+    await mcpGateway?.close();
+    throw error;
+  }
 
   const ctx: StreamingContext = {
     conversationId,
     taskId: taskId ?? undefined,
+    epicId: epicId ?? undefined,
     claudeSessionId: resumeSessionId,
     userId,
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     isNewSession: false,
   };
 
   activeSessions.set(resumeSessionId, {
-    instance: run as unknown,
+    instance: run,
     abortController,
     startTime: Date.now(),
     status: 'active',
@@ -293,10 +287,19 @@ export async function sendOpenCodeMessage(
     tempDir: null,
     conversationId,
     taskId: taskId ?? null,
+    epicId,
     projectId,
     userId: userId ?? null,
   });
 
+  try {
+    await handleAgentRunTurnStarted(ctx);
+  } catch (error) {
+    run.abort();
+    activeSessions.delete(resumeSessionId);
+    await mcpGateway?.close();
+    throw error;
+  }
   handleStreamingStarted(ctx);
 
   const contextUsageTracker = createContextUsageTracker({
@@ -314,8 +317,8 @@ export async function sendOpenCodeMessage(
         console.warn('[ConversationAdapter] OpenCode resume mirror failed:', err);
       });
       if (unified.type === 'result') {
-        if (unified.isError) {
-          failLinkedAgentRunIfRunning(taskId ?? undefined, conversationId);
+        if (unified.isError && !isQuestionDeferred(conversationId)) {
+          failLinkedAgentRunIfRunning(conversationId);
         }
         await contextUsageTracker.onResult({
           type: 'result',
@@ -325,6 +328,10 @@ export async function sendOpenCodeMessage(
     }
 
     activeSessions.delete(resumeSessionId);
+    if (consumeQuestionDeferred(conversationId)) {
+      await handleStreamingComplete(ctx);
+      return;
+    }
     if (broadcastFn) {
       broadcastFn(conversationId, {
         type: 'claude-complete',
@@ -337,6 +344,10 @@ export async function sendOpenCodeMessage(
   } catch (error) {
     console.error('[ConversationAdapter] OpenCode resume error:', error);
     activeSessions.delete(resumeSessionId);
+    if (consumeQuestionDeferred(conversationId)) {
+      await handleStreamingComplete(ctx);
+      return;
+    }
     if (broadcastFn) {
       const errMsg = error instanceof Error ? error.message : String(error);
       broadcastFn(conversationId, {
@@ -346,18 +357,22 @@ export async function sendOpenCodeMessage(
     }
     await composeOnComplete(ctx)();
     throw error;
+  } finally {
+    await mcpGateway?.close();
   }
 }
 
 export async function startOpenCodeConversation(
-  taskId: number,
+  targetOrTaskId: ConversationTarget | number,
   message: string,
   options: ConversationOptions = {},
 ): Promise<{ conversationId: number; claudeSessionId: string }> {
+  const { target, scope } = await resolveProviderStartScope(targetOrTaskId);
   const normalizedOptions = validateAndNormalizeOptions(options, 'startOpenCodeConversation');
   const {
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     userId,
     permissionMode,
     images,
@@ -372,15 +387,8 @@ export async function startOpenCodeConversation(
     throw new Error('startOpenCodeConversation requires an explicit model');
   }
 
-  const taskWithProject = tasksDb.getWithProject(taskId);
-  if (!taskWithProject) {
-    throw new Error(`Task ${taskId} not found`);
-  }
-
-  let projectPath = taskWithProject.repo_folder_path;
-  if (await worktreeExists(projectPath, taskId)) {
-    projectPath = getWorktreeProjectPath(projectPath, taskId, taskWithProject.subproject_path);
-  }
+  const { taskId, epicId, projectId } = scope;
+  const projectPath = scope.cwd;
 
   // Per-user OpenCode env (Zen API key). Throws if the user has no
   // provisioned auth.json, matching Claude/Codex fail-closed posture.
@@ -388,10 +396,12 @@ export async function startOpenCodeConversation(
 
   let conversationId = options.conversationId;
   if (!conversationId) {
-    const conversation = conversationsDb.create(taskId, 'opencode', model, null);
+    const conversation = target.kind === 'epic'
+      ? conversationsDb.createForEpic(target.epicId, 'opencode', model, null)
+      : conversationsDb.create(target.taskId, 'opencode', model, null);
     conversationId = conversation.id;
     console.log(
-      `[ConversationAdapter] Created OpenCode conversation ${conversationId} for task ${taskId} (model=${model})`,
+      `[ConversationAdapter] Created OpenCode conversation ${conversationId} for ${target.kind} ${taskId ?? epicId} (model=${model})`,
     );
   }
 
@@ -406,16 +416,28 @@ export async function startOpenCodeConversation(
     (customSystemPrompt ? `\n\n[System]\n${customSystemPrompt}` : '');
 
   const abortController = new AbortController();
-
-  const run = await openCodeProvider.startTurn({
-    cwd: projectPath,
-    prompt: promptText,
-    model,
-    effort: null,
-    ...(permissionMode !== undefined ? { permissionMode } : {}),
-    env: openCodeEnv,
-    abortController,
-  });
+  const mcpGateway = await startOwnerMcpGateway(scope, conversationId, normalizedOptions);
+  // The operator's own MCP servers (Playwright above all) — the Claude path
+  // gets these through `sdkOptions.mcpServers`; OpenCode gets them here.
+  const operatorMcpServers = await loadOperatorMcpServers(projectPath, videoConfig);
+  let run;
+  try {
+    run = await openCodeProvider.startTurn({
+      cwd: projectPath,
+      prompt: promptText,
+      model,
+      effort: null,
+      ...(permissionMode !== undefined ? { permissionMode } : {}),
+      env: openCodeEnv,
+      abortController,
+      extras: mcpGatewayExtras(mcpGateway, operatorMcpServers),
+      disallowedTools: normalizedOptions.disallowedTools,
+    });
+  } catch (error) {
+    await mcpGateway?.close();
+    await cleanupTempFiles(imageResult.tempImagePaths, imageResult.tempDir);
+    throw error;
+  }
 
   const { tempImagePaths, tempDir } = imageResult;
 
@@ -426,18 +448,20 @@ export async function startOpenCodeConversation(
     }, 60000);
 
     const ctx: StreamingContext = {
-      conversationId: conversationId!,
+      conversationId: conversationId,
       taskId,
+      epicId,
       claudeSessionId: null,
       userId,
       broadcastFn,
       broadcastToTaskSubscribersFn,
+      broadcastToEpicSubscribersFn,
       isNewSession: true,
       videoConfig,
     };
 
     const contextUsageTracker = createContextUsageTracker({
-      conversationId: conversationId!,
+      conversationId: conversationId,
       broadcastFn,
     });
 
@@ -458,50 +482,65 @@ export async function startOpenCodeConversation(
           ) {
             const sid = unified.providerSessionId;
             ctx.claudeSessionId = sid;
-            conversationsDb.updateClaudeId(conversationId!, sid);
-            conversationsDb.updateProviderSessionId(conversationId!, sid);
-            conversationsDb.updateSessionPath(conversationId!, projectPath);
+            conversationsDb.updateClaudeId(conversationId, sid);
+            conversationsDb.updateProviderSessionId(conversationId, sid);
+            conversationsDb.updateSessionPath(conversationId, projectPath);
             activeSessions.set(sid, {
-              instance: run as unknown,
+              instance: run,
               abortController,
               startTime: Date.now(),
               status: 'active',
               tempImagePaths,
               tempDir,
-              conversationId: conversationId!,
+              conversationId: conversationId,
               taskId,
-              projectId: taskWithProject.project_id,
+              epicId,
+              projectId,
               userId: userId ?? null,
             });
 
-            generateConversationTitle(
-              conversationId!,
-              message,
+            generateConversationTitle(conversationId, message, {
               broadcastFn,
               userId,
-              taskId,
+              ...(taskId != null ? { taskId } : {}),
+              ...(epicId != null ? { epicId } : {}),
               broadcastToTaskSubscribersFn,
-            );
+              broadcastToEpicSubscribersFn,
+            });
 
+            await handleAgentRunTurnStarted(ctx);
             handleStreamingStarted(ctx);
 
             if (broadcastFn) {
-              broadcastFn(conversationId!, {
+              broadcastFn(conversationId, {
                 type: 'conversation-created',
-                conversationId: conversationId!,
+                conversationId: conversationId,
                 claudeSessionId: sid,
               });
-              broadcastFn(conversationId!, {
+              broadcastFn(conversationId, {
                 type: 'session-created',
                 sessionId: sid,
               });
             }
-            if (broadcastToTaskSubscribersFn) {
+            if (broadcastToTaskSubscribersFn && taskId != null) {
               broadcastToTaskSubscribersFn(taskId, {
                 type: 'conversation-added',
                 conversation: {
-                  id: conversationId!,
+                  id: conversationId,
                   task_id: taskId,
+                  epic_id: epicId,
+                  claude_conversation_id: sid,
+                  created_at: new Date().toISOString(),
+                },
+              });
+            }
+            if (broadcastToEpicSubscribersFn && epicId != null) {
+              broadcastToEpicSubscribersFn(epicId, {
+                type: 'conversation-added',
+                conversation: {
+                  id: conversationId,
+                  task_id: taskId,
+                  epic_id: epicId,
                   claude_conversation_id: sid,
                   created_at: new Date().toISOString(),
                 },
@@ -510,10 +549,10 @@ export async function startOpenCodeConversation(
 
             clearTimeout(timeout);
             resolved = true;
-            resolve({ conversationId: conversationId!, claudeSessionId: sid });
+            resolve({ conversationId: conversationId, claudeSessionId: sid });
           }
 
-          broadcastUnified(broadcastFn, conversationId!, unified);
+          broadcastUnified(broadcastFn, conversationId, unified);
 
           if (ctx.claudeSessionId) {
             if (preSessionBuffer.length > 0) {
@@ -543,8 +582,8 @@ export async function startOpenCodeConversation(
           }
 
           if (unified.type === 'result') {
-            if (unified.isError) {
-              failLinkedAgentRunIfRunning(taskId, conversationId!);
+            if (unified.isError && !isQuestionDeferred(conversationId)) {
+              failLinkedAgentRunIfRunning(conversationId);
             }
             await contextUsageTracker.onResult({
               type: 'result',
@@ -556,13 +595,18 @@ export async function startOpenCodeConversation(
         if (ctx.claudeSessionId) {
           activeSessions.delete(ctx.claudeSessionId);
         }
+        if (consumeQuestionDeferred(conversationId)) {
+          await cleanupTempFiles(tempImagePaths, tempDir);
+          await handleStreamingComplete(ctx);
+          return;
+        }
         await cleanupTempFiles(tempImagePaths, tempDir);
         if (ctx.videoConfig) {
           await handleVideoRecording(ctx.videoConfig);
         }
 
         if (broadcastFn) {
-          broadcastFn(conversationId!, {
+          broadcastFn(conversationId, {
             type: 'claude-complete',
             sessionId: ctx.claudeSessionId,
             exitCode: 0,
@@ -576,6 +620,11 @@ export async function startOpenCodeConversation(
         if (ctx.claudeSessionId) {
           activeSessions.delete(ctx.claudeSessionId);
         }
+        if (consumeQuestionDeferred(conversationId)) {
+          await cleanupTempFiles(tempImagePaths, tempDir);
+          await handleStreamingComplete(ctx);
+          return;
+        }
         await cleanupTempFiles(tempImagePaths, tempDir);
         if (ctx.videoConfig?.tempDir) {
           await fs.rm(ctx.videoConfig.tempDir, { recursive: true, force: true }).catch(() => {});
@@ -588,12 +637,14 @@ export async function startOpenCodeConversation(
         }
         if (broadcastFn) {
           const errMsg = error instanceof Error ? error.message : String(error);
-          broadcastFn(conversationId!, {
+          broadcastFn(conversationId, {
             type: 'claude-error',
             error: errMsg,
           });
         }
         await composeOnComplete(ctx)();
+      } finally {
+        await mcpGateway?.close();
       }
     })();
   });

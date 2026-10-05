@@ -16,6 +16,7 @@ import React, {
   useRef,
   type FormEvent,
 } from 'react';
+import { useStickToBottom } from 'use-stick-to-bottom';
 import ClaudeStatus from './ClaudeStatus';
 import MessageInput from './MessageInput';
 import MessageComponent, { type DisplayMessage } from './MessageComponent';
@@ -37,6 +38,8 @@ import {
   type AskWidgetState,
 } from './AskUserQuestion/derivedState';
 import type { Question } from './AskUserQuestion/answerUtils';
+import { asGeneratedImageBlock } from '@shared/providers/generatedImage';
+import { isAskUserToolName } from './AskUserQuestion/toolName';
 import type {
   ClaudeSessionId,
   PermissionMode,
@@ -160,6 +163,17 @@ function convertSessionMessages(
               content: block.thinking,
               timestamp,
             });
+          } else if (block.type === 'generated_image') {
+            const image = asGeneratedImageBlock(block);
+            if (image) {
+              converted.push({
+                type: 'image',
+                fileName: image.file_name,
+                width: image.width,
+                height: image.height,
+                timestamp,
+              });
+            }
           } else if (block.type === 'tool_use' && block.id && block.name) {
             const toolResult = toolResults.get(block.id);
             converted.push({
@@ -246,18 +260,54 @@ function ChatInterface({
   // and reconnect resubscription.
   useConversationSubscription(activeConversation?.id ?? null);
 
-  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-  const [hasNewMessages, setHasNewMessages] = useState(false);
+  // Stick-to-bottom behaviour is delegated to use-stick-to-bottom. It owns the
+  // whole "pin to the latest message while the user is at the bottom, but never
+  // yank them down while they've scrolled up to read history" contract — driven
+  // by a ResizeObserver on the content (so a message that grows mid-stream is
+  // handled like any other growth) and by reading the live DOM scroll position,
+  // not a cached React boolean. This replaces the hand-rolled handleScroll /
+  // isAtBottomRef / markProgrammaticScroll machinery that we'd patched twice
+  // (#80 batching race, #82 orphaned-listener freeze) and still hadn't made
+  // robust. `escapedFromLock` is true once the user scrolls away from the
+  // bottom; `isAtBottom` reflects the live position.
+  const {
+    scrollRef: stickScrollRef,
+    contentRef,
+    isAtBottom,
+    escapedFromLock,
+    scrollToBottom: stickScrollToBottom,
+  } = useStickToBottom({ initial: 'instant', resize: 'smooth' });
+
+  // We also want the live scroll DOM node for a small, cosmetic affordance
+  // (collapsing the composer while the user scrolls history — see isScrolling
+  // below). Merge our own node-tracking callback ref with the library's ref so
+  // both stay correct across the list's mount/unmount cycle (the spinner
+  // remounts it on every conversation load).
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const setMessagesContainer = useCallback(
+    (node: HTMLDivElement | null) => {
+      setScrollEl(node);
+      if (typeof stickScrollRef === 'function') {
+        (stickScrollRef as (n: HTMLDivElement | null) => void)(node);
+      } else if (stickScrollRef) {
+        (
+          stickScrollRef as React.MutableRefObject<HTMLDivElement | null>
+        ).current = node;
+      }
+    },
+    [stickScrollRef],
+  );
+
+  const scrollToBottom = useCallback(() => {
+    void stickScrollToBottom();
+  }, [stickScrollToBottom]);
+
+  // "User is actively scrolling the history" — debounced, used only to collapse
+  // the mobile composer (MessageInput ignores it while streaming). Purely
+  // cosmetic; decoupled from the at-bottom decision above so a bug here can
+  // never resurrect the scroll-jump regression.
   const [isScrolling, setIsScrolling] = useState(false);
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const userScrollIntentRef = useRef(false);
-  const userScrollIntentTimeoutRef = useRef<ReturnType<
-    typeof setTimeout
-  > | null>(null);
-  const isProgrammaticScrollRef = useRef(false);
-  const reconnectCooldownRef = useRef(false);
 
   const wasConnectedRef = useRef(false);
   const isRefreshingRef = useRef(false);
@@ -534,8 +584,8 @@ function ChatInterface({
   const handleAskUserSubmit = useCallback(
     (_formatted: unknown, structured: Record<string, string> | null) => {
       if (!openAskPanel || !isConnected || !claudeSessionId) return;
-      // AskUserQuestion is Claude-only today, but gate on the provider anyway
-      // so a non-Anthropic conversation never pops the Claude-auth modal.
+      // Claude still uses its native auth gate; portable question tools on
+      // Codex/OpenCode resume through their own connected credentials.
       if (activeConversation?.provider === 'anthropic' && !requireClaudeAuth()) return;
       if (
         structured &&
@@ -637,17 +687,6 @@ function ChatInterface({
     }
   }, [activeConversation?.id, setStreamingMessages, setIsStreaming]);
 
-  // Cooldown after WebSocket reconnection to ignore scroll events
-  useEffect(() => {
-    if (isConnected) {
-      reconnectCooldownRef.current = true;
-      const timeout = setTimeout(() => {
-        reconnectCooldownRef.current = false;
-      }, 500);
-      return () => clearTimeout(timeout);
-    }
-  }, [isConnected]);
-
   // State sync on reconnect. `useConversationSubscription` already
   // resubscribes this client when the WS comes back; here we only need to
   // sync `isStreaming` / `isSending` (`check-session-status`) and backfill
@@ -713,121 +752,23 @@ function ChatInterface({
     setIsStreaming,
   ]);
 
-  const markProgrammaticScroll = useCallback(() => {
-    isProgrammaticScrollRef.current = true;
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        isProgrammaticScrollRef.current = false;
-      });
-    });
-  }, []);
-
-  const handleScroll = useCallback(() => {
-    const container = messagesContainerRef.current;
-    if (!container) return;
-
-    const scrollPos = container.scrollTop;
-    const atBottom = scrollPos >= -50;
-
-    setIsAtBottom(atBottom);
-    if (atBottom) {
-      setHasNewMessages(false);
-      setIsScrolling(false);
-      return;
-    }
-
-    if (isProgrammaticScrollRef.current) return;
-    if (!userScrollIntentRef.current) return;
-    if (isStreaming) return;
-    if (reconnectCooldownRef.current) return;
-
-    const COLLAPSE_THRESHOLD = -200;
-    if (scrollPos < COLLAPSE_THRESHOLD) {
+  // Debounced "user is actively scrolling the history" flag, used only to
+  // collapse the mobile composer (MessageInput ignores it while streaming).
+  // Bound to the live scroll node so it re-attaches across the list's remounts;
+  // it has no bearing on the stick-to-bottom decision, which the hook owns.
+  useEffect(() => {
+    if (!scrollEl) return;
+    const onScroll = () => {
       setIsScrolling(true);
-
-      if (scrollTimeoutRef.current) {
-        clearTimeout(scrollTimeoutRef.current);
-      }
-
-      scrollTimeoutRef.current = setTimeout(() => {
-        setIsScrolling(false);
-      }, 150);
-    }
-  }, [isStreaming]);
-
-  useEffect(() => {
-    const container = messagesContainerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll);
-      return () => {
-        container.removeEventListener('scroll', handleScroll);
-        if (scrollTimeoutRef.current) {
-          clearTimeout(scrollTimeoutRef.current);
-        }
-      };
-    }
-  }, [handleScroll]);
-
-  // Listen for user scroll-intent signals (touch, wheel, mouse)
-  useEffect(() => {
-    const container = messagesContainerRef.current;
-    if (!container) return;
-
-    const handleUserScrollIntent = () => {
-      userScrollIntentRef.current = true;
-      if (userScrollIntentTimeoutRef.current) {
-        clearTimeout(userScrollIntentTimeoutRef.current);
-      }
-      userScrollIntentTimeoutRef.current = setTimeout(() => {
-        userScrollIntentRef.current = false;
-      }, 200);
+      if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+      scrollTimeoutRef.current = setTimeout(() => setIsScrolling(false), 150);
     };
-
-    container.addEventListener('touchstart', handleUserScrollIntent, {
-      passive: true,
-    });
-    container.addEventListener('touchmove', handleUserScrollIntent, {
-      passive: true,
-    });
-    container.addEventListener('wheel', handleUserScrollIntent, {
-      passive: true,
-    });
-    container.addEventListener('mousedown', handleUserScrollIntent, {
-      passive: true,
-    });
-
+    scrollEl.addEventListener('scroll', onScroll, { passive: true });
     return () => {
-      container.removeEventListener('touchstart', handleUserScrollIntent);
-      container.removeEventListener('touchmove', handleUserScrollIntent);
-      container.removeEventListener('wheel', handleUserScrollIntent);
-      container.removeEventListener('mousedown', handleUserScrollIntent);
-      if (userScrollIntentTimeoutRef.current) {
-        clearTimeout(userScrollIntentTimeoutRef.current);
-      }
+      scrollEl.removeEventListener('scroll', onScroll);
+      if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
     };
-  }, []);
-
-  useEffect(() => {
-    if (streamingMessages.length > 0 && !isAtBottom) {
-      setHasNewMessages(true);
-    }
-  }, [streamingMessages.length, isAtBottom]);
-
-  const scrollToBottom = useCallback(() => {
-    const container = messagesContainerRef.current;
-    if (container) {
-      markProgrammaticScroll();
-      container.scrollTop = 0;
-    }
-    setHasNewMessages(false);
-  }, [markProgrammaticScroll]);
-
-  useEffect(() => {
-    if (isAtBottom && messagesContainerRef.current) {
-      markProgrammaticScroll();
-      messagesContainerRef.current.scrollTop = 0;
-    }
-  }, [displayMessages.length, isAtBottom, markProgrammaticScroll]);
+  }, [scrollEl]);
 
   if (isLoading) {
     return (
@@ -845,10 +786,10 @@ function ChatInterface({
   return (
     <div className="h-full flex flex-col relative">
       <div
-        ref={messagesContainerRef}
-        className="flex-1 overflow-y-auto p-4 space-y-4 flex flex-col-reverse"
+        ref={setMessagesContainer}
+        className="flex-1 overflow-y-auto p-4"
       >
-        <div className="space-y-4">
+        <div ref={contentRef} className="space-y-4">
           {displayMessages.length === 0 && !isStreaming ? (
             <div className="text-center py-12 text-muted-foreground">
               <p className="text-lg mb-2">Start a conversation</p>
@@ -870,7 +811,7 @@ function ChatInterface({
 
               const askWidgetState =
                 message.type === 'tool' &&
-                message.toolName === 'AskUserQuestion' &&
+                isAskUserToolName(message.toolName) &&
                 message.toolId
                   ? askWidgetStates.get(message.toolId)
                   : undefined;
@@ -878,6 +819,7 @@ function ChatInterface({
                 <MessageComponent
                   key={index}
                   message={message}
+                  conversationId={activeConversation?.id}
                   isGrouped={isGrouped}
                   askWidgetState={askWidgetState}
                   onOpenAskUserPanel={handleOpenAskUserPanel}
@@ -888,7 +830,7 @@ function ChatInterface({
         </div>
       </div>
 
-      {hasNewMessages && (
+      {escapedFromLock && isStreaming && (
         <button
           onClick={scrollToBottom}
           className="absolute bottom-20 left-1/2 -translate-x-1/2 px-4 py-2 bg-primary text-primary-foreground rounded-full shadow-lg flex items-center gap-2 hover:bg-primary/90 transition-colors z-10"
@@ -954,7 +896,7 @@ function ChatInterface({
         filteredCommands={filteredCommands}
         onCommandSelect={handleCommandSelect}
         onCloseCommandMenu={handleCloseCommandMenu}
-        isScrolling={isScrolling}
+        isScrolling={isScrolling && !isAtBottom}
       />
 
       <CommandMenu

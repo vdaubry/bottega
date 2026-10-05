@@ -2,10 +2,15 @@
 
 /**
  * CLI script to block a task's workflow.
- * Used by Claude agents to signal that user intervention is needed
- * and the implementation/review loop should pause.
+ * Used by agents to signal that outside help is needed and the
+ * implementation/review loop should pause.
  *
- * Usage: tsx scripts/block-workflow.ts <taskId>
+ * The reason is not decoration: when the task is an epic ticket, it is the
+ * message the epic orchestrator is woken with, and the orchestrator decides
+ * from it whether this is something it can fix itself. A block with no reason
+ * sends the orchestrator hunting through the ticket document instead.
+ *
+ * Usage: tsx scripts/block-workflow.ts <taskId> [reason...]
  */
 
 import { tasksDb, initializeDatabase } from '../server/database/db.js';
@@ -20,11 +25,14 @@ const colors = {
   yellow: '\x1b[33m',
 };
 
-async function blockWorkflow(taskId: string | undefined): Promise<void> {
+async function blockWorkflow(
+  taskId: string | undefined,
+  reason: string | null,
+): Promise<void> {
   // Validate taskId
   if (!taskId) {
     console.error(`${colors.red}Error:${colors.reset} Task ID is required`);
-    console.log(`\nUsage: tsx scripts/block-workflow.ts <taskId>`);
+    console.log(`\nUsage: tsx scripts/block-workflow.ts <taskId> [reason...]`);
     process.exit(1);
   }
 
@@ -55,12 +63,21 @@ async function blockWorkflow(taskId: string | undefined): Promise<void> {
 
   // Block the workflow
   try {
-    const updatedTask = tasksDb.blockWorkflow(parsedTaskId);
+    const updatedTask = tasksDb.blockWorkflow(parsedTaskId, reason);
 
     console.log('');
-    console.log(`${colors.yellow}${colors.bright}Workflow blocked - waiting for user intervention${colors.reset}`);
+    console.log(`${colors.yellow}${colors.bright}Workflow blocked - waiting for intervention${colors.reset}`);
     console.log(`${colors.cyan}Task ID:${colors.reset} ${parsedTaskId}`);
     console.log(`${colors.cyan}Title:${colors.reset} ${updatedTask?.title || '(no title)'}`);
+    console.log(
+      `${colors.cyan}Reason:${colors.reset} ${updatedTask?.workflow_blocked_reason || '(none given)'}`,
+    );
+    if (!reason) {
+      console.log(
+        `${colors.yellow}Hint:${colors.reset} pass the reason as arguments — ` +
+          `tsx scripts/block-workflow.ts ${parsedTaskId} "what is blocking and what you tried"`,
+      );
+    }
     console.log('');
 
   } catch (error) {
@@ -72,9 +89,11 @@ async function blockWorkflow(taskId: string | undefined): Promise<void> {
 
 // Main
 const taskId = process.argv[2];
+// Everything after the id is the reason, quoted or not.
+const reason = process.argv.slice(3).join(' ').trim() || null;
 
 // Initialize database (ensures schema and migrations are run)
 await initializeDatabase();
 
 // Block the workflow
-await blockWorkflow(taskId);
+await blockWorkflow(taskId, reason);

@@ -106,7 +106,7 @@ function assistantMessageUpdated(
   id: string,
   finish: string | undefined,
   tokens: { input: number; output: number } = { input: 100, output: 50 },
-  modelID = 'kimi-k2.6',
+  modelID = 'kimi-k2.7-code',
 ): EventMessageUpdated {
   const info: AssistantMessage = {
     id,
@@ -159,7 +159,7 @@ describe('opencode mapEvent', () => {
     if (out[0]?.type === 'assistant') {
       expect(out[0].text).toBe('Hello world!');
       expect(out[0].usage).toEqual({ input_tokens: 100, output_tokens: 50 });
-      expect(out[0].model).toBe('kimi-k2.6');
+      expect(out[0].model).toBe('kimi-k2.7-code');
       expect(out[0].isSubAgent).toBe(false);
     }
   });
@@ -319,7 +319,7 @@ describe('opencode mapEvent', () => {
           role: 'user',
           time: { created: 0 },
           agent: 'build',
-          model: { providerID: 'opencode', modelID: 'kimi-k2.6' },
+          model: { providerID: 'opencode', modelID: 'kimi-k2.7-code' },
         },
       },
     };

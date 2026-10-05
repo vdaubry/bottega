@@ -16,7 +16,6 @@
 import {
   userAgentModelSettingsDb,
   userDb,
-  agentRunsDb,
 } from '../database/db.js';
 import { getCredentialStore } from './credentials/registry.js';
 import { listOpenCodeModels } from './providers/opencode/index.js';
@@ -28,6 +27,7 @@ import {
   type AgentModelSettings,
 } from '../../shared/types/agentModelSettings.js';
 import type { Provider } from '../../shared/providers/types.js';
+import { ownerAdapterFor } from './conversation/ownerAdapters.js';
 import type { ConversationRow } from '../../shared/types/db.js';
 
 /** Thrown when a user has no usable agent model settings (unseeded/invalid). */
@@ -162,13 +162,14 @@ export async function seedAgentSettingsAfterConnect(userId: number): Promise<voi
  * (no agent run), an unseeded resuming user, or a provider mismatch.
  */
 export function resolveResumeModelEffort(
-  conversation: Pick<ConversationRow, 'id' | 'provider' | 'model' | 'effort'>,
+  conversation: ConversationRow,
   userId: number | undefined,
 ): { model: string | null; effort: string | null } {
   const stored = { model: conversation.model, effort: conversation.effort };
   if (userId == null) return stored;
 
-  const agentRun = agentRunsDb.getByConversationId(conversation.id);
+  // The linked run lives in the owner domain's own runs table.
+  const agentRun = ownerAdapterFor(conversation).linkedRun(conversation.id);
   if (!agentRun || !isAgentTypeWithSettings(agentRun.agent_type)) return stored;
 
   let settings: AgentModelSettings;

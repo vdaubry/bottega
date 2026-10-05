@@ -80,6 +80,8 @@ Opinionated features. Each is independent; implement what you want.
 | [`extra/harnesses/codex.md`](./extra/harnesses/codex.md) | OpenAI Codex integration. |
 | [`extra/harnesses/opencode.md`](./extra/harnesses/opencode.md) | OpenCode integration. |
 | [`extra/kanban-board.md`](./extra/kanban-board.md) | The opinionated projects/tasks board and 4-screen UI for authoring tasks. Swap for Jira/Notion/etc. |
+| [`extra/explore.md`](./extra/explore.md) | **Explore.** An agent reads a task's plan and the code it cites, then renders it as a self-contained interactive HTML page (plan, flowchart or architecture map) shown beside a read-only view of the repository. |
+| [`extra/epics.md`](./extra/epics.md) | **Epics.** A layer above tasks for features too big for one: specification, architecture and story-splitting stages with a human, then an orchestrator that drives every ticket through the normal task pipeline onto a shared feature branch. |
 | [`extra/refinement-agent.md`](./extra/refinement-agent.md) | An extra agent that polishes the work between review and PR. |
 | [`extra/yolo-mode.md`](./extra/yolo-mode.md) | A single-agent alternative to the multi-step pipeline. |
 | [`extra/pr-comment-retrigger.md`](./extra/pr-comment-retrigger.md) | Re-run the PR agent automatically when a PR receives review comments (GitHub webhook). |

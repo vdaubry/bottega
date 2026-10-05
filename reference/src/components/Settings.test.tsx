@@ -29,7 +29,25 @@ vi.mock('lucide-react', () => ({
   AlertTriangle: () => <span data-testid="icon-alert" />,
   Moon: () => <span data-testid="icon-moon" />,
   Sun: () => <span data-testid="icon-sun" />,
+  User: () => <span data-testid="icon-user" />,
+  LogOut: () => <span data-testid="icon-logout" />,
+  Key: () => <span data-testid="icon-key" />,
+  Copy: () => <span data-testid="icon-copy" />,
+  Check: () => <span data-testid="icon-check" />,
+  Trash2: () => <span data-testid="icon-trash" />,
 }));
+
+const mockLogout = vi.fn();
+vi.mock('../contexts/AuthContext', () => ({
+  useAuth: vi.fn(() => ({
+    user: { id: 1, username: 'alice', is_technical: true },
+    updateProfile: vi.fn(),
+    logout: mockLogout,
+  })),
+}));
+
+// The Account tab mounts ApiKeyPanel; its own tests cover it.
+vi.mock('./ApiKeyPanel', () => ({ default: () => null }));
 
 import { useTheme } from '../contexts/ThemeContext';
 
@@ -335,6 +353,17 @@ describe('Settings Component', () => {
 
       expect(screen.getByText('Tool Pattern Examples:')).toBeInTheDocument();
       expect(screen.getByText(/"Bash\(git log:\*\)"/)).toBeInTheDocument();
+    });
+  });
+
+  describe('Account Tab', () => {
+    it('signs the user out from the Session section', () => {
+      render(<Settings isOpen={true} onClose={vi.fn()} initialTab="account" />);
+
+      expect(screen.getByText('Signed in as alice')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+
+      expect(mockLogout).toHaveBeenCalledTimes(1);
     });
   });
 });

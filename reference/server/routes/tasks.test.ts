@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express from 'express';
 
+const mockMergeTask = vi.hoisted(() => vi.fn());
+
 // Mock the database module
 vi.mock('../database/db.js', () => ({
   projectsDb: {
@@ -26,11 +28,10 @@ vi.mock('../database/db.js', () => ({
   },
   conversationsDb: {
     getByTask: vi.fn().mockReturnValue([])
+  },
+  taskAgentRunsDb: {
+    getByTask: vi.fn().mockReturnValue([])
   }
-}));
-
-vi.mock('../services/conversationContentStore.js', () => ({
-  purgeConversationMessages: vi.fn().mockResolvedValue(undefined)
 }));
 
 // Mock the projectService
@@ -39,9 +40,28 @@ vi.mock('../services/projectService.js', () => ({
   getProject: vi.fn()
 }));
 
-// Mock the taskService
+// Mock the taskService. Task creation/deletion moved behind
+// `createTaskWithWorktree` / `deleteTaskCompletely` (the same entry points the
+// epic stories agent uses), so these route tests assert the delegation and the
+// service's own tests cover the git/archive mechanics.
 vi.mock('../services/taskService.js', () => ({
-  getAllTasks: vi.fn()
+  getAllTasks: vi.fn(),
+  createTaskWithWorktree: vi.fn(),
+  deleteTaskCompletely: vi.fn(),
+}));
+
+vi.mock('../services/tasks/index.js', () => ({
+  mergeTask: mockMergeTask,
+}));
+
+vi.mock('../services/tasks/worktreeSetup.js', () => ({
+  retryWorktreeSetup: vi.fn(),
+}));
+
+// Mock the task-layer base-branch resolver — every git-facing route resolves
+// the task's base branch through it.
+vi.mock('../services/tasks/baseBranch.js', () => ({
+  resolveBaseBranch: vi.fn(),
 }));
 
 // Mock the documentation service
@@ -74,6 +94,14 @@ vi.mock('../services/agentRunner.js', () => ({
   forceCompleteRunningAgents: vi.fn()
 }));
 
+// Mock the session-control helper. On completion the PUT handler calls
+// clearStreamingSessionsForTask and re-broadcasts streaming-ended for each
+// cleared entry. Mocking it lets us drive the returned descriptors without
+// pulling the real in-memory map / provider chain into this HTTP-level test.
+vi.mock('../services/conversation/sessionControl.js', () => ({
+  clearStreamingSessionsForTask: vi.fn().mockReturnValue([])
+}));
+
 // Mock the worktree service
 vi.mock('../services/worktree.js', () => ({
   isGitRepository: vi.fn(),
@@ -82,7 +110,7 @@ vi.mock('../services/worktree.js', () => ({
   worktreeExists: vi.fn(),
   getWorktreeProjectPath: vi.fn(),
   getWorktreeStatus: vi.fn(),
-  syncWithMain: vi.fn(),
+  syncWithBase: vi.fn(),
   createPullRequest: vi.fn(),
   getPullRequestStatus: vi.fn(),
   mergeAndCleanup: vi.fn(),
@@ -93,7 +121,7 @@ vi.mock('../services/worktree.js', () => ({
 
 // Mock the webServerManager service
 vi.mock('../services/webServerManager.js', () => ({
-  switchWorktree: vi.fn()
+  switchServedTarget: vi.fn()
 }));
 
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
@@ -101,19 +129,22 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 import tasksRoutes from './tasks.js';
-import { tasksDb, conversationsDb } from '../database/db.js';
-import { purgeConversationMessages } from '../services/conversationContentStore.js';
+import { tasksDb, conversationsDb, taskAgentRunsDb } from '../database/db.js';
 import { hasProjectAccess, getProject } from '../services/projectService.js';
-import { getAllTasks } from '../services/taskService.js';
-import { readTaskDoc, writeTaskDoc, deleteTaskArchive, getRecordingPath } from '../services/documentation.js';
-import { forceCompleteRunningAgents } from '../services/agentRunner.js';
 import {
-  isGitRepository,
-  createWorktree,
+  getAllTasks,
+  createTaskWithWorktree,
+  deleteTaskCompletely,
+} from '../services/taskService.js';
+import { resolveBaseBranch } from '../services/tasks/baseBranch.js';
+import { readTaskDoc, writeTaskDoc, getRecordingPath } from '../services/documentation.js';
+import { forceCompleteRunningAgents } from '../services/agentRunner.js';
+import { clearStreamingSessionsForTask } from '../services/conversation/sessionControl.js';
+import {
   removeWorktree,
   worktreeExists,
   getWorktreeStatus,
-  syncWithMain,
+  syncWithBase,
   createPullRequest,
   getPullRequestStatus,
   mergeAndCleanup,
@@ -121,19 +152,45 @@ import {
   commitAllChanges,
   pushChanges
 } from '../services/worktree.js';
-import { switchWorktree } from '../services/webServerManager.js';
+import { switchServedTarget } from '../services/webServerManager.js';
+import { UnsavedWorktreeWorkError, type WorktreeSafety } from '../services/worktreeSafety.js';
+
+/** Build the safety report a guarded primitive would throw with. */
+const unsavedWork = (over: Partial<WorktreeSafety> = {}): WorktreeSafety => ({
+  clean: false,
+  files: ['src/app.ts'],
+  dirtyFiles: 1,
+  unpushedCommits: 2,
+  branch: 'task/1-thing',
+  ...over,
+});
 
 describe('Tasks Routes - Phase 3', () => {
   let app: import("express").Application;
+  let broadcastToTaskSubscribers: ReturnType<typeof vi.fn>;
   const testUserId = 1;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // Re-establish the default after clearAllMocks wiped the implementation.
+    vi.mocked(clearStreamingSessionsForTask).mockReturnValue([]);
+    // Phases endpoint reads both; default to empty so unrelated tests are
+    // unaffected. Phase tests override these per-case.
+    vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([]);
+    vi.mocked(conversationsDb.getByTask).mockReturnValue([]);
 
     // Default to allowing access - tests can override if needed
     vi.mocked(hasProjectAccess).mockReturnValue(true);
+    // Defaults wiped by clearAllMocks: every git route resolves a base branch,
+    // and deletion delegates to the task service.
+    vi.mocked(resolveBaseBranch).mockResolvedValue('main');
+    vi.mocked(deleteTaskCompletely).mockResolvedValue(true);
+    mockMergeTask.mockResolvedValue({ success: true, merged: true });
+
+    broadcastToTaskSubscribers = vi.fn();
 
     app = express();
+    app.locals.broadcastToTaskSubscribers = broadcastToTaskSubscribers;
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: testUserId, username: 'testuser' } as never;
@@ -261,12 +318,12 @@ describe('Tasks Routes - Phase 3', () => {
   });
 
   describe('POST /api/projects/:projectId/tasks', () => {
+    const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
+
     it('should create a new task', async () => {
-      const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
       const newTask = { id: 1, projectId: 1, title: 'New Task' };
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.create).mockReturnValue(newTask as never);
-      vi.mocked(writeTaskDoc).mockReturnValue(undefined);
+      vi.mocked(createTaskWithWorktree).mockResolvedValue({ success: true, task: newTask as never });
 
       const response = await request(app)
         .post('/api/projects/1/tasks')
@@ -274,37 +331,61 @@ describe('Tasks Routes - Phase 3', () => {
 
       expect(response.status).toBe(201);
       expect(response.body).toEqual(newTask);
-      expect(tasksDb.create).toHaveBeenCalledWith(1, 'New Task', false, testUserId);
-      expect(writeTaskDoc).toHaveBeenCalledWith(1, 1, '');
+      expect(createTaskWithWorktree).toHaveBeenCalledWith(
+        mockProject,
+        {
+          title: 'New Task',
+          description: undefined,
+          yoloMode: undefined,
+          epicId: undefined,
+          epicOrder: undefined,
+        },
+        testUserId,
+      );
     });
 
     it('should create a task without title', async () => {
-      const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
       const newTask = { id: 1, projectId: 1, title: null };
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.create).mockReturnValue(newTask as never);
+      vi.mocked(createTaskWithWorktree).mockResolvedValue({ success: true, task: newTask as never });
 
       const response = await request(app)
         .post('/api/projects/1/tasks')
         .send({});
 
       expect(response.status).toBe(201);
-      expect(tasksDb.create).toHaveBeenCalledWith(1, null, false, testUserId);
+      expect(vi.mocked(createTaskWithWorktree).mock.calls[0]![1]).toMatchObject({ title: undefined });
     });
 
     it('should forward yolo_mode=true when provided in body', async () => {
-      const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
       const newTask = { id: 1, projectId: 1, title: 'YOLO Task', yolo_mode: 1 };
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.create).mockReturnValue(newTask as never);
-      vi.mocked(writeTaskDoc).mockReturnValue(undefined);
+      vi.mocked(createTaskWithWorktree).mockResolvedValue({ success: true, task: newTask as never });
 
       const response = await request(app)
         .post('/api/projects/1/tasks')
         .send({ title: 'YOLO Task', yolo_mode: true });
 
       expect(response.status).toBe(201);
-      expect(tasksDb.create).toHaveBeenCalledWith(1, 'YOLO Task', true, testUserId);
+      expect(vi.mocked(createTaskWithWorktree).mock.calls[0]![1]).toMatchObject({ yoloMode: true });
+    });
+
+    it('no longer accepts epic membership fields (tickets go through POST /epics/:id/tasks)', async () => {
+      // Breaking API change, architecture-v2 step 3: the body schema dropped
+      // epic_id/epic_order, so the task layer never hears about epics.
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      vi.mocked(createTaskWithWorktree).mockResolvedValue({
+        success: true,
+        task: { id: 3, projectId: 1, title: 'Ticket' } as never,
+      });
+
+      const response = await request(app)
+        .post('/api/projects/1/tasks')
+        .send({ title: 'Ticket', epic_id: 8, epic_order: 2 });
+
+      expect(response.status).toBe(201);
+      expect(vi.mocked(createTaskWithWorktree).mock.calls[0]![1]).not.toHaveProperty('epicId');
+      expect(vi.mocked(createTaskWithWorktree).mock.calls[0]![1]).not.toHaveProperty('baseBranch');
     });
 
     it('should return 404 if project not found', async () => {
@@ -454,60 +535,131 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.body.workflow_complete).toBe(1);
       expect(tasksDb.update).toHaveBeenCalledWith(1, { status: 'completed', workflow_complete: 1 });
     });
+
+    it('clears stale streaming sessions and broadcasts streaming-ended on completion', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'in_progress' };
+      const updatedTask = { id: 1, project_id: 1, status: 'completed' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(tasksDb.update).mockReturnValue(updatedTask as never);
+      vi.mocked(clearStreamingSessionsForTask).mockReturnValue([
+        { sessionId: 'sess-a', conversationId: 100 },
+        { sessionId: 'sess-b', conversationId: 101 },
+      ]);
+
+      const response = await request(app)
+        .put('/api/tasks/1')
+        .send({ status: 'completed' });
+
+      expect(response.status).toBe(200);
+      expect(clearStreamingSessionsForTask).toHaveBeenCalledWith(1);
+      // One task-channel streaming-ended per cleared session.
+      expect(broadcastToTaskSubscribers).toHaveBeenCalledTimes(2);
+      expect(broadcastToTaskSubscribers).toHaveBeenCalledWith(1, {
+        type: 'streaming-ended',
+        conversationId: 100,
+      });
+      expect(broadcastToTaskSubscribers).toHaveBeenCalledWith(1, {
+        type: 'streaming-ended',
+        conversationId: 101,
+      });
+    });
+
+    it('does not broadcast when completion cleared nothing', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'in_progress' };
+      const updatedTask = { id: 1, project_id: 1, status: 'completed' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(tasksDb.update).mockReturnValue(updatedTask as never);
+      vi.mocked(clearStreamingSessionsForTask).mockReturnValue([]);
+
+      const response = await request(app)
+        .put('/api/tasks/1')
+        .send({ status: 'completed' });
+
+      expect(response.status).toBe(200);
+      expect(clearStreamingSessionsForTask).toHaveBeenCalledWith(1);
+      expect(broadcastToTaskSubscribers).not.toHaveBeenCalled();
+    });
+
+    it('does not reconcile liveness when the task was already completed', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'completed' };
+      const updatedTask = { id: 1, project_id: 1, status: 'completed' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(tasksDb.update).mockReturnValue(updatedTask as never);
+
+      const response = await request(app)
+        .put('/api/tasks/1')
+        .send({ status: 'completed' });
+
+      expect(response.status).toBe(200);
+      // status didn't transition INTO completed → no reconcile.
+      expect(clearStreamingSessionsForTask).not.toHaveBeenCalled();
+      expect(broadcastToTaskSubscribers).not.toHaveBeenCalled();
+    });
+
+    it('does not reconcile liveness on a title-only update', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'in_progress' };
+      const updatedTask = { id: 1, project_id: 1, title: 'Renamed', status: 'in_progress' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(tasksDb.update).mockReturnValue(updatedTask as never);
+
+      const response = await request(app)
+        .put('/api/tasks/1')
+        .send({ title: 'Renamed' });
+
+      expect(response.status).toBe(200);
+      expect(clearStreamingSessionsForTask).not.toHaveBeenCalled();
+      expect(broadcastToTaskSubscribers).not.toHaveBeenCalled();
+    });
   });
 
   describe('DELETE /api/tasks/:id', () => {
     it('should delete a task', async () => {
       const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(deleteTaskArchive).mockReturnValue(undefined);
 
       const response = await request(app).delete('/api/tasks/1');
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ success: true });
-      expect(tasksDb.delete).toHaveBeenCalledWith(1);
-      expect(deleteTaskArchive).toHaveBeenCalledWith(1, 1);
+      expect(deleteTaskCompletely).toHaveBeenCalledWith(mockTaskWithProject, { force: false });
     });
 
-    it('should purge messages for every conversation before cascading the delete', async () => {
+    it('forwards ?force=true so the user can discard unsaved work', async () => {
       const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(conversationsDb.getByTask).mockReturnValue([
-        { id: 11, claude_conversation_id: 'sess-1', session_path: '/path/1' },
-        { id: 12, claude_conversation_id: 'sess-2', session_path: '/path/1/.worktrees/task-1' },
-      ] as never);
+
+      const response = await request(app).delete('/api/tasks/1?force=true');
+
+      expect(response.status).toBe(200);
+      expect(deleteTaskCompletely).toHaveBeenCalledWith(mockTaskWithProject, { force: true });
+    });
+
+    it('answers the unsaved-work 409 instead of destroying the task', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(deleteTaskCompletely).mockRejectedValue(
+        new UnsavedWorktreeWorkError(1, unsavedWork({ dirtyFiles: 0, files: [] })),
+      );
+      vi.mocked(getPullRequestStatus).mockResolvedValue({
+        success: true,
+        exists: false,
+      });
 
       const response = await request(app).delete('/api/tasks/1');
 
-      expect(response.status).toBe(200);
-      expect(conversationsDb.getByTask).toHaveBeenCalledWith(1);
-      expect(purgeConversationMessages).toHaveBeenCalledTimes(2);
-      expect(purgeConversationMessages).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 11, claude_conversation_id: 'sess-1' }),
-        '/path/1'
-      );
-      expect(purgeConversationMessages).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 12, claude_conversation_id: 'sess-2' }),
-        '/path/1'
-      );
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe('worktree-has-unsaved-work');
+      expect(response.body.summary).toBe('2 unpushed commits');
     });
 
-    it('should still delete the task when the message purge fails', async () => {
+    it('should answer 404 when the row was already gone', async () => {
       const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/path/1' };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(conversationsDb.getByTask).mockReturnValue([
-        { id: 11, claude_conversation_id: 'sess-1', session_path: '/path/1' },
-      ] as never);
-      vi.mocked(purgeConversationMessages).mockRejectedValueOnce(new Error('boom'));
+      vi.mocked(deleteTaskCompletely).mockResolvedValue(false);
 
       const response = await request(app).delete('/api/tasks/1');
 
-      expect(response.status).toBe(200);
-      expect(tasksDb.delete).toHaveBeenCalledWith(1);
+      expect(response.status).toBe(404);
     });
 
     it('should return 404 if task not found', async () => {
@@ -521,31 +673,36 @@ describe('Tasks Routes - Phase 3', () => {
   });
 
   describe('DELETE /api/projects/:projectId/tasks/cleanup-old-completed', () => {
-    it('should purge messages for every old task before deleting it', async () => {
+    it('deletes every old task through the shared task-deletion service', async () => {
       const mockProject = { id: 9, repo_folder_path: '/repo/9' };
       vi.mocked(getProject).mockReturnValue(mockProject as never);
       vi.mocked(tasksDb.getOldCompletedTasks).mockReturnValue([100, 101]);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(worktreeExists).mockResolvedValue(false);
-      vi.mocked(conversationsDb.getByTask).mockImplementation(((taskId: number) => {
-        if (taskId === 100) return [{ id: 1000, claude_conversation_id: 'sess-100', session_path: '/repo/9' }];
-        if (taskId === 101) return [{ id: 1010, claude_conversation_id: 'sess-101', session_path: '/repo/9' }];
-        return [];
-      }) as never);
+      vi.mocked(tasksDb.getWithProject).mockImplementation(((taskId: number) => ({
+        id: taskId,
+        project_id: 9,
+        repo_folder_path: '/repo/9',
+      })) as never);
 
       const response = await request(app).delete('/api/projects/9/tasks/cleanup-old-completed');
 
       expect(response.status).toBe(200);
       expect(response.body.deletedCount).toBe(2);
-      expect(purgeConversationMessages).toHaveBeenCalledTimes(2);
-      expect(purgeConversationMessages).toHaveBeenCalledWith(
-        expect.objectContaining({ claude_conversation_id: 'sess-100' }),
-        '/repo/9'
-      );
-      expect(purgeConversationMessages).toHaveBeenCalledWith(
-        expect.objectContaining({ claude_conversation_id: 'sess-101' }),
-        '/repo/9'
-      );
+      expect(deleteTaskCompletely).toHaveBeenCalledTimes(2);
+      expect(deleteTaskCompletely).toHaveBeenCalledWith(expect.objectContaining({ id: 100 }));
+      expect(deleteTaskCompletely).toHaveBeenCalledWith(expect.objectContaining({ id: 101 }));
+    });
+
+    it('skips ids whose row vanished between the query and the delete', async () => {
+      vi.mocked(getProject).mockReturnValue({ id: 9, repo_folder_path: '/repo/9' } as never);
+      vi.mocked(tasksDb.getOldCompletedTasks).mockReturnValue([100, 101]);
+      vi.mocked(tasksDb.getWithProject).mockImplementation(((taskId: number) =>
+        taskId === 100 ? { id: 100, project_id: 9, repo_folder_path: '/repo/9' } : undefined) as never);
+
+      const response = await request(app).delete('/api/projects/9/tasks/cleanup-old-completed');
+
+      expect(response.status).toBe(200);
+      expect(response.body.deletedCount).toBe(1);
+      expect(deleteTaskCompletely).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -582,6 +739,199 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.body).toEqual({ content: '# Archived doc' });
       expect(worktreeExists).not.toHaveBeenCalled();
       expect(readTaskDoc).toHaveBeenCalledWith(7, 1);
+    });
+  });
+
+  describe('GET /api/tasks/:id/phases', () => {
+    const taskWithProject = { id: 1, project_id: 7, repo_folder_path: '/repo' };
+
+    it('returns the five phases with statuses and conversation_ids in sidebar order', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...taskWithProject,
+        planification_complete: 0,
+        refinement_complete: 0,
+        pr_agent_complete: 0,
+      } as never);
+      // taskAgentRunsDb.getByTask is created_at DESC. Two planification runs
+      // (newest first), one running implementation run.
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([
+        { id: 20, task_id: 1, agent_type: 'planification', status: 'completed', conversation_id: 200 },
+        { id: 19, task_id: 1, agent_type: 'planification', status: 'failed', conversation_id: 199 },
+        { id: 18, task_id: 1, agent_type: 'implementation', status: 'running', conversation_id: 198 },
+      ] as never);
+      // conversationsDb.getByTask is created_at DESC — defines sidebar order.
+      vi.mocked(conversationsDb.getByTask).mockReturnValue([
+        { id: 200 },
+        { id: 199 },
+        { id: 198 },
+      ] as never);
+
+      const response = await request(app).get('/api/tasks/1/phases');
+
+      expect(response.status).toBe(200);
+      const phases = response.body.phases;
+      expect(phases.map((p: { phase: string }) => p.phase)).toEqual([
+        'planification',
+        'implementation',
+        'review',
+        'refinement',
+        'pr',
+      ]);
+
+      const planification = phases.find((p: { phase: string }) => p.phase === 'planification');
+      // Newest run wins (completed), and both runs' conversation ids appear,
+      // ordered by the conversation sidebar order (200 before 199).
+      expect(planification.status).toBe('completed');
+      expect(planification.conversation_ids).toEqual([200, 199]);
+      expect(planification.label).toBe('Classification');
+
+      const implementation = phases.find((p: { phase: string }) => p.phase === 'implementation');
+      expect(implementation.status).toBe('running');
+      expect(implementation.conversation_ids).toEqual([198]);
+    });
+
+    it('reports not_started for a phase with no run and no flag', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...taskWithProject,
+        planification_complete: 0,
+        refinement_complete: 0,
+        pr_agent_complete: 0,
+      } as never);
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([] as never);
+      vi.mocked(conversationsDb.getByTask).mockReturnValue([] as never);
+
+      const response = await request(app).get('/api/tasks/1/phases');
+
+      expect(response.status).toBe(200);
+      for (const phase of response.body.phases) {
+        expect(phase.status).toBe('not_started');
+        expect(phase.conversation_ids).toEqual([]);
+      }
+    });
+
+    it('derives completed from workflow flags when no run exists', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...taskWithProject,
+        planification_complete: 1,
+        refinement_complete: 1,
+        pr_agent_complete: 1,
+      } as never);
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([] as never);
+      vi.mocked(conversationsDb.getByTask).mockReturnValue([] as never);
+
+      const response = await request(app).get('/api/tasks/1/phases');
+
+      expect(response.status).toBe(200);
+      const byPhase = Object.fromEntries(
+        response.body.phases.map((p: { phase: string; status: string }) => [p.phase, p.status]),
+      );
+      // Phases backed by a flag report completed; flag-less phases stay not_started.
+      expect(byPhase.planification).toBe('completed');
+      expect(byPhase.refinement).toBe('completed');
+      expect(byPhase.pr).toBe('completed');
+      expect(byPhase.implementation).toBe('not_started');
+      expect(byPhase.review).toBe('not_started');
+    });
+
+    it('a phase with multiple runs reports the newest run status and all ids', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...taskWithProject,
+        planification_complete: 0,
+        refinement_complete: 0,
+        pr_agent_complete: 0,
+      } as never);
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([
+        { id: 31, task_id: 1, agent_type: 'review', status: 'running', conversation_id: 301 },
+        { id: 30, task_id: 1, agent_type: 'review', status: 'completed', conversation_id: 300 },
+      ] as never);
+      vi.mocked(conversationsDb.getByTask).mockReturnValue([
+        { id: 301 },
+        { id: 300 },
+      ] as never);
+
+      const response = await request(app).get('/api/tasks/1/phases');
+
+      const review = response.body.phases.find((p: { phase: string }) => p.phase === 'review');
+      expect(review.status).toBe('running');
+      expect(review.conversation_ids).toEqual([301, 300]);
+    });
+
+    it('returns 404 when task missing', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(undefined);
+
+      const response = await request(app).get('/api/tasks/999/phases');
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+    });
+
+    it('returns 404 when user is not a project member', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(false);
+
+      const response = await request(app).get('/api/tasks/1/phases');
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+    });
+
+    it('returns 400 on a non-numeric id', async () => {
+      const response = await request(app).get('/api/tasks/abc/phases');
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe('Validation failed');
+    });
+  });
+
+  describe('GET /api/tasks/:id/plan', () => {
+    const taskWithProject = { id: 1, project_id: 7, repo_folder_path: '/repo' };
+
+    it('returns ready + content when planification_complete=1', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...taskWithProject,
+        planification_complete: 1,
+      } as never);
+      vi.mocked(readTaskDoc).mockReturnValue('# The Plan');
+
+      const response = await request(app).get('/api/tasks/1/plan');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ status: 'ready', content: '# The Plan' });
+      expect(readTaskDoc).toHaveBeenCalledWith(7, 1);
+    });
+
+    it('returns not_ready + null content when planification_complete=0 (does NOT leak seeded doc)', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        ...taskWithProject,
+        planification_complete: 0,
+      } as never);
+      // readTaskDoc would return the seeded description — assert we never read it.
+      vi.mocked(readTaskDoc).mockReturnValue('seeded description');
+
+      const response = await request(app).get('/api/tasks/1/plan');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ status: 'not_ready', content: null });
+      expect(readTaskDoc).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when task missing', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(undefined);
+
+      const response = await request(app).get('/api/tasks/999/plan');
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+    });
+
+    it('returns 404 when user is not a project member', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(false);
+
+      const response = await request(app).get('/api/tasks/1/plan');
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
     });
   });
 
@@ -763,124 +1113,6 @@ describe('Tasks Routes - Phase 3', () => {
   // Worktree Endpoints Tests
   // ============================================================================
 
-  describe('POST /api/projects/:projectId/tasks (with worktree)', () => {
-    it('should create worktree for git repository projects', async () => {
-      const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/to/repo' };
-      const newTask = { id: 5, projectId: 1, title: 'New Feature' };
-      vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.create).mockReturnValue(newTask as never);
-      vi.mocked(isGitRepository).mockResolvedValue(true);
-      vi.mocked(createWorktree).mockResolvedValue({
-        success: true,
-        worktreePath: '/path/to/repo-worktrees/task-5',
-        branch: 'task/5-new-feature'
-      });
-      vi.mocked(writeTaskDoc).mockReturnValue(undefined);
-
-      const response = await request(app)
-        .post('/api/projects/1/tasks')
-        .send({ title: 'New Feature' });
-
-      expect(response.status).toBe(201);
-      expect(isGitRepository).toHaveBeenCalledWith('/path/to/repo');
-      expect(createWorktree).toHaveBeenCalledWith('/path/to/repo', 5, 'New Feature', undefined);
-      expect(response.body.worktree_path).toBe('/path/to/repo-worktrees/task-5');
-      expect(response.body.worktree_branch).toBe('task/5-new-feature');
-    });
-
-    it('should skip worktree creation for non-git projects', async () => {
-      const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/to/folder' };
-      const newTask = { id: 5, projectId: 1, title: 'Task' };
-      vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.create).mockReturnValue(newTask as never);
-      vi.mocked(isGitRepository).mockResolvedValue(false);
-      vi.mocked(writeTaskDoc).mockReturnValue(undefined);
-
-      const response = await request(app)
-        .post('/api/projects/1/tasks')
-        .send({ title: 'Task' });
-
-      expect(response.status).toBe(201);
-      expect(createWorktree).not.toHaveBeenCalled();
-    });
-
-    it('should rollback task on worktree creation failure', async () => {
-      const mockProject = { id: 1, project_id: 1, repo_folder_path: '/path/to/repo' };
-      const newTask = { id: 5, projectId: 1, title: 'Task' };
-      vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.create).mockReturnValue(newTask as never);
-      vi.mocked(isGitRepository).mockResolvedValue(true);
-      vi.mocked(createWorktree).mockResolvedValue({
-        success: false,
-        error: 'Branch already exists'
-      });
-
-      const response = await request(app)
-        .post('/api/projects/1/tasks')
-        .send({ title: 'Task' });
-
-      expect(response.status).toBe(500);
-      expect(response.body.error).toContain('Failed to create worktree');
-      expect(tasksDb.delete).toHaveBeenCalledWith(5);
-    });
-  });
-
-  describe('DELETE /api/tasks/:id (with worktree)', () => {
-    it('should remove worktree when deleting task', async () => {
-      const mockTaskWithProject = {
-        id: 1,
-        project_id: 1,
-        repo_folder_path: '/path/to/repo'
-      };
-      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(deleteTaskArchive).mockReturnValue(undefined);
-      vi.mocked(worktreeExists).mockResolvedValue(true);
-      vi.mocked(removeWorktree).mockResolvedValue({ success: true });
-
-      const response = await request(app).delete('/api/tasks/1');
-
-      expect(response.status).toBe(200);
-      expect(worktreeExists).toHaveBeenCalledWith('/path/to/repo', 1);
-      expect(removeWorktree).toHaveBeenCalledWith('/path/to/repo', 1);
-    });
-
-    it('should continue deletion if worktree removal fails', async () => {
-      const mockTaskWithProject = {
-        id: 1,
-        project_id: 1,
-        repo_folder_path: '/path/to/repo'
-      };
-      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(deleteTaskArchive).mockReturnValue(undefined);
-      vi.mocked(worktreeExists).mockResolvedValue(true);
-      vi.mocked(removeWorktree).mockResolvedValue({ success: false, error: 'Worktree locked' });
-
-      const response = await request(app).delete('/api/tasks/1');
-
-      expect(response.status).toBe(200);
-      expect(response.body).toEqual({ success: true });
-    });
-
-    it('should skip worktree removal if worktree does not exist', async () => {
-      const mockTaskWithProject = {
-        id: 1,
-        project_id: 1,
-        repo_folder_path: '/path/to/repo'
-      };
-      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(tasksDb.delete).mockReturnValue(true);
-      vi.mocked(deleteTaskArchive).mockReturnValue(undefined);
-      vi.mocked(worktreeExists).mockResolvedValue(false);
-
-      const response = await request(app).delete('/api/tasks/1');
-
-      expect(response.status).toBe(200);
-      expect(removeWorktree).not.toHaveBeenCalled();
-    });
-  });
-
   describe('GET /api/tasks/:id/review-recording', () => {
     let tempDir: string;
     let videoPath: string;
@@ -972,12 +1204,14 @@ describe('Tasks Routes - Phase 3', () => {
         repo_folder_path: '/path/to/repo'
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(resolveBaseBranch).mockResolvedValue('epic/8-nimbus');
       vi.mocked(getWorktreeStatus).mockResolvedValue({
         success: true,
         branch: 'task/1-feature',
         ahead: 3,
         behind: 1,
-        mainBranch: 'main',
+        baseBranch: 'epic/8-nimbus',
+        mainBranch: 'epic/8-nimbus',
         worktreePath: '/path/to/repo-worktrees/task-1'
       });
 
@@ -988,6 +1222,8 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.body.branch).toBe('task/1-feature');
       expect(response.body.ahead).toBe(3);
       expect(response.body.behind).toBe(1);
+      // The counts are measured against the task's resolved base branch.
+      expect(getWorktreeStatus).toHaveBeenCalledWith('/path/to/repo', 1, 'epic/8-nimbus');
     });
 
     it('should return 404 for non-existent task', async () => {
@@ -1016,20 +1252,22 @@ describe('Tasks Routes - Phase 3', () => {
   });
 
   describe('POST /api/tasks/:id/sync', () => {
-    it('should sync worktree with main', async () => {
+    it('should sync worktree with its base branch', async () => {
       const mockTaskWithProject = {
         id: 1,
         project_id: 1,
         repo_folder_path: '/path/to/repo'
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(syncWithMain).mockResolvedValue({ success: true });
+      vi.mocked(resolveBaseBranch).mockResolvedValue('epic/8-nimbus');
+      vi.mocked(syncWithBase).mockResolvedValue({ success: true });
 
       const response = await request(app).post('/api/tasks/1/sync');
 
       expect(response.status).toBe(200);
-      expect(syncWithMain).toHaveBeenCalledWith('/path/to/repo', 1);
+      expect(syncWithBase).toHaveBeenCalledWith('/path/to/repo', 1, 'epic/8-nimbus');
       expect(response.body.success).toBe(true);
+      expect(response.body.baseBranch).toBe('epic/8-nimbus');
     });
 
     it('should return sync error', async () => {
@@ -1039,7 +1277,7 @@ describe('Tasks Routes - Phase 3', () => {
         repo_folder_path: '/path/to/repo'
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(syncWithMain).mockResolvedValue({ success: false, error: 'Merge conflict' });
+      vi.mocked(syncWithBase).mockResolvedValue({ success: false, error: 'Merge conflict' });
 
       const response = await request(app).post('/api/tasks/1/sync');
 
@@ -1080,7 +1318,13 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.status).toBe(200);
       expect(hasUncommittedChanges).toHaveBeenCalledWith('/path/to/repo', 1);
       expect(commitAllChanges).not.toHaveBeenCalled();
-      expect(createPullRequest).toHaveBeenCalledWith('/path/to/repo', 1, 'Add feature', 'Description');
+      expect(createPullRequest).toHaveBeenCalledWith(
+        '/path/to/repo',
+        1,
+        'Add feature',
+        'Description',
+        'main',
+      );
       expect(response.body.success).toBe(true);
       expect(response.body.url).toBe('https://github.com/user/repo/pull/123');
     });
@@ -1109,7 +1353,13 @@ describe('Tasks Routes - Phase 3', () => {
       expect(hasUncommittedChanges).toHaveBeenCalledWith('/path/to/repo', 1);
       // Now uses PR title for commit message (via prService.createOrUpdatePR)
       expect(commitAllChanges).toHaveBeenCalledWith('/path/to/repo', 1, 'Add feature');
-      expect(createPullRequest).toHaveBeenCalledWith('/path/to/repo', 1, 'Add feature', 'Description');
+      expect(createPullRequest).toHaveBeenCalledWith(
+        '/path/to/repo',
+        1,
+        'Add feature',
+        'Description',
+        'main',
+      );
       expect(response.body.success).toBe(true);
     });
 
@@ -1209,7 +1459,7 @@ describe('Tasks Routes - Phase 3', () => {
         .post('/api/tasks/1/pull-request')
         .send({ title: 'Title only' });
 
-      expect(createPullRequest).toHaveBeenCalledWith('/path/to/repo', 1, 'Title only', '');
+      expect(createPullRequest).toHaveBeenCalledWith('/path/to/repo', 1, 'Title only', '', 'main');
     });
 
     it('should return 404 for non-existent task', async () => {
@@ -1278,13 +1528,37 @@ describe('Tasks Routes - Phase 3', () => {
         repo_folder_path: '/path/to/repo'
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(mergeAndCleanup).mockResolvedValue({ success: true });
-
       const response = await request(app).post('/api/tasks/1/merge-cleanup');
 
       expect(response.status).toBe(200);
-      expect(mergeAndCleanup).toHaveBeenCalledWith('/path/to/repo', 1);
+      expect(mockMergeTask).toHaveBeenCalledWith(1, {
+        force: false,
+        userId: 1,
+        broadcastToTaskSubscribersFn: broadcastToTaskSubscribers,
+      });
       expect(response.body.success).toBe(true);
+    });
+
+    it('answers the unsaved-work 409 instead of merging a stale PR head', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        id: 1,
+        project_id: 1,
+        repo_folder_path: '/path/to/repo',
+      } as never);
+      mockMergeTask.mockRejectedValue(
+        new UnsavedWorktreeWorkError(1, unsavedWork()),
+      );
+      vi.mocked(getPullRequestStatus).mockResolvedValue({
+        success: true,
+        exists: true,
+        url: 'https://github.com/user/repo/pull/7',
+      });
+
+      const response = await request(app).post('/api/tasks/1/merge-cleanup');
+
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe('worktree-has-unsaved-work');
+      expect(response.body.prNumber).toBe(7);
     });
 
     it('should return error on merge failure', async () => {
@@ -1294,7 +1568,7 @@ describe('Tasks Routes - Phase 3', () => {
         repo_folder_path: '/path/to/repo'
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(mergeAndCleanup).mockResolvedValue({ success: false, error: 'PR not mergeable' });
+      mockMergeTask.mockResolvedValue({ success: false, error: 'PR not mergeable' });
 
       const response = await request(app).post('/api/tasks/1/merge-cleanup');
 
@@ -1342,7 +1616,7 @@ describe('Tasks Routes - Phase 3', () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(getProject).mockReturnValue(mockProject as never);
       vi.mocked(mergeAndCleanup).mockResolvedValue({ success: true });
-      vi.mocked(switchWorktree).mockResolvedValue({ success: true, activeTaskId: null });
+      vi.mocked(switchServedTarget).mockResolvedValue({ success: true, activeTaskId: null });
 
       const response = await request(app).post('/api/tasks/1/merge-cleanup');
 
@@ -1350,7 +1624,7 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.body.success).toBe(true);
       expect(response.body.serverSwitched).toBe(true);
       expect(response.body.serverSwitchMessage).toBe('Server switched back to main repository');
-      expect(switchWorktree).toHaveBeenCalledWith(1, null, testUserId);
+      expect(switchServedTarget).toHaveBeenCalledWith(1, { kind: 'main' }, testUserId);
     });
 
     it('should not switch server when worktree was not active server', async () => {
@@ -1374,7 +1648,7 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.serverSwitched).toBeUndefined();
-      expect(switchWorktree).not.toHaveBeenCalled();
+      expect(switchServedTarget).not.toHaveBeenCalled();
     });
 
     it('should not switch server when project has no web server configured', async () => {
@@ -1398,7 +1672,7 @@ describe('Tasks Routes - Phase 3', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.serverSwitched).toBeUndefined();
-      expect(switchWorktree).not.toHaveBeenCalled();
+      expect(switchServedTarget).not.toHaveBeenCalled();
     });
 
     it('should include warning when server switch has warning', async () => {
@@ -1416,7 +1690,7 @@ describe('Tasks Routes - Phase 3', () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(getProject).mockReturnValue(mockProject as never);
       vi.mocked(mergeAndCleanup).mockResolvedValue({ success: true });
-      vi.mocked(switchWorktree).mockResolvedValue({
+      vi.mocked(switchServedTarget).mockResolvedValue({
         success: true,
         activeTaskId: null,
         warning: 'Service restart failed'
@@ -1445,7 +1719,7 @@ describe('Tasks Routes - Phase 3', () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(getProject).mockReturnValue(mockProject as never);
       vi.mocked(mergeAndCleanup).mockResolvedValue({ success: true });
-      vi.mocked(switchWorktree).mockResolvedValue({
+      vi.mocked(switchServedTarget).mockResolvedValue({
         success: false,
         error: 'Failed to update symlink'
       });
@@ -1561,19 +1835,33 @@ describe('Tasks Routes - Phase 3', () => {
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(worktreeExists).mockResolvedValue(true);
-      vi.mocked(hasUncommittedChanges).mockResolvedValue({ success: true, hasChanges: false });
       vi.mocked(removeWorktree).mockResolvedValue({ success: true });
 
       const response = await request(app).delete('/api/tasks/1/worktree');
 
       expect(response.status).toBe(200);
       expect(worktreeExists).toHaveBeenCalledWith('/path/to/repo', 1);
-      expect(hasUncommittedChanges).toHaveBeenCalledWith('/path/to/repo', 1);
-      expect(removeWorktree).toHaveBeenCalledWith('/path/to/repo', 1);
+      // The unsaved-work check lives inside `removeWorktree` now; the route's
+      // only job is to forward `force` and the base branch.
+      expect(removeWorktree).toHaveBeenCalledWith('/path/to/repo', 1, { force: false });
       expect(response.body.success).toBe(true);
     });
 
-    it('should return 409 when worktree has uncommitted changes without force', async () => {
+    it('refuses to discard a worktree that is still being set up', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        id: 1,
+        project_id: 1,
+        repo_folder_path: '/path/to/repo',
+        worktree_state: 'provisioning',
+      } as never);
+
+      const response = await request(app).delete('/api/tasks/1/worktree');
+
+      expect(response.status).toBe(409);
+      expect(removeWorktree).not.toHaveBeenCalled();
+    });
+
+    it('should return the unsaved-work 409 when the worktree still holds work', async () => {
       const mockTaskWithProject = {
         id: 1,
         project_id: 1,
@@ -1581,14 +1869,52 @@ describe('Tasks Routes - Phase 3', () => {
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(worktreeExists).mockResolvedValue(true);
-      vi.mocked(hasUncommittedChanges).mockResolvedValue({ success: true, hasChanges: true });
+      vi.mocked(removeWorktree).mockRejectedValue(
+        new UnsavedWorktreeWorkError(1, unsavedWork()),
+      );
+      vi.mocked(getPullRequestStatus).mockResolvedValue({
+        success: true,
+        exists: true,
+        url: 'https://github.com/user/repo/pull/123',
+      });
 
       const response = await request(app).delete('/api/tasks/1/worktree');
 
       expect(response.status).toBe(409);
-      expect(response.body.hasChanges).toBe(true);
-      expect(response.body.error).toBe('Worktree has uncommitted changes');
-      expect(removeWorktree).not.toHaveBeenCalled();
+      expect(response.body).toMatchObject({
+        error: 'worktree-has-unsaved-work',
+        taskId: 1,
+        dirtyFiles: 1,
+        unpushedCommits: 2,
+        dirtyPaths: ['src/app.ts'],
+        branch: 'task/1-thing',
+        // The PR number is what lets the client say "push to PR #123".
+        prNumber: 123,
+        prUrl: 'https://github.com/user/repo/pull/123',
+      });
+      expect(response.body.summary).toBe('1 uncommitted file and 2 unpushed commits');
+    });
+
+    it('reports prNumber null in the 409 when the task has no PR yet', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        id: 1,
+        project_id: 1,
+        repo_folder_path: '/path/to/repo',
+      } as never);
+      vi.mocked(worktreeExists).mockResolvedValue(true);
+      vi.mocked(removeWorktree).mockRejectedValue(
+        new UnsavedWorktreeWorkError(1, unsavedWork()),
+      );
+      vi.mocked(getPullRequestStatus).mockResolvedValue({
+        success: true,
+        exists: false,
+      });
+
+      const response = await request(app).delete('/api/tasks/1/worktree');
+
+      expect(response.status).toBe(409);
+      expect(response.body.prNumber).toBeNull();
+      expect(response.body.prUrl).toBeNull();
     });
 
     it('should discard worktree with uncommitted changes when force=true', async () => {
@@ -1599,13 +1925,12 @@ describe('Tasks Routes - Phase 3', () => {
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(worktreeExists).mockResolvedValue(true);
-      vi.mocked(hasUncommittedChanges).mockResolvedValue({ success: true, hasChanges: true });
       vi.mocked(removeWorktree).mockResolvedValue({ success: true });
 
       const response = await request(app).delete('/api/tasks/1/worktree?force=true');
 
       expect(response.status).toBe(200);
-      expect(removeWorktree).toHaveBeenCalledWith('/path/to/repo', 1);
+      expect(removeWorktree).toHaveBeenCalledWith('/path/to/repo', 1, { force: true });
       expect(response.body.success).toBe(true);
     });
 
@@ -1656,7 +1981,6 @@ describe('Tasks Routes - Phase 3', () => {
       };
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
       vi.mocked(worktreeExists).mockResolvedValue(true);
-      vi.mocked(hasUncommittedChanges).mockResolvedValue({ success: true, hasChanges: false });
       vi.mocked(removeWorktree).mockResolvedValue({ success: false, error: 'Worktree locked' });
 
       const response = await request(app).delete('/api/tasks/1/worktree');
@@ -1670,6 +1994,43 @@ describe('Tasks Routes - Phase 3', () => {
   // ============================================================================
   // Resume Blocked Workflow Tests
   // ============================================================================
+
+  describe('POST /api/tasks/:id/worktree/retry', () => {
+    it('restarts a failed setup and returns the row, back to provisioning', async () => {
+      const { retryWorktreeSetup } = await import('../services/tasks/worktreeSetup.js');
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
+      vi.mocked(retryWorktreeSetup).mockReturnValue(true);
+      vi.mocked(tasksDb.getById).mockReturnValue({ id: 1, worktree_state: 'provisioning' } as never);
+
+      const response = await request(app).post('/api/tasks/1/worktree/retry');
+
+      expect(response.status).toBe(200);
+      expect(retryWorktreeSetup).toHaveBeenCalledWith(1);
+      expect(response.body).toEqual({ id: 1, worktree_state: 'provisioning' });
+    });
+
+    it('answers 409 when the setup did not fail', async () => {
+      const { retryWorktreeSetup } = await import('../services/tasks/worktreeSetup.js');
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
+      vi.mocked(retryWorktreeSetup).mockReturnValue(false);
+
+      const response = await request(app).post('/api/tasks/1/worktree/retry');
+
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe('Only a failed worktree setup can be retried');
+    });
+
+    it('hides a task the user cannot access', async () => {
+      const { retryWorktreeSetup } = await import('../services/tasks/worktreeSetup.js');
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(false);
+
+      const response = await request(app).post('/api/tasks/1/worktree/retry');
+
+      expect(response.status).toBe(404);
+      expect(retryWorktreeSetup).not.toHaveBeenCalled();
+    });
+  });
 
   describe('POST /api/tasks/:id/resume', () => {
     it('should unblock workflow and reset run count', async () => {

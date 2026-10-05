@@ -22,12 +22,14 @@
  */
 
 export { startConversation, sendMessage } from './conversation/startConversation.js';
+export type { ConversationTarget } from './conversation/conversationScope.js';
 export {
   abortSession,
   isSessionActive,
   getActiveSessions,
   getActiveStreamingByConversation,
   getAllActiveStreamingSessions,
+  getOngoingAtlasGenerationConversationId,
 } from './conversation/sessionControl.js';
 export { resolveAskUserQuestion } from './conversation/askUserQuestion.js';
 

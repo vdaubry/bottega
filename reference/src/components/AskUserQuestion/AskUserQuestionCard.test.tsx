@@ -55,7 +55,7 @@ describe('AskUserQuestionCard', () => {
       />,
     );
 
-    expect(screen.getByText('Claude has 2 questions for you')).toBeTruthy();
+    expect(screen.getByText('The agent has 2 questions for you')).toBeTruthy();
     expect(screen.getByText('Database')).toBeTruthy();
     expect(screen.getByText('Auth')).toBeTruthy();
     expect(screen.getByText('Answer')).toBeTruthy();
@@ -102,7 +102,7 @@ describe('AskUserQuestionCard', () => {
       />,
     );
 
-    expect(screen.getByText('Claude has 1 question for you')).toBeTruthy();
+    expect(screen.getByText('The agent has 1 question for you')).toBeTruthy();
   });
 
   it('Bug 2: parses answers from a successful tool_result on reload (no local state)', () => {

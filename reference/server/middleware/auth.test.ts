@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
 import type { NextFunction, Request, Response } from 'express';
+import Database from 'better-sqlite3';
 import {
   authenticateToken,
   generateToken,
@@ -328,50 +329,49 @@ describe('Auth Middleware', () => {
       expect(res.json).toHaveBeenCalledWith({ error: 'Invalid or expired credentials.' });
     });
 
-    it('should allow localhost requests to web-server/config endpoint without auth', async () => {
-      vi.mocked(userDb.getFirstUser).mockReturnValue(asSafeUser(mockUser));
+    // Regression guard for the removed IP-based localhost auth-bypass. The
+    // backend sits behind nginx → Vite → loopback, so req.ip is a loopback
+    // address for every request, remote ones included. An unauthenticated
+    // request to web-server/config from ANY loopback address must be rejected,
+    // never silently authenticated as the first user.
+    it.each(['127.0.0.1', '::1', '::ffff:127.0.0.1'])(
+      'rejects unauthenticated web-server/config from loopback %s (no bypass)',
+      async (ip) => {
+        const req = {
+          headers: {},
+          query: {},
+          ip,
+          baseUrl: '/api',
+          path: '/projects/123/web-server/config',
+        };
+        const res = makeRes();
+        const next = vi.fn();
+
+        await callAuth(req, res, next);
+
+        expect(next).not.toHaveBeenCalled();
+        expect(res.status).toHaveBeenCalledWith(401);
+        expect(res.json).toHaveBeenCalledWith({
+          error: 'Access denied. No token provided.',
+        });
+        // The removed bypass used to resolve the caller via getFirstUser().
+        expect(userDb.getFirstUser).not.toHaveBeenCalled();
+      },
+    );
+
+    it('authenticates web-server/config normally when a valid token IS supplied', async () => {
+      vi.mocked(userDb.getUserById).mockReturnValue(asSafeUser(mockUser));
+      const token = jwt.sign(
+        { userId: 1, username: 'testuser', tokenVersion: 1 },
+        getJwtSecret(),
+        { expiresIn: 60 },
+      );
       const req = {
-        headers: {},
+        headers: { authorization: `Bearer ${token}` },
         query: {},
         ip: '127.0.0.1',
         baseUrl: '/api',
         path: '/projects/123/web-server/config',
-      };
-      const res = makeRes();
-      const next = vi.fn();
-
-      await callAuth(req, res, next);
-
-      expect(next).toHaveBeenCalled();
-      expect((req as { user?: unknown }).user).toEqual(mockUser);
-    });
-
-    it('should allow localhost requests with IPv6 loopback', async () => {
-      vi.mocked(userDb.getFirstUser).mockReturnValue(asSafeUser(mockUser));
-      const req = {
-        headers: {},
-        query: {},
-        ip: '::1',
-        baseUrl: '/api',
-        path: '/projects/456/web-server/config',
-      };
-      const res = makeRes();
-      const next = vi.fn();
-
-      await callAuth(req, res, next);
-
-      expect(next).toHaveBeenCalled();
-      expect((req as { user?: unknown }).user).toEqual(mockUser);
-    });
-
-    it('should allow localhost requests with IPv4-mapped IPv6', async () => {
-      vi.mocked(userDb.getFirstUser).mockReturnValue(asSafeUser(mockUser));
-      const req = {
-        headers: {},
-        query: {},
-        ip: '::ffff:127.0.0.1',
-        baseUrl: '/api',
-        path: '/projects/789/web-server/config',
       };
       const res = makeRes();
       const next = vi.fn();
@@ -441,8 +441,8 @@ describe('Auth Middleware', () => {
       const decoded = jwt.verify(token, getJwtSecret()) as JwtPayload;
 
       expect(decoded.exp).toBeDefined();
-      const issuedAt = (decoded.iat ?? 0) as number;
-      const exp = (decoded.exp ?? 0) as number;
+      const issuedAt = decoded.iat ?? 0;
+      const exp = decoded.exp ?? 0;
       const lifetimeSeconds = exp - issuedAt;
       // 30 days = 2,592,000 s. Allow ±5 s for clock granularity.
       expect(lifetimeSeconds).toBeGreaterThanOrEqual(2_591_995);
@@ -452,6 +452,103 @@ describe('Auth Middleware', () => {
     it('throws when the user no longer exists', () => {
       vi.mocked(userDb.getTokenVersion).mockReturnValue(null);
       expect(() => generateToken({ id: 999, username: 'gone' })).toThrow(/999/);
+    });
+  });
+
+  describe('a locked database at the boundary', () => {
+    // What better-sqlite3 throws when another process holds the file past
+    // the busy timeout. The boundary must fail the request with a 503 — not
+    // a 401 (the credential is fine) and not the process (it used to).
+    const busy = () => new Database.SqliteError('database is locked', 'SQLITE_BUSY');
+    const busyReq = (headers: Record<string, string>) => ({
+      method: 'GET',
+      baseUrl: '/api',
+      path: '/projects',
+      headers,
+      query: {},
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('answers 503 + Retry-After when the API-key lookup throws SQLITE_BUSY', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.mocked(findUserByApiKey).mockImplementationOnce(() => {
+        throw busy();
+      });
+      const req = busyReq({ authorization: 'Bearer ccui_abc123' });
+      const res = makeRes();
+      const next = vi.fn();
+
+      await callAuth(req, res, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect(res.setHeader).toHaveBeenCalledWith('Retry-After', '1');
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith({ error: expect.any(String) });
+      expect((req as { user?: unknown }).user).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers 503 when the JWT token_version check throws SQLITE_BUSY', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.mocked(userDb.getTokenVersion).mockImplementationOnce(() => {
+        throw busy();
+      });
+      const token = jwt.sign(
+        { userId: 1, username: 'testuser', tokenVersion: 1 },
+        getJwtSecret(),
+        { expiresIn: 60 },
+      );
+      const req = busyReq({ authorization: `Bearer ${token}` });
+      const res = makeRes();
+      const next = vi.fn();
+
+      await callAuth(req, res, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.status).not.toHaveBeenCalledWith(401);
+      expect(res.setHeader).toHaveBeenCalledWith('Retry-After', '1');
+    });
+
+    it('requireAdmin answers 503 when the admin check throws SQLITE_BUSY', () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.mocked(userDb.isAdmin).mockImplementationOnce(() => {
+        throw busy();
+      });
+      const req = { ...busyReq({}), user: { id: 1 } };
+      const res = makeRes();
+      const next = vi.fn();
+
+      callRequireAdmin(req, res, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.setHeader).toHaveBeenCalledWith('Retry-After', '1');
+    });
+
+    it('forwards a non-busy failure to next(err) rather than throwing or masking it', async () => {
+      const boom = new TypeError('unexpected');
+      vi.mocked(findUserByApiKey).mockImplementationOnce(() => {
+        throw boom;
+      });
+      const req = busyReq({ authorization: 'Bearer ccui_abc123' });
+      const res = makeRes();
+      const next = vi.fn();
+
+      await callAuth(req, res, next);
+
+      expect(next).toHaveBeenCalledWith(boom);
+      expect(res.status).not.toHaveBeenCalled();
+    });
+
+    it('authenticateWebSocket lets the error through — the upgrade hook maps it', () => {
+      vi.mocked(findUserByApiKey).mockImplementationOnce(() => {
+        throw busy();
+      });
+      expect(() => authenticateWebSocket('ccui_abc123')).toThrow(Database.SqliteError);
     });
   });
 

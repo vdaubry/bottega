@@ -1,11 +1,26 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import matter from 'gray-matter';
+
+// Bottega's own .claude/commands/ ships with the repo and applies to every
+// project. Kept in sync with BUILTIN_COMMANDS_DIR in
+// `server/routes/commands.ts`. See that file for the path math.
+const __filename = fileURLToPath(import.meta.url);
+const BOTTEGA_INSTALL_ROOT = path.resolve(
+  path.dirname(__filename),
+  '..',
+  '..',
+  '..',
+  '..',
+);
+const BUILTIN_COMMANDS_DIR = path.join(BOTTEGA_INSTALL_ROOT, '.claude', 'commands');
 
 /**
  * Resolve a slash command message to its expanded content.
- * Looks up custom command .md files in project and user command directories.
+ * Looks up custom command .md files in project, user, and Bottega built-in
+ * command directories.
  */
 export async function resolveSlashCommand(
   message: string | null,
@@ -25,6 +40,7 @@ export async function resolveSlashCommand(
     searchDirs.push(path.join(projectPath, '.claude', 'commands'));
   }
   searchDirs.push(path.join(os.homedir(), '.claude', 'commands'));
+  searchDirs.push(BUILTIN_COMMANDS_DIR);
 
   for (const dir of searchDirs) {
     const candidates = [

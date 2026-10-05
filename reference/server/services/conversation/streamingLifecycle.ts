@@ -23,13 +23,15 @@ export function handleStreamingStarted(context: StreamingContext): void {
   const {
     conversationId,
     taskId,
+    epicId,
     claudeSessionId,
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
   } = context;
 
   if (claudeSessionId) {
-    activeStreamingSessions.set(claudeSessionId, { taskId, conversationId });
+    activeStreamingSessions.set(claudeSessionId, { taskId, epicId, conversationId });
   }
 
   if (broadcastFn) {
@@ -38,12 +40,23 @@ export function handleStreamingStarted(context: StreamingContext): void {
       conversationId,
       ...(claudeSessionId ? { claudeSessionId } : {}),
       ...(taskId ? { taskId } : {}),
+      ...(epicId ? { epicId } : {}),
     });
   }
 
   if (broadcastToTaskSubscribersFn && taskId) {
     // `taskId` is spliced in by the helper itself.
     broadcastToTaskSubscribersFn(taskId, {
+      type: 'streaming-started',
+      conversationId,
+      ...(claudeSessionId ? { claudeSessionId } : {}),
+    });
+  }
+
+  // Epic conversations: the epic channel plays the badge/list role the task
+  // channel plays for tasks (`epicId` is spliced in by the helper).
+  if (broadcastToEpicSubscribersFn && epicId) {
+    broadcastToEpicSubscribersFn(epicId, {
       type: 'streaming-started',
       conversationId,
       ...(claudeSessionId ? { claudeSessionId } : {}),
@@ -61,8 +74,9 @@ export function handleStreamingStarted(context: StreamingContext): void {
  *
  * No success/failure parameter: from the streaming-loop's point of view a
  * turn either ended or it didn't, and the WebSocket consumers don't care
- * which. Failure is tracked separately on the agent_run row by
- * `abortSession` (user-Stop) and the orphan-recovery sweep on server restart.
+ * which. Agent-run state is tracked separately by its owner adapter: a user
+ * Stop is terminal for a task and resumably blocked for an epic; technical
+ * failures and restart recovery keep their own paths.
  */
 export async function handleStreamingComplete(
   context: StreamingContext,
@@ -70,9 +84,11 @@ export async function handleStreamingComplete(
   const {
     conversationId,
     taskId,
+    epicId,
     claudeSessionId,
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
   } = context;
 
   if (claudeSessionId) {
@@ -84,11 +100,19 @@ export async function handleStreamingComplete(
       type: 'streaming-ended',
       conversationId,
       ...(taskId ? { taskId } : {}),
+      ...(epicId ? { epicId } : {}),
     });
   }
 
   if (broadcastToTaskSubscribersFn && taskId) {
     broadcastToTaskSubscribersFn(taskId, {
+      type: 'streaming-ended',
+      conversationId,
+    });
+  }
+
+  if (broadcastToEpicSubscribersFn && epicId) {
+    broadcastToEpicSubscribersFn(epicId, {
       type: 'streaming-ended',
       conversationId,
     });

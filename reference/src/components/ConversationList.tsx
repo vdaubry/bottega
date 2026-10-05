@@ -47,12 +47,15 @@ interface ConversationListProps {
   onRenameConversation?: ((conversationId: number, name: string) => void | Promise<unknown>) | undefined;
   activeConversationId?: number | null | undefined;
   className?: string | undefined;
+  /** Why a new chat cannot start yet (the worktree is not set up); disables the button. */
+  newConversationDisabledReason?: string | null | undefined;
 }
 
 function ConversationList({
   conversations = [],
   isLoading = false,
   onNewConversation,
+  newConversationDisabledReason,
   onResumeConversation,
   onDeleteConversation,
   onRenameConversation,
@@ -151,6 +154,8 @@ function ConversationList({
           variant="default"
           size="sm"
           onClick={onNewConversation}
+          disabled={!!newConversationDisabledReason}
+          title={newConversationDisabledReason ?? undefined}
           className="h-8"
         >
           <Plus className="w-4 h-4 mr-1" />

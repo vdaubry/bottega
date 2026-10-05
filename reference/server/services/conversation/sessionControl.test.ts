@@ -15,13 +15,21 @@ vi.mock('../projectService.js', () => ({
   }),
 }));
 
-vi.mock('../../database/db.js', () => ({
+vi.mock('../../database/conversations.js', () => ({
   conversationsDb: { findByClaudeSessionId: vi.fn(), getById: vi.fn() },
-  tasksDb: { getById: vi.fn() },
-  agentRunsDb: {
-    getByConversationId: vi.fn(),
-    updateStatus: vi.fn(),
-  },
+}));
+
+// Owner questions (linked-run pre-fail, project resolution) go through the
+// owner-adapter registry; the fake task adapter delegates to shared spies.
+const { interruptLinkedRunMock, resolveOwnerMock } = vi.hoisted(() => ({
+  interruptLinkedRunMock: vi.fn(),
+  resolveOwnerMock: vi.fn(),
+}));
+vi.mock('./ownerAdapters.js', () => ({
+  ownerAdapterFor: vi.fn(() => ({
+    interruptLinkedRun: interruptLinkedRunMock,
+    resolveOwner: resolveOwnerMock,
+  })),
 }));
 
 // The Stop path now resolves the conversation's provider and dispatches to
@@ -38,14 +46,16 @@ import {
   isSessionActive,
   getActiveSessions,
   getActiveStreamingByConversation,
-  getAllActiveStreamingSessions
+  getAllActiveStreamingSessions,
+  getOngoingAtlasGenerationConversationId,
+  clearStreamingSessionsForTask
 } from './sessionControl.js';
 import {
   activeSessions,
   activeStreamingSessions,
 } from './sessionState.js';
 import { cleanupTempFiles } from './media.js';
-import { conversationsDb, agentRunsDb } from '../../database/db.js';
+import { conversationsDb } from '../../database/conversations.js';
 import { getProvider } from '../providers/registry.js';
 
 beforeEach(() => {
@@ -63,7 +73,7 @@ describe('abortSession', () => {
     expect(result).toBe(false);
   });
 
-  it('aborts the controller, cleans temp files, and removes from both maps', async () => {
+  it('aborts and keeps the busy guard until the old completion hook finishes', async () => {
     const abortController = { abort: vi.fn() } as unknown as AbortController;
     activeSessions.set('s1', {
       instance: {},
@@ -74,33 +84,30 @@ describe('abortSession', () => {
       tempDir: '/tmp/dir',
       conversationId: 42,
       taskId: 7,
+      epicId: null,
       projectId: 1,
       userId: 1,
     });
     activeStreamingSessions.set('s1', { taskId: 7, conversationId: 42 });
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue(undefined);
+    interruptLinkedRunMock.mockReturnValue(null);
 
     const result = await abortSession('s1');
 
     expect(result).toBe(true);
     expect(abortController.abort).toHaveBeenCalledOnce();
     expect(activeSessions.has('s1')).toBe(false);
-    expect(activeStreamingSessions.has('s1')).toBe(false);
+    expect(activeStreamingSessions.has('s1')).toBe(true);
     expect(cleanupTempFiles).toHaveBeenCalledWith(['/tmp/foo.png'], '/tmp/dir');
   });
 
-  it("marks the linked agent run 'failed' BEFORE the abort fires", async () => {
-    // Order matters: the agent_run row is the source of truth for "did the
-    // user stop this run". Writing it before the abort lands means the
-    // streaming-complete handler will see status='failed' when it runs and
-    // skip the chain.
+  it('records the owner interruption BEFORE the abort fires', async () => {
     let agentMarkedAtAbortTime = false;
-    const updateStatus = vi.mocked(agentRunsDb.updateStatus);
+    interruptLinkedRunMock.mockImplementation(() => {
+      return { id: 99, agent_type: 'review', status: 'running', conversation_id: 42 };
+    });
     const abortController = {
       abort: vi.fn(() => {
-        agentMarkedAtAbortTime = updateStatus.mock.calls.some(
-          ([id, status]) => id === 99 && status === 'failed',
-        );
+        agentMarkedAtAbortTime = interruptLinkedRunMock.mock.calls.length > 0;
       }),
     };
     activeSessions.set('s2', {
@@ -108,24 +115,19 @@ describe('abortSession', () => {
       status: 'active',
       conversationId: 42,
     } as never);
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue({
-      id: 99,
-      task_id: 7,
-      agent_type: 'review',
-      status: 'running',
-      conversation_id: 42,
+    vi.mocked(conversationsDb.getById).mockReturnValue({
+      id: 42,
+      owner_kind: 'task',
       provider: 'anthropic',
-      created_at: '',
-      completed_at: null,
-    });
+    } as never);
 
     await abortSession('s2');
 
     expect(agentMarkedAtAbortTime).toBe(true);
-    expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(99, 'failed');
+    expect(interruptLinkedRunMock).toHaveBeenCalledWith(42);
   });
 
-  it('does not flip a non-running agent run to failed', async () => {
+  it('leaves a run untouched when its owner reports no interruption', async () => {
     // A manual chat (no agent_run) or an already-completed run must not be
     // overwritten by an abort.
     activeSessions.set('s3', {
@@ -133,20 +135,18 @@ describe('abortSession', () => {
       status: 'active',
       conversationId: 42,
     } as never);
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue({
-      id: 99,
-      task_id: 7,
-      agent_type: 'review',
-      status: 'completed',
-      conversation_id: 42,
+    // The adapter decides whether the linked run is interruptible. A manual
+    // chat or already-completed run reports no state change.
+    interruptLinkedRunMock.mockReturnValue(null);
+    vi.mocked(conversationsDb.getById).mockReturnValue({
+      id: 42,
+      owner_kind: 'task',
       provider: 'anthropic',
-      created_at: '',
-      completed_at: '',
-    });
+    } as never);
 
     await abortSession('s3');
 
-    expect(agentRunsDb.updateStatus).not.toHaveBeenCalled();
+    expect(interruptLinkedRunMock).toHaveBeenCalledWith(42);
   });
 
   it('dispatches a server-side abort to the conversation provider (opencode)', async () => {
@@ -164,7 +164,7 @@ describe('abortSession', () => {
       tempDir: null,
     } as never);
     vi.mocked(conversationsDb.getById).mockReturnValue({ provider: 'opencode' } as never);
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue(undefined);
+    interruptLinkedRunMock.mockReturnValue(null);
 
     const result = await abortSession('oc-session-1');
 
@@ -187,8 +187,8 @@ describe('abortSession', () => {
       tempImagePaths: [],
       tempDir: null,
     } as never);
-    vi.mocked(conversationsDb.getById).mockReturnValue(undefined as never);
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue(undefined);
+    vi.mocked(conversationsDb.getById).mockReturnValue(undefined);
+    interruptLinkedRunMock.mockReturnValue(null);
 
     await abortSession('s4');
 
@@ -209,7 +209,7 @@ describe('abortSession', () => {
     } as never);
     activeStreamingSessions.set('s5', { taskId: 7, conversationId: 42 });
     vi.mocked(conversationsDb.getById).mockReturnValue({ provider: 'opencode' } as never);
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue(undefined);
+    interruptLinkedRunMock.mockReturnValue(null);
     abortTurnMock.mockImplementationOnce(() => {
       throw new Error('server unreachable');
     });
@@ -220,7 +220,7 @@ describe('abortSession', () => {
     expect(abortController.abort).toHaveBeenCalledOnce();
     expect(cleanupTempFiles).toHaveBeenCalledWith(['/tmp/x.png'], '/tmp/d');
     expect(activeSessions.has('s5')).toBe(false);
-    expect(activeStreamingSessions.has('s5')).toBe(false);
+    expect(activeStreamingSessions.has('s5')).toBe(true);
   });
 });
 
@@ -257,6 +257,30 @@ describe('getActiveStreamingByConversation', () => {
   it('returns null when no entry matches', () => {
     activeStreamingSessions.set('s1', { taskId: 1, conversationId: 100 });
     expect(getActiveStreamingByConversation(999)).toBe(null);
+  });
+});
+
+describe('getOngoingAtlasGenerationConversationId', () => {
+  it('returns the conversation id of a streaming atlas generation for the task', () => {
+    activeStreamingSessions.set('s1', { taskId: 7, conversationId: 100 });
+    vi.mocked(conversationsDb.getById).mockReturnValue({ atlas_enabled: 1 } as never);
+    expect(getOngoingAtlasGenerationConversationId(7)).toBe(100);
+  });
+
+  it('ignores streaming conversations for other tasks', () => {
+    activeStreamingSessions.set('s1', { taskId: 9, conversationId: 100 });
+    vi.mocked(conversationsDb.getById).mockReturnValue({ atlas_enabled: 1 } as never);
+    expect(getOngoingAtlasGenerationConversationId(7)).toBe(null);
+  });
+
+  it('ignores non-atlas streaming conversations (e.g. a normal coding turn)', () => {
+    activeStreamingSessions.set('s1', { taskId: 7, conversationId: 100 });
+    vi.mocked(conversationsDb.getById).mockReturnValue({ atlas_enabled: 0 } as never);
+    expect(getOngoingAtlasGenerationConversationId(7)).toBe(null);
+  });
+
+  it('returns null when nothing is streaming for the task', () => {
+    expect(getOngoingAtlasGenerationConversationId(7)).toBe(null);
   });
 });
 
@@ -301,5 +325,38 @@ describe('getAllActiveStreamingSessions', () => {
 
   it('returns [] when nothing is streaming', () => {
     expect(getAllActiveStreamingSessions(undefined)).toEqual([]);
+  });
+});
+
+describe('clearStreamingSessionsForTask', () => {
+  it('deletes and returns only the entries for the given task', () => {
+    activeStreamingSessions.set('s1', { taskId: 42, conversationId: 100 });
+    activeStreamingSessions.set('s2', { taskId: 42, conversationId: 101 });
+    activeStreamingSessions.set('s3', { taskId: 99, conversationId: 200 });
+
+    const cleared = clearStreamingSessionsForTask(42);
+
+    expect(cleared).toEqual([
+      { sessionId: 's1', conversationId: 100 },
+      { sessionId: 's2', conversationId: 101 },
+    ]);
+    // The task-42 entries are gone…
+    expect(activeStreamingSessions.has('s1')).toBe(false);
+    expect(activeStreamingSessions.has('s2')).toBe(false);
+    // …and the task-99 entry is left untouched.
+    expect(activeStreamingSessions.has('s3')).toBe(true);
+    expect(activeStreamingSessions.get('s3')).toEqual({
+      taskId: 99,
+      conversationId: 200,
+    });
+  });
+
+  it('returns [] and changes nothing when no session matches', () => {
+    activeStreamingSessions.set('s3', { taskId: 99, conversationId: 200 });
+
+    const cleared = clearStreamingSessionsForTask(42);
+
+    expect(cleared).toEqual([]);
+    expect(activeStreamingSessions.has('s3')).toBe(true);
   });
 });

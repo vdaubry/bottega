@@ -21,6 +21,7 @@ import {
 import { getCredentialStore } from '../services/credentials/registry.js';
 import {
   AGENT_TYPES_WITH_SETTINGS,
+  isAnthropicLockedKey,
   type AgentModelSetting,
   type AgentModelSettings,
 } from '../../shared/types/agentModelSettings.js';
@@ -37,9 +38,15 @@ function buildApp(): express.Application {
   return app;
 }
 
+// `schema` and `epic` are Anthropic-only by contract, so a valid full body
+// always pins them to Anthropic regardless of which provider the agent rows use.
+const ANTHROPIC_LOCKED: AgentModelSetting = { provider: 'anthropic', model: 'opus', effort: 'high' };
+
 function fullSettings(setting: AgentModelSetting): AgentModelSettings {
   const out: Record<string, AgentModelSetting> = {};
-  for (const a of AGENT_TYPES_WITH_SETTINGS) out[a] = setting;
+  for (const a of AGENT_TYPES_WITH_SETTINGS) {
+    out[a] = isAnthropicLockedKey(a) ? ANTHROPIC_LOCKED : setting;
+  }
   return out as AgentModelSettings;
 }
 
@@ -82,7 +89,7 @@ describe('/api/user-agent-model-settings', () => {
   });
 
   it('PUT persists a valid full settings object', async () => {
-    const settings = fullSettings({ provider: 'openai', model: 'gpt-5.5', effort: 'high' });
+    const settings = fullSettings({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
     const res = await request(app).put('/api/uams').send(settings);
     expect(res.status).toBe(200);
     expect(saveAgentModelSettings).toHaveBeenCalledWith(5, settings);
@@ -97,8 +104,21 @@ describe('/api/user-agent-model-settings', () => {
     expect(saveAgentModelSettings).not.toHaveBeenCalled();
   });
 
-  it('PUT rejects a cross-provider model (anthropic + gpt-5.5) (400)', async () => {
-    const settings = fullSettings({ provider: 'anthropic', model: 'gpt-5.5', effort: 'high' });
+  it('PUT rejects a cross-provider model (anthropic + gpt-6.1-sol) (400)', async () => {
+    const settings = fullSettings({ provider: 'anthropic', model: 'gpt-6.1-sol', effort: 'high' });
+    const res = await request(app).put('/api/uams').send(settings);
+    expect(res.status).toBe(400);
+    expect(saveAgentModelSettings).not.toHaveBeenCalled();
+  });
+
+  it('PUT rejects a non-Anthropic schema entry (Anthropic-only) (400)', async () => {
+    const settings = fullSettings({ provider: 'anthropic', model: 'opus', effort: 'high' });
+    // Override schema to a non-Anthropic provider — must be rejected.
+    (settings as Record<string, AgentModelSetting>).schema = {
+      provider: 'openai',
+      model: 'gpt-6.1-sol',
+      effort: 'high',
+    };
     const res = await request(app).put('/api/uams').send(settings);
     expect(res.status).toBe(400);
     expect(saveAgentModelSettings).not.toHaveBeenCalled();

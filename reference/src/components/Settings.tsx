@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
-import { X, Plus, Settings as SettingsIcon, Shield, AlertTriangle, Moon, Sun, User } from 'lucide-react';
+import { X, Plus, Settings as SettingsIcon, Shield, AlertTriangle, Moon, Sun, User, LogOut } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useAppSettings } from '../contexts/AppSettingsContext';
@@ -32,7 +32,7 @@ function Settings({
   initialTab = 'tools',
 }: SettingsProps) {
   const { isDarkMode, toggleDarkMode } = useTheme();
-  const { user, updateProfile } = useAuth();
+  const { user, updateProfile, logout } = useAuth();
   const { internalToolName, githubPrTrigger, refresh: refreshAppSettings } = useAppSettings();
   const [isTechnical, setIsTechnical] = useState(true);
   const [isUpdatingProfile, setIsUpdatingProfile] = useState(false);
@@ -751,6 +751,32 @@ function Settings({
                 </div>
 
                 <ApiKeyPanel />
+
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <LogOut className="w-5 h-5 text-blue-500" />
+                    <h3 className="text-lg font-medium text-foreground">
+                      Session
+                    </h3>
+                  </div>
+
+                  <div className="bg-gray-50 dark:bg-gray-900/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex-1 min-w-0">
+                        <div className="font-medium text-foreground">
+                          {user ? `Signed in as ${user.username}` : 'Signed in'}
+                        </div>
+                        <div className="text-sm text-muted-foreground">
+                          Signing out ends your session on every device. Your
+                          API key keeps working.
+                        </div>
+                      </div>
+                      <Button variant="outline" onClick={logout}>
+                        Sign out
+                      </Button>
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
 

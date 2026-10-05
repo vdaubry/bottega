@@ -42,7 +42,7 @@ const anthropicSettings = fullSettings({ provider: 'anthropic', model: 'sonnet',
 
 const zenCatalog = {
   models: [
-    { id: 'opencode/kimi-k2.6', bareModelId: 'kimi-k2.6', name: 'Kimi K2.6', status: 'active' as const, contextWindow: 200000 },
+    { id: 'opencode/kimi-k2.7-code', bareModelId: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', status: 'active' as const, contextWindow: 262144 },
     { id: 'opencode/qwen3.6-plus', bareModelId: 'qwen3.6-plus', name: 'Qwen3.6 Plus', status: 'active' as const, contextWindow: 128000 },
   ],
 };
@@ -66,6 +66,18 @@ describe('AgentModelsTab', () => {
     render(<AgentModelsTab />);
     expect(await screen.findByTestId('agent-row-planification')).toBeInTheDocument();
     expect(screen.getByTestId('agent-row-yolo')).toBeInTheDocument();
+  });
+
+  it('renders a Schema row locked to Anthropic (no provider dropdown, Claude models only)', async () => {
+    render(<AgentModelsTab />);
+    expect(await screen.findByTestId('agent-row-schema')).toBeInTheDocument();
+    // The provider is locked — no provider <select>, just the Claude label.
+    expect(screen.queryByTestId('agent-provider-select-schema')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agent-provider-locked-schema')).toHaveTextContent('Claude Code');
+    // Model options are the Anthropic catalog only.
+    const model = screen.getByTestId('agent-model-select-schema') as HTMLSelectElement;
+    const values = Array.from(model.querySelectorAll('option')).map((o) => o.value);
+    expect(values).toEqual(['sonnet', 'opus', 'fable']);
   });
 
   it('filters the provider dropdown to connected providers only', async () => {
@@ -96,14 +108,14 @@ describe('AgentModelsTab', () => {
 
     await waitFor(() => {
       const model = screen.getByTestId('agent-model-select-planification') as HTMLSelectElement;
-      expect(model.value).toBe('opencode/kimi-k2.6');
+      expect(model.value).toBe('opencode/kimi-k2.7-code');
     });
     expect(screen.queryByTestId('agent-effort-select-planification')).not.toBeInTheDocument();
 
     await waitFor(() => expect(api.userAgentModelSettings.update).toHaveBeenCalled());
     const calls = vi.mocked(api.userAgentModelSettings.update).mock.calls;
     const saved = calls[calls.length - 1]![0] as Record<string, AgentModelSetting>;
-    expect(saved.planification).toEqual({ provider: 'opencode', model: 'opencode/kimi-k2.6', effort: null });
+    expect(saved.planification).toEqual({ provider: 'opencode', model: 'opencode/kimi-k2.7-code', effort: null });
     // Other agents are unchanged in the full-object save.
     expect(saved.review?.provider).toBe('anthropic');
   });

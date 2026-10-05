@@ -26,6 +26,8 @@ export interface AskQuestionModalProps {
   onSubmit: (payload: AskQuestionPayload) => Promise<AskQuestionResult | void>;
   projectName?: string;
   isSubmitting?: boolean;
+  /** What the submission is waiting on, shown while it runs. */
+  statusText?: string | null;
 }
 
 function AskQuestionModal({
@@ -34,6 +36,7 @@ function AskQuestionModal({
   onSubmit,
   projectName,
   isSubmitting = false,
+  statusText = null,
 }: AskQuestionModalProps) {
   const [title, setTitle] = useState('');
   const [question, setQuestion] = useState('');
@@ -212,6 +215,12 @@ function AskQuestionModal({
             disabled={isSubmitting}
             testIdPrefix="ask-question"
           />
+
+          {isSubmitting && statusText ? (
+            <p className="text-sm text-muted-foreground" data-testid="ask-question-status">
+              {statusText}
+            </p>
+          ) : null}
 
           <div className="flex gap-2 pt-2">
             <Button

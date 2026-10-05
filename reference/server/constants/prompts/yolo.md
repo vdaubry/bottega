@@ -33,69 +33,91 @@ You are a solo delivery agent. You own this task end-to-end in a single conversa
 ## Phase 4: Mark Workflow Complete
 When implementation and tests are done, run:
 ```bash
-tsx /home/ubuntu/bottega/reference/scripts/complete-workflow.ts {{taskId}}
+tsx {{scriptsDir}}/complete-workflow.ts {{taskId}}
 ```
 
 ## Phase 5: PR + CI
 Now follow the standard PR creation and CI monitoring procedure below. `complete-pr.js` is the final step — it marks the entire YOLO workflow done.
 
-{{prCreateOrVerifyBlock}}
+**Do NOT re-run the full unit test suite before committing or creating the PR** — Phase 3 already ran it and it passed; repeating it only delays the PR, and CI runs the suite on the push anyway. Run it again locally only when **you change code yourself** below (resolving rebase conflicts, or fixing a CI failure): finish the change, run the suite **once**, then push, so a single CI run covers it. Always run it in the foreground with a generous `timeout` (up to `timeout: 600000`, i.e. 10 minutes) — backgrounded or monitored tasks are terminated when the turn ends and never report back, so the suite silently dies and the turn deadlocks — and never start a second run while one is in flight.
 
-### 2. Monitor CI Status
+{{prPublishBlock}}
+
+### 2. Check for Merge Conflicts
+Check whether the PR conflicts with the base branch:
+```bash
+gh pr view --json mergeStateStatus,mergeable --jq '{ mergeStateStatus, mergeable }'
+```
+
+**If mergeable is "MERGEABLE" (no conflicts):**
+Proceed to step 3. Do not run the test suite — nothing has changed since Phase 3 validated it.
+
+**If mergeable is "CONFLICTING" (has conflicts):**
+1. Rebase onto the base branch to resolve conflicts:
+   ```bash
+   git fetch origin {{baseBranch}} && git rebase origin/{{baseBranch}}
+   ```
+2. Resolve any conflicts during the rebase
+3. Continue the rebase: `git rebase --continue`
+4. **Run the full unit test suite** — the rebased result is a combination of changes nobody has tested. Fix any failures it surfaces
+5. Force push: `git push --force-with-lease`
+6. Re-check mergeability (max 3 conflict resolution attempts), then proceed to step 3
+
+**If mergeable is "UNKNOWN":**
+- Wait 10 seconds and re-check (GitHub may still be computing mergeability)
+- Retry up to 5 times
+
+### 3. Monitor CI Status
 Check the CI status:
 ```bash
 gh pr checks
 ```
 
-### 3. Handle CI Results
+### 4. Handle CI Results
 
 **If PENDING:**
 - Wait 30 seconds: `sleep 30`
 - Check again (max 20 polling attempts)
 - If still pending after 20 attempts, report status and stop
 
-**If PASSED:**
-Proceed to step 4 (conflict check) before completing.
+**If PASSED (or no checks are configured):**
+CI is green. Finish with step 5 — do not call the completion script from here.
 
 **If FAILED:**
 1. Get failure details: `gh pr checks` and `gh run view <run-id> --log-failed`
 2. Analyze what's causing the failures (test failures, build errors, lint issues)
 3. Fix the issues in the codebase
-4. Commit and push: `git add -A && git commit -m "Fix CI: <description>" && git push`
-5. Return to step 2 (max 10 fix iterations)
+4. Once the fix is complete, run the full unit test suite locally so the next CI run is the last one
+5. Commit and push: `git add -A && git commit -m "Fix CI: <description>" && git push`
+6. Return to step 3 (max 10 fix iterations)
 
 **If max iterations reached:**
 - Document the persistent failures
 - Stop and let the user investigate
 
-### 4. Check for Merge Conflicts
-Once CI passes, check if the PR has merge conflicts with the base branch:
+### 5. Leave the Worktree Deletable, Then Complete
+Yours is the last turn that touches this worktree: when the PR merges it gets
+deleted. So the tree you hand back has to be one that can be thrown away without
+losing anything. The QA layer in Phase 3 and any CI fix above will have left
+files behind, so check once more — the same two commands as step 1:
 ```bash
-gh pr view --json mergeStateStatus,mergeable --jq '{ mergeStateStatus, mergeable }'
+git status --porcelain --untracked-files=all
+git log --oneline HEAD --not --remotes=origin
 ```
+Both must come back **empty**. If they don't, triage exactly as in step 1: delete
+the byproducts — screenshots, recordings, traces, logs, scratch scripts — and
+commit and push what belongs in the PR. `complete-pr.ts` refuses to mark the
+stage complete while either one is non-empty, and it is right to refuse:
+whatever is still sitting here is about to be discarded.
 
-**If mergeable is "MERGEABLE" (no conflicts):**
-Run the completion script:
+Once both are empty, complete the workflow:
 ```bash
-tsx /home/ubuntu/bottega/reference/scripts/complete-pr.ts {{taskId}}
+tsx {{scriptsDir}}/complete-pr.ts {{taskId}}
 ```
-
-**If mergeable is "CONFLICTING" (has conflicts):**
-1. Rebase onto the base branch to resolve conflicts:
-   ```bash
-   git fetch origin main && git rebase origin/main
-   ```
-2. Resolve any conflicts during the rebase
-3. Continue the rebase: `git rebase --continue`
-4. Force push: `git push --force-with-lease`
-5. Return to step 2 to re-check CI (max 3 conflict resolution attempts)
-
-**If mergeable is "UNKNOWN":**
-- Wait 10 seconds and re-check (GitHub may still be computing mergeability)
-- Retry up to 5 times
 
 ## Important Constraints
 - Do NOT merge the PR - the user will merge manually
+- Leave **nothing** behind in the worktree: every change either reaches the PR or gets deleted. You ran the manual QA layer yourself, so you are the one holding its screenshots and scratch files — delete them
 - Iterate until CI passes AND no merge conflicts, or max attempts reached
 - Focus on test failures, build errors, and merge conflicts
 - If you cannot fix an issue after multiple attempts, stop and report

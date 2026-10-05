@@ -19,9 +19,11 @@
 //   - Drives `activeSessions`, the streaming lifecycle, and the
 //     agent-run completion handler.
 //
+// Provider-neutral features supplied by Bottega:
+//   - AskUserQuestion semantics through the durable `ask_user` MCP tool.
+//   - Owner-domain tools through a per-turn loopback MCP gateway.
+//
 // What this branch does NOT do (capability flags from Phase 4):
-//   - No AskUserQuestion / canUseTool (Codex SDK has no canUseTool).
-//   - No MCP wait (Codex v1 doesn't speak Bottega MCP configs).
 //   - No image attachments (Codex v1).
 //   - No thinking-delta accumulator (no `stream_event` deltas).
 //   - No live `getContextUsage()` breakdown (no per-tool breakdown).
@@ -30,11 +32,11 @@
 // `auth.json` on its own, so we surface SDK errors verbatim.
 
 import { promises as fs } from 'fs';
-import { conversationsDb, tasksDb } from '../../database/db.js';
+import { conversationsDb } from '../../database/conversations.js';
 import { resolveResumeModelEffort } from '../agentModelSettings.js';
-import { getWorktreeProjectPath, worktreeExists } from '../worktree.js';
 import { generateConversationTitle } from '../titleGenerator.js';
 import { createContextUsageTracker } from '../contextUsageTracker.js';
+import { storeConversationImage } from '../conversationImages.js';
 import { getCredentialStore } from '../credentials/registry.js';
 import { codexProvider } from '../providers/openai/index.js';
 import { mirrorCodexEvent } from '../providers/openai/messageMirror.js';
@@ -46,16 +48,32 @@ import {
   handleStreamingComplete,
   composeAsync,
 } from './streamingLifecycle.js';
-import { buildAgentRunCompletionHandler } from './agentRunLifecycle.js';
+import {
+  buildAgentRunCompletionHandler,
+  failLinkedAgentRunIfRunning,
+  handleAgentRunTurnStarted,
+} from './agentRunLifecycle.js';
 import { resolveSlashCommand } from './slashCommands.js';
+import {
+  type ConversationTarget,
+} from './conversationScope.js';
+import { resolveProviderResumeScope, resolveProviderStartScope } from './providerScope.js';
+import { mcpGatewayExtras, ownerDisallowedTools, startOwnerMcpGateway } from './portableMcpForTurn.js';
+import { loadOperatorMcpServers } from './operatorMcpForTurn.js';
+import { consumeQuestionDeferred, isQuestionDeferred } from './portableQuestionTool.js';
 import type { ConversationOptions, StreamingContext } from './types.js';
 import type { BroadcastFn } from '@shared/websocket/messages';
-import type { UnifiedMessage } from '@shared/providers/types';
+import { generatedImageBlock } from '@shared/providers/generatedImage';
+import type {
+  UnifiedAssistantImageMessage,
+  UnifiedMessage,
+  UnifiedResultMessage,
+} from '@shared/providers/types';
 
 function composeOnComplete(ctx: StreamingContext): () => Promise<void> {
   return composeAsync<void>(
-    () => handleStreamingComplete(ctx),
     buildAgentRunCompletionHandler(ctx),
+    () => handleStreamingComplete(ctx),
   );
 }
 
@@ -137,6 +155,17 @@ function unifiedToWireMessage(unified: UnifiedMessage): Record<string, unknown> 
           content: [{ type: 'thinking', thinking: unified.text }],
         },
       };
+    case 'assistant_image':
+      return {
+        type: 'assistant',
+        uuid: unified.id,
+        session_id: unified.providerSessionId,
+        parent_tool_use_id: null,
+        message: {
+          id: unified.id,
+          content: [generatedImageBlock(unified)],
+        },
+      };
     case 'result':
       return {
         type: 'result',
@@ -156,6 +185,28 @@ function unifiedToWireMessage(unified: UnifiedMessage): Record<string, unknown> 
       };
     case 'stream_delta':
       return null; // Codex doesn't emit these; defensive.
+  }
+}
+
+/**
+ * Copy a generated image out of Codex's per-user scratch folder into the
+ * conversation's own image store — the transcript entry names the file, and
+ * the store is what serves it. Returns false when the copy failed: the caller
+ * drops the message rather than leave the chat pointing at a missing file.
+ */
+async function adoptGeneratedImage(
+  conversationId: number,
+  unified: UnifiedAssistantImageMessage,
+): Promise<boolean> {
+  try {
+    await storeConversationImage(conversationId, unified.sourcePath, unified.fileName);
+    return true;
+  } catch (err) {
+    console.warn(
+      `[ConversationAdapter] Could not store generated image ${unified.sourcePath} for conversation ${conversationId}:`,
+      err,
+    );
+    return false;
   }
 }
 
@@ -181,6 +232,48 @@ function broadcastUnified(
 }
 
 /**
+ * Surface a terminal Codex turn error in the conversation transcript.
+ *
+ * The provider reports usage-limit / stream errors as a `result` event with
+ * `isError: true`. That entry is persisted, but the chat UI only renders
+ * user/assistant messages, so a failed turn otherwise looks empty on reload —
+ * the run is correctly marked failed, yet the reason is invisible. We broadcast
+ * and mirror a synthetic *assistant* message carrying the error text so the
+ * failure reason shows up both live and on reload. The uuid is derived from the
+ * result id, so the mirror upserts (no duplicate) if the turn is ever replayed.
+ */
+async function surfaceCodexTurnError(
+  result: UnifiedResultMessage,
+  broadcastFn: BroadcastFn | undefined,
+  conversationId: number,
+  projectPath: string,
+  providerSessionId: string,
+): Promise<void> {
+  const detail =
+    (result.errors ?? [])
+      .map((e) =>
+        e && typeof e === 'object' && 'message' in e
+          ? String(e.message)
+          : String(e),
+      )
+      .filter((m) => m && m !== 'undefined')
+      .join('\n') || 'The turn failed without a specific error message.';
+
+  const synthetic: UnifiedMessage = {
+    type: 'assistant',
+    id: `error_message:${result.id}`,
+    provider: 'openai',
+    providerSessionId,
+    raw: null,
+    text: `⚠️ This agent run failed and was stopped.\n\n${detail}`,
+    isSubAgent: false,
+  };
+
+  broadcastUnified(broadcastFn, conversationId, synthetic);
+  await mirrorCodexEvent({ projectFolderPath: projectPath, providerSessionId }, synthetic);
+}
+
+/**
  * Resume an existing Codex conversation. Mirrors `sendMessage` for
  * the Anthropic path: looks the conversation up, builds the CODEX_HOME
  * env, and calls `codexProvider.sendTurnMessage(resumeSessionId)`.
@@ -196,8 +289,14 @@ export async function sendCodexMessage(
   options: ConversationOptions = {},
 ): Promise<void> {
   const normalizedOptions = validateAndNormalizeOptions(options, 'sendCodexMessage');
-  const { broadcastFn, broadcastToTaskSubscribersFn, userId, permissionMode } =
-    normalizedOptions;
+  const {
+    broadcastFn,
+    broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
+    userId,
+    permissionMode,
+    videoConfig,
+  } = normalizedOptions;
 
   const conversation = conversationsDb.getById(conversationId);
   if (!conversation) {
@@ -211,26 +310,9 @@ export async function sendCodexMessage(
     );
   }
 
-  const taskId = conversation.task_id;
-  const taskWithProject = taskId ? tasksDb.getWithProject(taskId) : null;
-  if (!taskWithProject) {
-    throw new Error(`Task for conversation ${conversationId} not found`);
-  }
-  const projectId = taskWithProject.project_id;
-
-  let projectPath: string;
-  if (conversation.session_path) {
-    projectPath = conversation.session_path;
-  } else {
-    projectPath = taskWithProject.repo_folder_path;
-    if (await worktreeExists(projectPath, taskId!)) {
-      projectPath = getWorktreeProjectPath(
-        projectPath,
-        taskId!,
-        taskWithProject.subproject_path,
-      );
-    }
-  }
+  const scope = await resolveProviderResumeScope(conversation);
+  const { taskId, epicId, projectId } = scope;
+  const projectPath = conversation.session_path ?? scope.cwd;
 
   const codexEnv = getCredentialStore('openai').buildSdkEnv(userId);
   const promptText = message ?? '';
@@ -249,29 +331,47 @@ export async function sendCodexMessage(
   }
 
   const abortController = new AbortController();
-  const run = await codexProvider.sendTurnMessage({
-    cwd: projectPath,
-    prompt: promptText,
-    resumeSessionId,
-    model,
-    effort,
-    ...(permissionMode !== undefined ? { permissionMode } : {}),
-    env: codexEnv,
-    abortController,
-  });
+  const mcpGateway = await startOwnerMcpGateway(scope, conversationId, normalizedOptions);
+  const operatorMcpServers = await loadOperatorMcpServers(projectPath, videoConfig);
+  const disallowedTools = [
+    ...new Set([
+      ...(normalizedOptions.disallowedTools ?? []),
+      ...ownerDisallowedTools(scope, conversationId),
+    ]),
+  ];
+  let run;
+  try {
+    run = await codexProvider.sendTurnMessage({
+      cwd: projectPath,
+      prompt: promptText,
+      resumeSessionId,
+      model,
+      effort,
+      ...(permissionMode !== undefined ? { permissionMode } : {}),
+      env: codexEnv,
+      abortController,
+      extras: mcpGatewayExtras(mcpGateway, operatorMcpServers),
+      disallowedTools,
+    });
+  } catch (error) {
+    await mcpGateway?.close();
+    throw error;
+  }
 
   const ctx: StreamingContext = {
     conversationId,
     taskId: taskId ?? undefined,
+    epicId: epicId ?? undefined,
     claudeSessionId: resumeSessionId,
     userId,
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     isNewSession: false,
   };
 
   activeSessions.set(resumeSessionId, {
-    instance: run as unknown,
+    instance: run,
     abortController,
     startTime: Date.now(),
     status: 'active',
@@ -279,10 +379,19 @@ export async function sendCodexMessage(
     tempDir: null,
     conversationId,
     taskId: taskId ?? null,
+    epicId,
     projectId,
     userId: userId ?? null,
   });
 
+  try {
+    await handleAgentRunTurnStarted(ctx);
+  } catch (error) {
+    run.abort();
+    activeSessions.delete(resumeSessionId);
+    await mcpGateway?.close();
+    throw error;
+  }
   handleStreamingStarted(ctx);
 
   const contextUsageTracker = createContextUsageTracker({
@@ -290,8 +399,15 @@ export async function sendCodexMessage(
     broadcastFn,
   });
 
+  // Codex reports a failed turn as a pair (stream_error + turn_failed); only
+  // surface the reason once.
+  let turnErrorSurfaced = false;
+
   try {
     for await (const unified of run.events) {
+      if (unified.type === 'assistant_image' && !(await adoptGeneratedImage(conversationId, unified))) {
+        continue;
+      }
       broadcastUnified(broadcastFn, conversationId, unified);
       await mirrorCodexEvent(
         { projectFolderPath: projectPath, providerSessionId: resumeSessionId },
@@ -300,6 +416,26 @@ export async function sendCodexMessage(
         console.warn('[ConversationAdapter] Codex resume mirror failed:', err);
       });
       if (unified.type === 'result') {
+        // A terminal Codex error (e.g. "You've hit your usage limit") arrives
+        // as an in-band result event, not a thrown exception, so the loop ends
+        // cleanly. Pre-mark the agent run failed here so composeOnComplete
+        // stops the chain instead of treating the dead turn as a pass and
+        // looping to MAX_WORKFLOW_RUNS. Mirrors the OpenCode path.
+        if (unified.isError && !isQuestionDeferred(conversationId)) {
+          failLinkedAgentRunIfRunning(conversationId);
+          if (!turnErrorSurfaced) {
+            turnErrorSurfaced = true;
+            await surfaceCodexTurnError(
+              unified,
+              broadcastFn,
+              conversationId,
+              projectPath,
+              resumeSessionId,
+            ).catch((err) =>
+              console.warn('[ConversationAdapter] failed to surface Codex turn error:', err),
+            );
+          }
+        }
         await contextUsageTracker.onResult({
           type: 'result',
           ...(unified.usage ? { modelUsage: { codex: unified.usage } } : {}),
@@ -308,6 +444,10 @@ export async function sendCodexMessage(
     }
 
     activeSessions.delete(resumeSessionId);
+    if (consumeQuestionDeferred(conversationId)) {
+      await handleStreamingComplete(ctx);
+      return;
+    }
     if (broadcastFn) {
       broadcastFn(conversationId, {
         type: 'claude-complete',
@@ -320,6 +460,10 @@ export async function sendCodexMessage(
   } catch (error) {
     console.error('[ConversationAdapter] Codex resume error:', error);
     activeSessions.delete(resumeSessionId);
+    if (consumeQuestionDeferred(conversationId)) {
+      await handleStreamingComplete(ctx);
+      return;
+    }
     if (broadcastFn) {
       const errMsg = error instanceof Error ? error.message : String(error);
       broadcastFn(conversationId, {
@@ -329,18 +473,22 @@ export async function sendCodexMessage(
     }
     await composeOnComplete(ctx)();
     throw error;
+  } finally {
+    await mcpGateway?.close();
   }
 }
 
 export async function startCodexConversation(
-  taskId: number,
+  targetOrTaskId: ConversationTarget | number,
   message: string,
   options: ConversationOptions = {},
 ): Promise<{ conversationId: number; claudeSessionId: string }> {
+  const { target, scope } = await resolveProviderStartScope(targetOrTaskId);
   const normalizedOptions = validateAndNormalizeOptions(options, 'startCodexConversation');
   const {
     broadcastFn,
     broadcastToTaskSubscribersFn,
+    broadcastToEpicSubscribersFn,
     userId,
     permissionMode,
     images,
@@ -355,15 +503,8 @@ export async function startCodexConversation(
     throw new Error('startCodexConversation requires an explicit model');
   }
 
-  const taskWithProject = tasksDb.getWithProject(taskId);
-  if (!taskWithProject) {
-    throw new Error(`Task ${taskId} not found`);
-  }
-
-  let projectPath = taskWithProject.repo_folder_path;
-  if (await worktreeExists(projectPath, taskId)) {
-    projectPath = getWorktreeProjectPath(projectPath, taskId, taskWithProject.subproject_path);
-  }
+  const { taskId, epicId, projectId } = scope;
+  const projectPath = scope.cwd;
 
   // Per-user CODEX_HOME. Throws if the user has no provisioned auth.json,
   // matching the Claude path's fail-closed posture.
@@ -371,10 +512,12 @@ export async function startCodexConversation(
 
   let conversationId = options.conversationId;
   if (!conversationId) {
-    const conversation = conversationsDb.create(taskId, 'openai', model, effort);
+    const conversation = target.kind === 'epic'
+      ? conversationsDb.createForEpic(target.epicId, 'openai', model, effort)
+      : conversationsDb.create(target.taskId, 'openai', model, effort);
     conversationId = conversation.id;
     console.log(
-      `[ConversationAdapter] Created Codex conversation ${conversationId} for task ${taskId} (model=${model})`,
+      `[ConversationAdapter] Created Codex conversation ${conversationId} for ${target.kind} ${taskId ?? epicId} (model=${model})`,
     );
   }
 
@@ -390,16 +533,28 @@ export async function startCodexConversation(
     (customSystemPrompt ? `\n\n[System]\n${customSystemPrompt}` : '');
 
   const abortController = new AbortController();
-
-  const run = await codexProvider.startTurn({
-    cwd: projectPath,
-    prompt: promptText,
-    model,
-    effort,
-    ...(permissionMode !== undefined ? { permissionMode } : {}),
-    env: codexEnv,
-    abortController,
-  });
+  const mcpGateway = await startOwnerMcpGateway(scope, conversationId, normalizedOptions);
+  // The operator's own MCP servers (Playwright above all) — the Claude path
+  // gets these through `sdkOptions.mcpServers`; Codex gets them here.
+  const operatorMcpServers = await loadOperatorMcpServers(projectPath, videoConfig);
+  let run;
+  try {
+    run = await codexProvider.startTurn({
+      cwd: projectPath,
+      prompt: promptText,
+      model,
+      effort,
+      ...(permissionMode !== undefined ? { permissionMode } : {}),
+      env: codexEnv,
+      abortController,
+      extras: mcpGatewayExtras(mcpGateway, operatorMcpServers),
+      disallowedTools: normalizedOptions.disallowedTools,
+    });
+  } catch (error) {
+    await mcpGateway?.close();
+    await cleanupTempFiles(imageResult.tempImagePaths, imageResult.tempDir);
+    throw error;
+  }
 
   const { tempImagePaths, tempDir } = imageResult;
 
@@ -410,12 +565,14 @@ export async function startCodexConversation(
     }, 60000);
 
     const ctx: StreamingContext = {
-      conversationId: conversationId!,
+      conversationId: conversationId,
       taskId,
+      epicId,
       claudeSessionId: null,
       userId,
       broadcastFn,
       broadcastToTaskSubscribersFn,
+      broadcastToEpicSubscribersFn,
       isNewSession: true,
       videoConfig,
     };
@@ -424,7 +581,7 @@ export async function startCodexConversation(
     // baseline path. The breakdown capability is off for Codex so
     // `onAssistant` is never called.
     const contextUsageTracker = createContextUsageTracker({
-      conversationId: conversationId!,
+      conversationId: conversationId,
       broadcastFn,
     });
 
@@ -432,6 +589,10 @@ export async function startCodexConversation(
     // (the synthetic user message arrives first, before thread.started).
     // Once the id lands we patch and mirror them in order.
     const preSessionBuffer: UnifiedMessage[] = [];
+
+    // Codex reports a failed turn as a pair (stream_error + turn_failed); only
+    // surface the reason once.
+    let turnErrorSurfaced = false;
 
     void (async () => {
       try {
@@ -445,50 +606,65 @@ export async function startCodexConversation(
           ) {
             const sid = unified.providerSessionId;
             ctx.claudeSessionId = sid;
-            conversationsDb.updateClaudeId(conversationId!, sid);
-            conversationsDb.updateProviderSessionId(conversationId!, sid);
-            conversationsDb.updateSessionPath(conversationId!, projectPath);
+            conversationsDb.updateClaudeId(conversationId, sid);
+            conversationsDb.updateProviderSessionId(conversationId, sid);
+            conversationsDb.updateSessionPath(conversationId, projectPath);
             activeSessions.set(sid, {
-              instance: run as unknown,
+              instance: run,
               abortController,
               startTime: Date.now(),
               status: 'active',
               tempImagePaths,
               tempDir,
-              conversationId: conversationId!,
+              conversationId: conversationId,
               taskId,
-              projectId: taskWithProject.project_id,
+              epicId,
+              projectId,
               userId: userId ?? null,
             });
 
-            generateConversationTitle(
-              conversationId!,
-              message,
+            generateConversationTitle(conversationId, message, {
               broadcastFn,
               userId,
-              taskId,
+              ...(taskId != null ? { taskId } : {}),
+              ...(epicId != null ? { epicId } : {}),
               broadcastToTaskSubscribersFn,
-            );
+              broadcastToEpicSubscribersFn,
+            });
 
+            await handleAgentRunTurnStarted(ctx);
             handleStreamingStarted(ctx);
 
             if (broadcastFn) {
-              broadcastFn(conversationId!, {
+              broadcastFn(conversationId, {
                 type: 'conversation-created',
-                conversationId: conversationId!,
+                conversationId: conversationId,
                 claudeSessionId: sid,
               });
-              broadcastFn(conversationId!, {
+              broadcastFn(conversationId, {
                 type: 'session-created',
                 sessionId: sid,
               });
             }
-            if (broadcastToTaskSubscribersFn) {
+            if (broadcastToTaskSubscribersFn && taskId != null) {
               broadcastToTaskSubscribersFn(taskId, {
                 type: 'conversation-added',
                 conversation: {
-                  id: conversationId!,
+                  id: conversationId,
                   task_id: taskId,
+                  epic_id: epicId,
+                  claude_conversation_id: sid,
+                  created_at: new Date().toISOString(),
+                },
+              });
+            }
+            if (broadcastToEpicSubscribersFn && epicId != null) {
+              broadcastToEpicSubscribersFn(epicId, {
+                type: 'conversation-added',
+                conversation: {
+                  id: conversationId,
+                  task_id: taskId,
+                  epic_id: epicId,
                   claude_conversation_id: sid,
                   created_at: new Date().toISOString(),
                 },
@@ -497,10 +673,14 @@ export async function startCodexConversation(
 
             clearTimeout(timeout);
             resolved = true;
-            resolve({ conversationId: conversationId!, claudeSessionId: sid });
+            resolve({ conversationId: conversationId, claudeSessionId: sid });
           }
 
-          broadcastUnified(broadcastFn, conversationId!, unified);
+          if (unified.type === 'assistant_image' && !(await adoptGeneratedImage(conversationId, unified))) {
+            continue;
+          }
+
+          broadcastUnified(broadcastFn, conversationId, unified);
 
           // Mirror to the messages table so the conversation reloads
           // with full history. The synthetic user message arrives
@@ -535,6 +715,24 @@ export async function startCodexConversation(
           }
 
           if (unified.type === 'result') {
+            // Terminal Codex error (usage limit, stream error) surfaces as an
+            // in-band result event; pre-mark the run failed so the loop stops
+            // here instead of chaining a dead turn. See the resume path above.
+            if (unified.isError && !isQuestionDeferred(conversationId)) {
+              failLinkedAgentRunIfRunning(conversationId);
+              if (!turnErrorSurfaced && ctx.claudeSessionId) {
+                turnErrorSurfaced = true;
+                await surfaceCodexTurnError(
+                  unified,
+                  broadcastFn,
+                  conversationId,
+                  projectPath,
+                  ctx.claudeSessionId,
+                ).catch((err) =>
+                  console.warn('[ConversationAdapter] failed to surface Codex turn error:', err),
+                );
+              }
+            }
             await contextUsageTracker.onResult({
               type: 'result',
               ...(unified.usage ? { modelUsage: { codex: unified.usage } } : {}),
@@ -546,13 +744,18 @@ export async function startCodexConversation(
         if (ctx.claudeSessionId) {
           activeSessions.delete(ctx.claudeSessionId);
         }
+        if (consumeQuestionDeferred(conversationId)) {
+          await cleanupTempFiles(tempImagePaths, tempDir);
+          await handleStreamingComplete(ctx);
+          return;
+        }
         await cleanupTempFiles(tempImagePaths, tempDir);
         if (ctx.videoConfig) {
           await handleVideoRecording(ctx.videoConfig);
         }
 
         if (broadcastFn) {
-          broadcastFn(conversationId!, {
+          broadcastFn(conversationId, {
             type: 'claude-complete',
             sessionId: ctx.claudeSessionId,
             exitCode: 0,
@@ -566,6 +769,11 @@ export async function startCodexConversation(
         if (ctx.claudeSessionId) {
           activeSessions.delete(ctx.claudeSessionId);
         }
+        if (consumeQuestionDeferred(conversationId)) {
+          await cleanupTempFiles(tempImagePaths, tempDir);
+          await handleStreamingComplete(ctx);
+          return;
+        }
         await cleanupTempFiles(tempImagePaths, tempDir);
         if (ctx.videoConfig?.tempDir) {
           await fs.rm(ctx.videoConfig.tempDir, { recursive: true, force: true }).catch(() => {});
@@ -578,12 +786,14 @@ export async function startCodexConversation(
         }
         if (broadcastFn) {
           const errMsg = error instanceof Error ? error.message : String(error);
-          broadcastFn(conversationId!, {
+          broadcastFn(conversationId, {
             type: 'claude-error',
             error: errMsg,
           });
         }
         await composeOnComplete(ctx)();
+      } finally {
+        await mcpGateway?.close();
       }
     })();
   });

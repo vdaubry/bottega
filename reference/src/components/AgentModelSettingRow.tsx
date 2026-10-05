@@ -6,9 +6,9 @@ import { Loader2 } from 'lucide-react';
 import {
   MODELS_FOR_UI,
   EFFORTS_FOR_UI,
+  type AgentModelKey,
   type AgentModelSetting,
 } from '../../shared/types/agentModelSettings';
-import type { AgentType } from '../../shared/types/db';
 import type { Provider } from '../../shared/providers/types';
 import type { OpenCodeModelEntry } from '../../shared/api/openCodeAuth';
 
@@ -25,13 +25,14 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
 export const MODEL_LABELS: Record<string, string> = {
   sonnet: 'Sonnet',
   opus: 'Opus',
-  'gpt-5.5': 'GPT-5.5',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.4-mini': 'GPT-5.4 mini',
+  fable: 'Fable',
+  'gpt-6-astra': 'GPT-6 Astra',
+  'gpt-6.1-sol': 'GPT-6.1 Sol',
 };
 
+// Union across providers: `low`/`max` are Anthropic-only, `medium`/`high`/
+// `xhigh` are shared. Unknown keys fall back to the raw value at the call site.
 export const EFFORT_LABELS: Record<string, string> = {
-  minimal: 'Minimal',
   low: 'Low',
   medium: 'Medium',
   high: 'High',
@@ -68,7 +69,7 @@ export function buildModelOptions(
 }
 
 interface AgentModelSettingRowProps {
-  agentType: AgentType;
+  agentType: AgentModelKey;
   label: string;
   setting: AgentModelSetting;
   /** Providers the user has credentials for — the provider dropdown is filtered to these. */
@@ -76,7 +77,14 @@ interface AgentModelSettingRowProps {
   openCodeModels: OpenCodeModelEntry[] | null;
   isLoadingOpenCodeModels: boolean;
   disabled: boolean;
-  onChange: (agent: AgentType, patch: Partial<AgentModelSetting>) => void;
+  /**
+   * When set, this row is pinned to Anthropic: the provider dropdown is hidden
+   * (it can only ever be Claude) and the model list is the Anthropic catalog.
+   * Used by the `schema` row — the code-atlas HTML/diagram engine is in-process
+   * Claude-only.
+   */
+  lockedProvider?: 'anthropic' | undefined;
+  onChange: (agent: AgentModelKey, patch: Partial<AgentModelSetting>) => void;
 }
 
 function AgentModelSettingRow({
@@ -87,9 +95,10 @@ function AgentModelSettingRow({
   openCodeModels,
   isLoadingOpenCodeModels,
   disabled,
+  lockedProvider,
   onChange,
 }: AgentModelSettingRowProps) {
-  const providerKey = setting.provider;
+  const providerKey = lockedProvider ?? setting.provider;
   // Always include the currently-selected provider so a setting saved under a
   // since-disconnected provider still renders, plus every connected provider.
   const providerOptions: Provider[] = Array.from(
@@ -102,22 +111,31 @@ function AgentModelSettingRow({
       <span className="w-full sm:w-32 font-medium text-foreground" data-testid={`agent-row-${agentType}`}>
         {label}
       </span>
-      <label className="flex items-center gap-2 w-full sm:w-auto">
-        <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Harness</span>
-        <select
-          value={providerKey}
-          onChange={(e) => onChange(agentType, { provider: e.target.value as Provider })}
-          disabled={disabled}
-          data-testid={`agent-provider-select-${agentType}`}
-          className="flex-1 min-w-0 sm:flex-none bg-background border border-border rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
-        >
-          {providerOptions.map((p) => (
-            <option key={p} value={p}>
-              {PROVIDER_LABELS[p]}
-            </option>
-          ))}
-        </select>
-      </label>
+      {lockedProvider ? (
+        <span className="flex items-center gap-2 w-full sm:w-auto">
+          <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Harness</span>
+          <span className="text-foreground" data-testid={`agent-provider-locked-${agentType}`}>
+            {PROVIDER_LABELS[lockedProvider]}
+          </span>
+        </span>
+      ) : (
+        <label className="flex items-center gap-2 w-full sm:w-auto">
+          <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Harness</span>
+          <select
+            value={providerKey}
+            onChange={(e) => onChange(agentType, { provider: e.target.value as Provider })}
+            disabled={disabled}
+            data-testid={`agent-provider-select-${agentType}`}
+            className="flex-1 min-w-0 sm:flex-none bg-background border border-border rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+          >
+            {providerOptions.map((p) => (
+              <option key={p} value={p}>
+                {PROVIDER_LABELS[p]}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       <label className="flex items-center gap-2 w-full sm:w-auto">
         <span className="text-muted-foreground w-20 sm:w-auto shrink-0">Model</span>
         <select

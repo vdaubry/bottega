@@ -19,23 +19,21 @@ describe('shared/providers/capabilities', () => {
     expect(caps.supportsImages).toBe(true);
   });
 
-  it('OpenAI starts with conservative placeholders for v1', () => {
+  it('OpenAI supports portable questions and remote MCP tools', () => {
     const caps = CAPABILITIES_BY_PROVIDER.openai;
-    // Per D3: AskUserQuestion is Claude-only in v1.
-    expect(caps.supportsAskUserQuestion).toBe(false);
+    expect(caps.supportsAskUserQuestion).toBe(true);
     expect(caps.supportsThinkingDelta).toBe(false);
     expect(caps.supportsContextUsageBreakdown).toBe(false);
-    expect(caps.supportsMcpServers).toBe(false);
+    expect(caps.supportsMcpServers).toBe(true);
     expect(caps.supportsImages).toBe(false);
   });
 
-  it('OpenCode mirrors the Codex posture (every flag off in v1)', () => {
-    // Per docs/opencode/00-context-decisions.md § D8.
+  it('OpenCode supports portable questions and remote MCP tools', () => {
     const caps = CAPABILITIES_BY_PROVIDER.opencode;
-    expect(caps.supportsAskUserQuestion).toBe(false);
+    expect(caps.supportsAskUserQuestion).toBe(true);
     expect(caps.supportsThinkingDelta).toBe(false);
     expect(caps.supportsContextUsageBreakdown).toBe(false);
-    expect(caps.supportsMcpServers).toBe(false);
+    expect(caps.supportsMcpServers).toBe(true);
     expect(caps.supportsImages).toBe(false);
   });
 

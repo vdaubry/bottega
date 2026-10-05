@@ -9,7 +9,7 @@ import { z } from 'zod';
 
 // Path B: user pastes the JSON content of ~/.codex/auth.json from a
 // successful `codex login` run on a developer machine. We validate the
-// shape (must be an object with at least an OAuth or API-key field) and
+// shape (must be an object with ChatGPT OAuth tokens) and
 // persist verbatim with mode 0600.
 export const PasteCodexAuthBodySchema = z
   .object({

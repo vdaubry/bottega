@@ -9,6 +9,7 @@ import {
   deleteOverride,
   getOverrideMtime,
   findUnknownVariables,
+  allowedVariables,
 } from '../services/promptRenderer.js';
 import type { ApiError } from '../../shared/api/_common.js';
 import type {
@@ -32,6 +33,7 @@ router.get(
           name,
           label: def.label,
           kind: def.kind,
+          ...(def.description ? { description: def.description } : {}),
           isCustomized: hasOverride(name),
         };
       });
@@ -62,9 +64,10 @@ router.get(
         name: def.name,
         label: def.label,
         kind: def.kind,
+        ...(def.description ? { description: def.description } : {}),
         content,
         defaultContent,
-        variables: def.variables,
+        variables: allowedVariables(def),
         isCustomized,
         mtime,
       });
@@ -101,7 +104,7 @@ router.put(
       return res.status(400).json({
         error: 'Unknown template variables',
         unknownVariables: unknown,
-        allowedVariables: def.variables,
+        allowedVariables: allowedVariables(def),
       });
     }
 

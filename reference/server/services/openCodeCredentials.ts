@@ -191,7 +191,7 @@ function isOpenCodeAuthJson(value: unknown): value is OpenCodeAuthJson {
   // plan, even if the 'opencode' field is well-formed — the spawned
   // server would still see those extras and route through the wrong
   // path.
-  const keys = Object.keys(value as Record<string, unknown>);
+  const keys = Object.keys(value);
   if (keys.length !== 1 || keys[0] !== 'opencode') return false;
   const v = (value as { opencode?: unknown }).opencode;
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false;

@@ -8,7 +8,7 @@ cp CLAUDE.local.md.example CLAUDE.local.md
 ```
 
 `CLAUDE.local.md` loads automatically alongside `CLAUDE.md` every session and
-holds machine/operator-specific context that should never be committed: dev-box
+holds machine/operator-specific context that should never be committed: instance
 URLs, deploy layout, manual-test fixtures, and auth tokens. The committed
 `CLAUDE.md` stays generic and public; anything specific to how *your* box runs
 Bottega goes here instead.
@@ -20,18 +20,18 @@ Bottega goes here instead.
 
 ## Development environment
 
-- Where does your instance run? (local only, or a VPS / dev box)
+- Where does your instance run? (local only, or a remote server)
 - Public or reverse-proxy URL, if any: `https://<your-domain>` — note whether it
   is real production or a proxy to the same dev server.
-- Local URLs: frontend `http://localhost:5173`, backend `http://localhost:3001`.
+- Local URLs: frontend `http://localhost:5173`, backend `http://localhost:3002`.
 
 ## Deployment
 
 - How the app is started (e.g. systemd user service `bottega.service` under user
   `<user>`, managed with `systemctl --user`; or a process manager of your choice).
 - Any other services it orchestrates via the "switch server" feature.
-- Redeploy mechanism — how a push to `main` reaches the server (CI/CD, or a
-  manual `git pull` + restart).
+- Redeploy mechanism — how a merge to `main` reaches the running instance
+  (CI workflow, deploy script, service unit).
 - Restart/stop commands and health check for your setup.
 
 ## Manual-test fixtures
