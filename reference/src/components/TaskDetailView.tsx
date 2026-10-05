@@ -9,24 +9,27 @@
  */
 
 import React, { useState, useCallback, useEffect } from 'react';
-import { FileText, ArrowLeft, ChevronDown, Check, CheckCircle2, GitBranch, ExternalLink, GitMerge, Copy, ArrowUpRight, ArrowDownLeft, Upload, Server, ArrowDownToLine, Loader2, AlertCircle, X } from 'lucide-react';
+import { FileText, ArrowLeft, ChevronDown, Check, CheckCircle2, GitBranch, ExternalLink, GitMerge, Copy, ArrowUpRight, ArrowDownLeft, Upload, ArrowDownToLine, Loader2, AlertCircle } from 'lucide-react';
 import { Button } from './ui/button';
+import ServeSwitchButton from './ServeSwitchButton';
 import Breadcrumb from './Breadcrumb';
 import MarkdownEditor from './MarkdownEditor';
 import ConversationList from './ConversationList';
 import AgentSection from './AgentSection';
 import ReviewRecording from './ReviewRecording';
-import CIFixModal from './CIFixModal';
+import WorktreeSetupBanner from './WorktreeSetupBanner';
+import PRFixModal, { type PRFixKind } from './PRFixModal';
 import { cn } from '../lib/utils';
 import { api } from '../utils/api';
-import { cleanupWorktreeOnComplete } from '../utils/worktreeCleanup';
+import { useWorktreeGuard } from '../hooks/useWorktreeGuard';
+import { useWebSocket } from '../contexts/WebSocketContext';
 import { useClaudeAuth } from '../contexts/ClaudeAuthContext';
 import type { Provider } from '../../shared/providers/types';
 import type {
   ProjectRow,
   TaskRow,
   ConversationRow,
-  AgentRunRow,
+  TaskAgentRunRow,
   TaskStatus,
   AgentType,
 } from '../../shared/types/db';
@@ -46,6 +49,10 @@ interface WorktreeSuccess {
   behind: number;
   mainBranch: string;
   worktreePath: string;
+  // Unsaved-work counters. Optional so a response from an older server (or a
+  // test fixture) still renders — the badge simply stays hidden.
+  dirtyFiles?: number;
+  unpushed?: number;
 }
 
 interface CICheck {
@@ -65,6 +72,7 @@ interface PRStatus {
   url?: string;
   state?: string;
   mergeable?: string;
+  baseBranch?: string;
   ciStatus?: CIStatusDetails;
 }
 
@@ -90,7 +98,7 @@ export interface TaskDetailViewProps {
   activeConversationId?: number | null;
   isLoadingDoc?: boolean;
   isLoadingConversations?: boolean;
-  agentRuns?: AgentRunRow[];
+  agentRuns?: TaskAgentRunRow[];
   isLoadingAgentRuns?: boolean;
   onRunAgent: (agentType: AgentType) => void | Promise<void>;
   onBack: () => void;
@@ -99,6 +107,7 @@ export interface TaskDetailViewProps {
   onSaveTaskDoc?: (content: string) => Promise<SaveDocResult>;
   onEditDocumentation?: () => void;
   onShowDocumentation?: () => void;
+  onExploreDocumentation?: () => void;
   onStatusChange?: (taskId: number, newStatus: TaskStatus) => Promise<unknown>;
   onWorkflowCompleteChange?: (taskId: number, value: boolean) => Promise<unknown>;
   onResumeWorkflow?: (taskId: number) => Promise<unknown>;
@@ -106,7 +115,11 @@ export interface TaskDetailViewProps {
   onResumeConversation: (conversation: ConversationRow) => void;
   onDeleteConversation: (conversationId: number) => void | Promise<unknown>;
   onRenameConversation?: (conversationId: number, name: string) => void | Promise<unknown>;
-  onCIFixConversationCreated?: (conversation: Record<string, unknown> & { __initialMessage?: string }) => void;
+  onFixConversationCreated?: (conversation: Record<string, unknown> & { __initialMessage?: string }) => void;
+  /** Retry a failed worktree setup (shown on the failed-setup banner). */
+  onRetryWorktreeSetup?: () => Promise<unknown>;
+  /** Delete the task (offered on the failed-setup banner). */
+  onDeleteTask?: () => void;
   className?: string;
 }
 
@@ -117,6 +130,39 @@ const STATUS_OPTIONS: StatusOption[] = [
   { value: 'in_review', label: 'In Review', color: 'bg-blue-500/10 text-blue-600 dark:text-blue-400' },
   { value: 'completed', label: 'Completed', color: 'bg-green-500/10 text-green-600 dark:text-green-400' },
 ];
+
+/**
+ * The pre-defined message that seeds a repair conversation. Deliberately not an
+ * editable agent prompt: these are one-shot fixes, not a workflow stage.
+ */
+function buildFixPrompt(
+  kind: PRFixKind,
+  pr: { url: string; baseBranch?: string | undefined },
+): string {
+  const base = pr.baseBranch ? `\`${pr.baseBranch}\`` : 'its base branch';
+  if (kind === 'conflicts') {
+    return `The git worktree for this task contains a complete implementation.
+
+The PR cannot be merged — it conflicts with ${base}: ${pr.url}
+
+Please:
+1. Fetch the latest ${base} and merge it into this task's branch
+2. Resolve every conflict, preserving the intent of both sides
+3. Run the project's unit tests to confirm the resolution is sound
+4. Commit and push the resolution
+5. Monitor the PR status and iterate until GitHub reports no conflicts and all checks pass`;
+  }
+  return `The git worktree for this task contains a complete implementation.
+
+CI is failing for the PR: ${pr.url}
+
+Please:
+1. Retrieve the CI failures from the GitHub Action
+2. Analyze what's causing the failures
+3. Fix the issues in the codebase
+4. Push the changes
+5. Monitor the PR status and iterate until all checks pass`;
+}
 
 function TaskDetailView({
   project,
@@ -137,6 +183,7 @@ function TaskDetailView({
   onSaveTaskDoc,
   onEditDocumentation,
   onShowDocumentation,
+  onExploreDocumentation,
   onStatusChange,
   onWorkflowCompleteChange,
   onResumeWorkflow,
@@ -144,7 +191,9 @@ function TaskDetailView({
   onResumeConversation,
   onDeleteConversation,
   onRenameConversation,
-  onCIFixConversationCreated,
+  onFixConversationCreated,
+  onRetryWorktreeSetup,
+  onDeleteTask,
   className
 }: TaskDetailViewProps) {
   const { requireClaudeAuth } = useClaudeAuth();
@@ -152,6 +201,12 @@ function TaskDetailView({
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
   const [isUpdatingWorkflow, setIsUpdatingWorkflow] = useState(false);
   const [isResumingWorkflow, setIsResumingWorkflow] = useState(false);
+
+  // Every worktree-destroying action on this page routes through the guard, so
+  // the "unsaved work" prompt is identical whichever button the user pressed.
+  const { guard, guardModal } = useWorktreeGuard();
+  const { subscribe, unsubscribe } = useWebSocket();
+  const taskId = task?.id ?? null;
 
   // Worktree state
   const [worktreeStatus, setWorktreeStatus] = useState<WorktreeSuccess | null>(null);
@@ -162,49 +217,70 @@ function TaskDetailView({
   const [isMerging, setIsMerging] = useState(false);
   const [isDiscarding, setIsDiscarding] = useState(false);
   const [isPushing, setIsPushing] = useState(false);
-  const [isCreatingCIFixConversation, setIsCreatingCIFixConversation] = useState(false);
-  const [showCIFixModal, setShowCIFixModal] = useState(false);
+  const [isCreatingFixConversation, setIsCreatingFixConversation] = useState(false);
+  // Which repair the modal is collecting a provider/model for — null = closed.
+  const [fixModalKind, setFixModalKind] = useState<PRFixKind | null>(null);
   const [worktreeError, setWorktreeError] = useState<string | null>(null);
 
   // Web server state
   const [webServerStatus, setWebServerStatus] = useState<WebServerStatus | null>(null);
   const [isSwitchingServer, setIsSwitchingServer] = useState(false);
 
-  // Fetch worktree status when task changes
-  useEffect(() => {
-    const loadWorktreeStatus = async () => {
-      if (!task?.id) return;
+  /**
+   * Load worktree + PR status. Extracted from the mount effect because several
+   * things invalidate it mid-session: a push, a guard-modal save, and — the one
+   * that used to go unnoticed — an agent turn ending, which is exactly when the
+   * worktree acquires uncommitted work while the user is live-testing it.
+   */
+  const refreshWorktreeStatus = useCallback(async (options: { quiet?: boolean } = {}) => {
+    if (!taskId) return;
 
+    if (!options.quiet) {
       setIsLoadingWorktree(true);
       setWorktreeError(null);
-      try {
-        const response = await api.tasks.getWorktree(task.id);
-        if (response.ok) {
-          const data = await response.json();
-          if (data.success) {
-            setWorktreeStatus(data);
-            // Also fetch PR status
-            const prResponse = await api.tasks.getPR(task.id);
-            if (prResponse.ok) {
-              const prData = await prResponse.json();
-              setPrStatus(prData as PRStatus);
-            }
-          } else {
-            setWorktreeStatus(null);
+    }
+    try {
+      const response = await api.tasks.getWorktree(taskId);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success) {
+          setWorktreeStatus(data);
+          const prResponse = await api.tasks.getPR(taskId);
+          if (prResponse.ok) {
+            const prData = await prResponse.json();
+            setPrStatus(prData as PRStatus);
           }
         } else {
           setWorktreeStatus(null);
         }
-      } catch (err) {
-        console.error('Error loading worktree status:', err);
+      } else {
         setWorktreeStatus(null);
-      } finally {
-        setIsLoadingWorktree(false);
       }
-    };
+    } catch (err) {
+      console.error('Error loading worktree status:', err);
+      setWorktreeStatus(null);
+    } finally {
+      if (!options.quiet) setIsLoadingWorktree(false);
+    }
+  }, [taskId]);
 
-    void loadWorktreeStatus();
-  }, [task?.id]);
+  // Fetch worktree status when task changes — and once more when the
+  // background setup finishes, since the worktree only exists from then on.
+  const worktreeState = task?.worktree_state;
+  useEffect(() => {
+    void refreshWorktreeStatus();
+  }, [refreshWorktreeStatus, worktreeState]);
+
+  // A finished turn is the moment the worktree most often goes dirty — refresh
+  // quietly so the "uncommitted / unpushed" badge is true while live-testing.
+  useEffect(() => {
+    if (!taskId) return;
+    const onStreamingEnded = () => {
+      void refreshWorktreeStatus({ quiet: true });
+    };
+    subscribe('streaming-ended', onStreamingEnded);
+    return () => unsubscribe('streaming-ended', onStreamingEnded);
+  }, [taskId, subscribe, unsubscribe, refreshWorktreeStatus]);
 
   // Fetch web server status when project changes
   useEffect(() => {
@@ -392,31 +468,40 @@ function TaskDetailView({
 
   const handleMergeAndCleanup = async () => {
     if (!task?.id) return;
-    if (!confirm('This will merge the PR, delete the worktree, mark the task as completed, and return to the project dashboard. Continue?')) {
+    if (!confirm('This will merge the PR, mark the task as completed, and return to the project dashboard. Worktree cleanup runs after the merge and may finish asynchronously. Continue?')) {
       return;
     }
     setIsMerging(true);
     setWorktreeError(null);
     try {
-      const response = await api.tasks.mergeAndCleanup(task.id);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setWorktreeStatus(null);
-          setPrStatus(null);
+      const outcome = await guard({
+        taskId: task.id,
+        intent: 'merge',
+        run: (force) => api.tasks.mergeAndCleanup(task.id, force),
+      });
 
-          // Update task status to completed
-          if (onStatusChange) {
-            await onStatusChange(task.id, 'completed');
-          }
+      if (outcome.status === 'saved') {
+        // The user chose to push instead of merge — the PR moved, CI is
+        // re-running, and the worktree is still here to keep testing against.
+        await refreshWorktreeStatus();
+        return;
+      }
+      if (outcome.status === 'cancelled') return;
+      if (outcome.status === 'error') {
+        setWorktreeError(outcome.error);
+        return;
+      }
+      if (outcome.data?.success === false) {
+        setWorktreeError(outcome.data.error || 'Merge failed');
+        return;
+      }
 
-          // Navigate to project dashboard
-          if (onBack) {
-            onBack();
-          }
-        } else {
-          setWorktreeError((data as { error?: string }).error || 'Merge failed');
-        }
+      setWorktreeStatus(null);
+      setPrStatus(null);
+
+      // Navigate to project dashboard
+      if (onBack) {
+        onBack();
       }
     } catch (err) {
       setWorktreeError((err as Error).message);
@@ -425,27 +510,20 @@ function TaskDetailView({
     }
   };
 
-  const handleCIFixConversation = async (provider: Provider, model: string) => {
-    if (!task?.id || !prStatus?.url) return;
+  const handleFixConversation = async (provider: Provider, model: string) => {
+    if (!task?.id || !prStatus?.url || !fixModalKind) return;
     // The Claude-connection gate only applies to the Anthropic backend;
     // OpenAI/OpenCode validate their own credentials server-side.
     if (provider === 'anthropic' && !requireClaudeAuth()) return;
 
-    setIsCreatingCIFixConversation(true);
+    setIsCreatingFixConversation(true);
     setWorktreeError(null);
 
     try {
-      // Construct the pre-filled message
-      const message = `The git worktree for this task contains a complete implementation.
-
-CI is failing for the PR: ${prStatus.url}
-
-Please:
-1. Retrieve the CI failures from the GitHub Action
-2. Analyze what's causing the failures
-3. Fix the issues in the codebase
-4. Push the changes
-5. Monitor the PR status and iterate until all checks pass`;
+      const message = buildFixPrompt(fixModalKind, {
+        url: prStatus.url,
+        baseBranch: prStatus.baseBranch,
+      });
 
       // Create conversation with the pre-filled message on the explicitly
       // chosen (provider, model).
@@ -464,11 +542,11 @@ Please:
 
       const conversation = await response.json();
 
-      setShowCIFixModal(false);
+      setFixModalKind(null);
 
       // Navigate to the chat page with the initial message
-      if (onCIFixConversationCreated) {
-        onCIFixConversationCreated({
+      if (onFixConversationCreated) {
+        onFixConversationCreated({
           ...(conversation as unknown as Record<string, unknown>),
           __initialMessage: message
         });
@@ -476,7 +554,7 @@ Please:
     } catch (err) {
       setWorktreeError((err as Error).message);
     } finally {
-      setIsCreatingCIFixConversation(false);
+      setIsCreatingFixConversation(false);
     }
   };
 
@@ -494,38 +572,28 @@ Please:
     setIsDiscarding(true);
     setWorktreeError(null);
     try {
-      // First try without force to check for uncommitted changes
-      const response = await api.tasks.discardWorktree(task.id);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setWorktreeStatus(null);
-          setPrStatus(null);
-        } else {
-          setWorktreeError((data as { error?: string }).error || 'Failed to merge without PR');
-        }
-      } else if (response.status === 409) {
-        // Has uncommitted changes - ask for confirmation
-        const data = await response.json() as { hasChanges?: boolean };
-        if (data.hasChanges) {
-          if (confirm('This worktree has uncommitted changes that will be lost. Continue anyway?')) {
-            const forceResponse = await api.tasks.discardWorktree(task.id, true);
-            if (forceResponse.ok) {
-              const forceData = await forceResponse.json();
-              if (forceData.success) {
-                setWorktreeStatus(null);
-                setPrStatus(null);
-              } else {
-                setWorktreeError((forceData as { error?: string }).error || 'Failed to merge without PR');
-              }
-            } else {
-              setWorktreeError('Failed to merge without PR');
-            }
-          }
-        }
-      } else {
-        setWorktreeError('Failed to merge without PR');
+      const outcome = await guard({
+        taskId: task.id,
+        intent: 'discard',
+        run: (force) => api.tasks.discardWorktree(task.id, force),
+      });
+
+      if (outcome.status === 'saved') {
+        await refreshWorktreeStatus();
+        return;
       }
+      if (outcome.status === 'cancelled') return;
+      if (outcome.status === 'error') {
+        setWorktreeError(outcome.error);
+        return;
+      }
+      if (outcome.data?.success === false) {
+        setWorktreeError(outcome.data.error || 'Failed to merge without PR');
+        return;
+      }
+
+      setWorktreeStatus(null);
+      setPrStatus(null);
     } catch (err) {
       setWorktreeError((err as Error).message);
     } finally {
@@ -542,14 +610,8 @@ Please:
       if (response.ok) {
         const data = await response.json();
         if (data.success) {
-          // Refresh worktree status to update commits ahead/behind
-          const statusResponse = await api.tasks.getWorktree(task.id);
-          if (statusResponse.ok) {
-            const statusData = await statusResponse.json();
-            if (statusData.success) {
-              setWorktreeStatus(statusData);
-            }
-          }
+          // Refresh so ahead/behind and the unsaved-work badge both settle.
+          await refreshWorktreeStatus({ quiet: true });
         } else {
           setWorktreeError((data as { error?: string }).error || 'Failed to push changes');
         }
@@ -576,18 +638,45 @@ Please:
 
   if (!task) return null;
 
+  // No conversation — chat, agent, Explore — may start before the worktree is set up.
+  const notReadyReason =
+    task.worktree_state === 'provisioning'
+      ? 'The worktree is still being set up'
+      : task.worktree_state === 'failed'
+        ? 'The worktree setup failed — retry it or delete the task'
+        : null;
+
   const currentStatus = STATUS_OPTIONS.find(s => s.value === task.status) ?? STATUS_OPTIONS[0]!;
 
   const handleStatusChange = async (newStatus: TaskStatus) => {
     if (newStatus === task.status || !onStatusChange) return;
 
+    // Close the dropdown before anything can bail out. It renders a full-screen
+    // click-outside catcher, and leaving that behind (e.g. when the user cancels
+    // the guard prompt) makes the whole page unclickable.
+    setShowStatusDropdown(false);
+
+    // Completing a task deletes its worktree, so it is as destructive as Merge
+    // or Delete and takes the same prompt.
     if (newStatus === 'completed') {
-      const result = await cleanupWorktreeOnComplete(task.id);
-      if (result.aborted) return;
+      const outcome = await guard({
+        taskId: task.id,
+        intent: 'complete',
+        run: (force) => api.tasks.discardWorktree(task.id, force),
+      });
+      if (outcome.status !== 'ok') {
+        if (outcome.status === 'saved') {
+          await refreshWorktreeStatus();
+        } else if (outcome.status === 'error') {
+          setWorktreeError(outcome.error);
+        }
+        return;
+      }
+      setWorktreeStatus(null);
+      setPrStatus(null);
     }
 
     setIsUpdatingStatus(true);
-    setShowStatusDropdown(false);
     try {
       await onStatusChange(task.id, newStatus);
     } finally {
@@ -658,7 +747,7 @@ Please:
             <button
               onClick={handleResumeWorkflow}
               disabled={isResumingWorkflow}
-              title="Workflow is blocked - click to resume agent loop"
+              title={task.workflow_blocked_reason || 'Workflow is blocked - click to resume agent loop'}
               className={cn(
                 'flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors flex-shrink-0',
                 'bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/20',
@@ -751,8 +840,31 @@ Please:
         </div>
       </div>
 
-      {/* Worktree section - only show if worktree exists */}
-      {worktreeStatus && (
+      {/* Why the workflow is blocked, in the agent's own words — an escalation
+          to a technical user, a review block. Whoever opens the task sees what
+          it is waiting for; Resume stays available to everyone. */}
+      {task.workflow_blocked && task.workflow_blocked_reason ? (
+        <div
+          className="px-4 py-2 border-b border-border bg-amber-500/10 flex items-start gap-2 text-sm text-amber-700 dark:text-amber-400"
+          data-testid="workflow-blocked-reason"
+        >
+          <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+          <span className="min-w-0 break-words">Paused: {task.workflow_blocked_reason}</span>
+        </div>
+      ) : null}
+
+      {/* The worktree is set up in the background after creation; until it is
+          ready nothing can start a conversation here. */}
+      <WorktreeSetupBanner
+        state={task.worktree_state ?? 'ready'}
+        error={task.worktree_error ?? null}
+        onRetry={onRetryWorktreeSetup ?? (() => Promise.resolve())}
+        onDelete={onDeleteTask}
+      />
+
+      {/* Worktree section - only show if worktree exists, and is set up: a
+          half-built one (its hook still running) is nothing to pull, PR or merge. */}
+      {worktreeStatus && !notReadyReason && (
         <div className="px-4 py-3 border-b border-border bg-muted/30">
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
             {/* Branch info */}
@@ -781,6 +893,31 @@ Please:
                 <span className="text-muted-foreground">Up to date with {worktreeStatus.mainBranch}</span>
               )}
             </div>
+
+            {/*
+              Unsaved-work badge. `ahead`/`behind` are measured against the base
+              branch, so they look identical whether or not the work reached the
+              PR — these two are the only signal that says "what you are testing
+              is not on the pull request yet".
+            */}
+            {((worktreeStatus.dirtyFiles ?? 0) > 0 || (worktreeStatus.unpushed ?? 0) > 0) && (
+              <div
+                className="flex items-center gap-1.5 text-sm text-amber-600 dark:text-amber-400"
+                title="This work is not on the remote — pushing it updates the pull request"
+              >
+                <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                <span>
+                  {[
+                    worktreeStatus.dirtyFiles
+                      ? `${worktreeStatus.dirtyFiles} uncommitted`
+                      : null,
+                    worktreeStatus.unpushed ? `${worktreeStatus.unpushed} unpushed` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </span>
+              </div>
+            )}
 
             {/* Actions */}
             <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
@@ -863,8 +1000,35 @@ Please:
                     <ExternalLink className="w-3.5 h-3.5" />
                     View PR
                   </a>
-                  {/* Merge & Cleanup button - appearance based on CI status */}
-                  {prStatus.mergeable === 'MERGEABLE' && (() => {
+                  {/* Merge & Cleanup button - appearance based on conflicts, then CI status */}
+                  {(() => {
+                    // Conflicts come first: GitHub reports no meaningful CI
+                    // verdict for a branch that cannot be merged, and the
+                    // conflict is what blocks the merge either way.
+                    if (prStatus.mergeable === 'CONFLICTING') {
+                      return (
+                        <Button
+                          variant="default"
+                          size="sm"
+                          onClick={() => setFixModalKind('conflicts')}
+                          disabled={isCreatingFixConversation}
+                          className="h-7 text-xs bg-amber-600 hover:bg-amber-700"
+                          title="The PR conflicts with its base branch - click to pick a model and create a fix conversation"
+                        >
+                          {isCreatingFixConversation ? (
+                            <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin mr-1.5" />
+                          ) : (
+                            <GitMerge className="w-3.5 h-3.5 mr-1.5" />
+                          )}
+                          Fix conflicts
+                        </Button>
+                      );
+                    }
+
+                    // Mergeability still being computed (UNKNOWN) — no verdict
+                    // to act on, so no button at all.
+                    if (prStatus.mergeable !== 'MERGEABLE') return null;
+
                     const ciStatus = prStatus.ciStatus?.status || 'none';
 
                     // Yellow/Amber disabled state for pending CI
@@ -889,12 +1053,12 @@ Please:
                         <Button
                           variant="default"
                           size="sm"
-                          onClick={() => setShowCIFixModal(true)}
-                          disabled={isCreatingCIFixConversation}
+                          onClick={() => setFixModalKind('ci')}
+                          disabled={isCreatingFixConversation}
                           className="h-7 text-xs bg-red-600 hover:bg-red-700"
                           title="CI checks failed - click to pick a model and create a fix conversation"
                         >
-                          {isCreatingCIFixConversation ? (
+                          {isCreatingFixConversation ? (
                             <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin mr-1.5" />
                           ) : (
                             <AlertCircle className="w-3.5 h-3.5 mr-1.5" />
@@ -927,54 +1091,14 @@ Please:
 
               {/* Switch Web Server button - only show if web server is configured */}
               {webServerStatus?.isConfigured && (
-                webServerStatus.activeTaskId === task.id ? (
-                  // This worktree is the active server: a green button that
-                  // re-opens the app, plus an attached close button that
-                  // switches serving back to the main repo.
-                  <div className="inline-flex items-center">
-                    <Button
-                      variant="default"
-                      size="sm"
-                      onClick={handleOpenApp}
-                      disabled={isSwitchingServer}
-                      className="h-7 text-xs bg-green-600 hover:bg-green-700 rounded-r-none"
-                      title="This worktree is the active server — click to open the app"
-                    >
-                      <Server className="w-3.5 h-3.5 mr-1.5" />
-                      Active Server
-                    </Button>
-                    <Button
-                      variant="default"
-                      size="sm"
-                      onClick={handleResetServer}
-                      disabled={isSwitchingServer}
-                      className="h-7 px-1.5 text-xs bg-green-600 hover:bg-green-700 rounded-l-none border-l border-green-700"
-                      title="Switch the web server back to the main repo"
-                    >
-                      {isSwitchingServer ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <X className="w-3.5 h-3.5" />
-                      )}
-                    </Button>
-                  </div>
-                ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleSwitchServer}
-                    disabled={isSwitchingServer}
-                    className="h-7 text-xs"
-                    title="Switch web server to serve this worktree"
-                  >
-                    {isSwitchingServer ? (
-                      <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin mr-1.5" />
-                    ) : (
-                      <Server className="w-3.5 h-3.5 mr-1.5" />
-                    )}
-                    Switch Server
-                  </Button>
-                )
+                <ServeSwitchButton
+                  isActive={webServerStatus.activeTaskId === task.id}
+                  isSwitching={isSwitchingServer}
+                  onSwitch={() => void handleSwitchServer()}
+                  onOpenApp={handleOpenApp}
+                  onReset={() => void handleResetServer()}
+                  switchTitle="Switch web server to serve this worktree"
+                />
               )}
 
               {/* Copy path */}
@@ -1007,6 +1131,7 @@ Please:
             conversations={conversations}
             isLoading={isLoadingConversations}
             onNewConversation={onNewConversation}
+            newConversationDisabledReason={notReadyReason}
             onResumeConversation={onResumeConversation}
             onDeleteConversation={onDeleteConversation}
             onRenameConversation={onRenameConversation}
@@ -1022,6 +1147,7 @@ Please:
             onSave={onSaveTaskDoc}
             onEditClick={onEditDocumentation}
             onShowClick={onShowDocumentation}
+            onExploreClick={notReadyReason ? undefined : onExploreDocumentation}
             isLoading={isLoadingDoc}
             placeholder="No task documentation yet. Click Edit to describe what needs to be done."
             className="md:flex-1 md:min-h-0"
@@ -1032,19 +1158,22 @@ Please:
             onRunAgent={onRunAgent}
             onResumeAgent={handleResumeAgent}
             yoloMode={task.yolo_mode === 1}
+            disabledReason={notReadyReason}
             className="flex-shrink-0"
           />
           <ReviewRecording taskId={task.id} className="flex-shrink-0" />
         </div>
       </div>
 
-      <CIFixModal
-        isOpen={showCIFixModal}
-        onClose={() => setShowCIFixModal(false)}
-        onSubmit={handleCIFixConversation}
+      <PRFixModal
+        kind={fixModalKind}
+        onClose={() => setFixModalKind(null)}
+        onSubmit={handleFixConversation}
         prUrl={prStatus?.url}
-        isSubmitting={isCreatingCIFixConversation}
+        isSubmitting={isCreatingFixConversation}
       />
+
+      {guardModal}
     </div>
   );
 }

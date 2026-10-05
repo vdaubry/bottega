@@ -1,8 +1,9 @@
 import jwt from 'jsonwebtoken';
-import type { Request, RequestHandler } from 'express';
+import type { RequestHandler } from 'express';
 import { userDb } from '../database/db.js';
 import type { UserRow } from '../database/db.js';
 import { findUserByApiKey, isApiKeyFormat } from '../services/userApiKey.js';
+import { withDatabaseBusyGuard } from './databaseBusy.js';
 
 // Legacy placeholder that used to be the silent default. Tokens signed with
 // this value are guessable by anyone reading the source; refuse to use it.
@@ -49,17 +50,6 @@ interface JwtPayload {
   tokenVersion: number;
 }
 
-// Check if request is from localhost
-const isLocalhostRequest = (req: Request): boolean => {
-  const ip =
-    req.ip ||
-    (req as unknown as { connection?: { remoteAddress?: string } }).connection?.remoteAddress ||
-    req.socket?.remoteAddress;
-  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === 'localhost';
-};
-
-const LOCALHOST_BYPASS_ENDPOINTS: RegExp[] = [/^\/api\/projects\/\d+\/web-server\/config$/];
-
 interface ResolvedToken {
   user: UserRow;
   // True when the token was a JWT (eligible for rolling refresh). API keys
@@ -68,6 +58,10 @@ interface ResolvedToken {
 }
 
 // Resolve a Bearer/URL token to a user, supporting both API keys and JWTs.
+//
+// Throws whatever the synchronous lookups throw — a locked database included
+// (`SqliteError`, code SQLITE_BUSY). The two boundaries that call it,
+// `authenticateToken` and the WebSocket `verifyClient`, turn that into a 503.
 const resolveToken = (token: string | null | undefined): ResolvedToken | null => {
   if (!token) return null;
   if (isApiKeyFormat(token)) {
@@ -100,21 +94,23 @@ const signJwtForUser = (user: Pick<UserRow, 'id' | 'username'>, tokenVersion: nu
     { expiresIn: JWT_EXPIRES_IN_SECONDS },
   );
 
-// JWT / API-key authentication middleware
-const authenticateToken: RequestHandler = async (req, res, next) => {
-  const fullPath = req.baseUrl + req.path;
-  if (isLocalhostRequest(req) && LOCALHOST_BYPASS_ENDPOINTS.some((pattern) => pattern.test(fullPath))) {
-    try {
-      const user = userDb.getFirstUser();
-      if (user) {
-        req.user = user;
-        return next();
-      }
-    } catch (error) {
-      console.error('Localhost bypass error:', error);
-    }
-  }
-
+// JWT / API-key authentication middleware.
+//
+// Every request must present a credential — there is deliberately NO IP-based
+// "localhost bypass". The backend runs behind nginx → Vite → the API on
+// loopback, so it sees req.ip = 127.0.0.1 for *every* request, remote ones
+// included. An exception keyed on that address was therefore equivalent to no
+// auth at all and let anonymous internet callers act as the first user. Do not
+// re-introduce an IP-based bypass; auth decisions must not depend on req.ip.
+//
+// Synchronous on purpose, and behind `withDatabaseBusyGuard`: the lookups in
+// here are better-sqlite3 calls, which throw SQLITE_BUSY when another process
+// holds the database file. This used to be an `async` handler, so that throw
+// became a rejected promise Express 4 never sees — the unhandled rejection
+// that took a server down on 2026-09-04. Now a lock answers 503 + Retry-After
+// and any other throw goes to Express's error handler; the process is never
+// what fails.
+const authenticateToken: RequestHandler = withDatabaseBusyGuard((req, res, next) => {
   // Bearer token (Authorization header) or query-string token (for media elements that can't set headers)
   const authHeader = req.headers['authorization'];
   const bearerToken = authHeader && authHeader.split(' ')[1];
@@ -148,7 +144,7 @@ const authenticateToken: RequestHandler = async (req, res, next) => {
   }
 
   next();
-};
+});
 
 // Generate a fresh JWT for a user. Pulls the current `token_version` from
 // the DB so the issued token survives until the next logout/password-change.
@@ -160,8 +156,9 @@ const generateToken = (user: Pick<UserRow, 'id' | 'username'>): string => {
   return signJwtForUser(user, tv);
 };
 
-// Admin authorization middleware (requires authenticateToken first)
-const requireAdmin: RequestHandler = (req, res, next) => {
+// Admin authorization middleware (requires authenticateToken first). Same
+// database boundary as `authenticateToken`: `isAdmin` is a synchronous read.
+const requireAdmin: RequestHandler = withDatabaseBusyGuard((req, res, next) => {
   const userId = req.user?.id;
   if (!userId) {
     res.status(401).json({ error: 'Authentication required' });
@@ -175,7 +172,7 @@ const requireAdmin: RequestHandler = (req, res, next) => {
   }
 
   next();
-};
+});
 
 export interface WebSocketUser {
   id: number;
@@ -183,7 +180,9 @@ export interface WebSocketUser {
   username: string;
 }
 
-// WebSocket authentication function
+// WebSocket authentication function. Like `resolveToken`, it lets a locked
+// database throw: the upgrade hook (`websocket/verifyClient.ts`) is the
+// boundary that answers the handshake with a 503.
 const authenticateWebSocket = (token: string | null | undefined): WebSocketUser | null => {
   if (!token) return null;
 

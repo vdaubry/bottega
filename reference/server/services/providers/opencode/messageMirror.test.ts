@@ -11,7 +11,7 @@ import { sqliteSessionStore } from '../../sqliteSessionStore.js';
 import { mirrorOpenCodeEvent } from './messageMirror.js';
 
 const CTX = {
-  projectFolderPath: '/home/ubuntu/misc/hello_world',
+  projectFolderPath: '/home/dev/projects/hello_world',
   providerSessionId: 'sess_oc_42',
 };
 
@@ -29,13 +29,13 @@ describe('mirrorOpenCodeEvent', () => {
       raw: null,
       text: 'hi',
       isSubAgent: false,
-      model: 'kimi-k2.6',
+      model: 'kimi-k2.7-code',
     };
     await mirrorOpenCodeEvent(CTX, msg);
     expect(sqliteSessionStore.append).toHaveBeenCalledTimes(1);
     const call = vi.mocked(sqliteSessionStore.append).mock.calls[0]!;
     expect(call[0]).toMatchObject({
-      projectKey: '-home-ubuntu-misc-hello-world',
+      projectKey: '-home-dev-projects-hello-world',
       sessionId: 'sess_oc_42',
       subpath: '',
       provider: 'opencode',
@@ -46,7 +46,7 @@ describe('mirrorOpenCodeEvent', () => {
     expect(entries[0]!['uuid']).toBe('msg-1');
     // model is reprefixed to the canonical opencode/<modelID> form
     expect(((entries[0]!['message'] as Record<string, unknown>)['model'])).toBe(
-      'opencode/kimi-k2.6',
+      'opencode/kimi-k2.7-code',
     );
   });
 

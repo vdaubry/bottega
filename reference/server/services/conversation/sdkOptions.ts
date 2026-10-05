@@ -2,6 +2,9 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { sqliteSessionStore } from '../sqliteSessionStore.js';
+import { backgroundTaskPreToolUseHook } from './backgroundTaskGate.js';
+import { FIGMA_WRITE_TOOLS } from '../../constants/figmaTools.js';
+import type { SdkLocalPlugin } from './pluginConfig.js';
 import type { PermissionMode } from '@shared/websocket/messages';
 
 // bypassPermissions allows Claude to write files without prompting.
@@ -61,6 +64,12 @@ export interface MapOptionsInput {
   /** Reasoning effort, or null when none was chosen. */
   effort?: string | null | undefined;
   disallowedTools?: string[] | undefined;
+  /**
+   * Extra PreToolUse hooks appended after the always-on background-task gate
+   * (epic doc-write containment today). Hooks run in order and the first `deny`
+   * wins, so an added hook can only narrow the tool surface, never widen it.
+   */
+  extraPreToolUseHooks?: Array<(input: never) => unknown> | undefined;
 }
 
 export interface SDKOptions {
@@ -79,6 +88,9 @@ export interface SDKOptions {
   sessionStore?: typeof sqliteSessionStore;
   sessionStoreFlush?: 'eager' | 'lazy';
   mcpServers?: Record<string, unknown>;
+  /** Operator plugins named explicitly — see `conversation/pluginConfig.ts`. */
+  plugins?: SdkLocalPlugin[];
+  hooks?: Record<string, Array<{ hooks: Array<(input: unknown) => unknown> }>>;
 }
 
 /**
@@ -135,9 +147,11 @@ export function mapOptionsToSDK(options: MapOptionsInput): SDKOptions {
   // thinking widget render empty after the SDK upgrade.
   sdkOptions.thinking = { type: 'adaptive', display: 'summarized' };
 
-  if (options.disallowedTools?.length) {
-    sdkOptions.disallowedTools = options.disallowedTools;
-  }
+  // Figma writes are denied for every agent, on every turn — see
+  // constants/figmaTools.ts. Set unconditionally (not gated on the caller
+  // passing a list): most callers pass `[]`, and an empty list must still
+  // carry the Figma denial.
+  sdkOptions.disallowedTools = [...(options.disallowedTools ?? []), ...FIGMA_WRITE_TOOLS];
 
   if (sessionId) {
     sdkOptions.resume = sessionId;
@@ -154,6 +168,28 @@ export function mapOptionsToSDK(options: MapOptionsInput): SDKOptions {
   // reloads of /api/conversations/:id/messages return an empty history —
   // the WS stream stays in sync, but SQLite is stale until the turn closes.
   sdkOptions.sessionStoreFlush = 'eager';
+
+  // Defense-in-depth: force `Bash run_in_background` to the foreground and deny
+  // the defer-past-this-turn tools (`Monitor`, `ScheduleWakeup`, `CronCreate`),
+  // so a backgrounded/monitored/scheduled task can never be orphaned by the
+  // per-turn subprocess teardown even if the SDK's internal
+  // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS env flag is renamed. A PreToolUse hook
+  // is used (not canUseTool) because canUseTool is NOT consulted under
+  // permissionMode 'bypassPermissions' — the mode every turn uses — whereas
+  // PreToolUse hooks fire for every tool call. See backgroundTaskGate.ts.
+  //
+  // Callers append their own gates through `extraPreToolUseHooks` (the epic
+  // docs-write containment). They run after this one, in order.
+  sdkOptions.hooks = {
+    PreToolUse: [
+      {
+        hooks: [
+          backgroundTaskPreToolUseHook as (input: unknown) => unknown,
+          ...((options.extraPreToolUseHooks ?? []) as Array<(input: unknown) => unknown>),
+        ],
+      },
+    ],
+  };
 
   return sdkOptions;
 }

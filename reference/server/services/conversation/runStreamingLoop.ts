@@ -26,7 +26,12 @@ interface SDKIteratorMessage {
   session_id?: string;
   message?: {
     id?: string;
-    usage?: { input_tokens?: number; output_tokens?: number };
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
     error?: string;
   };
   errors?: unknown;
@@ -140,6 +145,7 @@ export async function runStreamingLoop({
           queryInstance as unknown as Parameters<ContextUsageTracker['onAssistant']>[0],
           parentToolUseId,
           masterModel,
+          sdkMessage.message?.usage ?? null,
         );
       }
 

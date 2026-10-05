@@ -27,16 +27,15 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 });
 
-// Mock ResizeObserver for components that use it
-globalThis.ResizeObserver = vi.fn().mockImplementation(() => ({
-  observe: vi.fn(),
-  unobserve: vi.fn(),
-  disconnect: vi.fn(),
-}));
+// Mock ResizeObserver / IntersectionObserver for components that use them.
+// These must be real constructors: an arrow-function mock implementation
+// throws "is not a constructor" the moment a component calls `new`.
+class NoopObserver {
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+  takeRecords = vi.fn(() => []);
+}
 
-// Mock IntersectionObserver for components that use it
-globalThis.IntersectionObserver = vi.fn().mockImplementation(() => ({
-  observe: vi.fn(),
-  unobserve: vi.fn(),
-  disconnect: vi.fn(),
-}));
+globalThis.ResizeObserver = NoopObserver;
+globalThis.IntersectionObserver = NoopObserver as unknown as typeof IntersectionObserver;

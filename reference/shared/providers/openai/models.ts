@@ -7,14 +7,11 @@
 import type { OpenAIModel, OpenAIEffort } from '../models.js';
 
 export const OPENAI_MODEL_LABELS: Record<OpenAIModel, string> = {
-  'gpt-5.5': 'GPT-5.5',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.4-mini': 'GPT-5.4 mini',
+  'gpt-6-astra': 'GPT-6 Astra',
+  'gpt-6.1-sol': 'GPT-6.1 Sol',
 };
 
 export const OPENAI_EFFORT_LABELS: Record<OpenAIEffort, string> = {
-  minimal: 'Minimal',
-  low: 'Low',
   medium: 'Medium',
   high: 'High',
   xhigh: 'Extra high',

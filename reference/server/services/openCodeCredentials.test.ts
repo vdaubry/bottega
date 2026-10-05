@@ -222,7 +222,7 @@ describe('openCodeCredentials', () => {
     // from the parent process must be stripped first; the assertion
     // is that the final value is what Bottega computed, not what the
     // parent process tried to inject.
-    const parsedContent = JSON.parse(env['OPENCODE_CONFIG_CONTENT'] as string) as {
+    const parsedContent = JSON.parse(env['OPENCODE_CONFIG_CONTENT']) as {
       permission?: { external_directory?: string };
     };
     expect(parsedContent.permission?.external_directory).toBe('allow');

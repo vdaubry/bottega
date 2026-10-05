@@ -15,7 +15,7 @@ import { ScrollArea } from '../ui/scroll-area';
 import { useTaskContext } from '../../contexts/TaskContext';
 import { useAppSettings } from '../../contexts/AppSettingsContext';
 import { api } from '../../utils/api';
-import { cleanupWorktreeOnComplete } from '../../utils/worktreeCleanup';
+import { useWorktreeGuard } from '../../hooks/useWorktreeGuard';
 import { useTasksLiveSubscriptions } from '../../hooks/useTasksLiveSubscriptions';
 import ViewToggle, { type DashboardViewMode } from './ViewToggle';
 import ProjectCardGrid, { type TaskCounts } from './ProjectCardGrid';
@@ -28,6 +28,15 @@ interface ProjectDataEntry {
   taskCounts: TaskCounts;
   hasLiveTask: boolean;
   tasks: TaskRow[];
+}
+
+// True if any task is streaming. A completed task never counts as live, even
+// if a stale streaming session momentarily slips through (Bug #1 guard).
+function anyTaskLive(
+  tasks: TaskRow[],
+  isTaskLive: (taskId: number) => boolean,
+): boolean {
+  return tasks.some((t) => isTaskLive(t.id) && t.status !== 'completed');
 }
 
 interface ActionResult {
@@ -63,6 +72,7 @@ function Dashboard({
     liveTaskIds,
   } = useTaskContext();
   const { internalToolName } = useAppSettings();
+  const { guard, guardWith, guardModal } = useWorktreeGuard();
 
   // View mode: 'project' or 'in_progress'
   const [viewMode, setViewMode] = useState<DashboardViewMode>('project');
@@ -128,8 +138,7 @@ function Dashboard({
                 completed: projectTasks.filter((t) => t.status === 'completed').length,
               };
 
-              // Check if any task in this project is live
-              const hasLiveTask = projectTasks.some((t) => isTaskLive(t.id));
+              const hasLiveTask = anyTaskLive(projectTasks, isTaskLive);
 
               newProjectData[project.id] = {
                 taskCounts,
@@ -168,7 +177,7 @@ function Dashboard({
         const projectId = Number(projectIdStr);
         const data = updated[projectId];
         if (data?.tasks) {
-          const hasLiveTask = data.tasks.some((t) => isTaskLive(t.id));
+          const hasLiveTask = anyTaskLive(data.tasks, isTaskLive);
           if (data.hasLiveTask !== hasLiveTask) {
             updated[projectId] = { ...data, hasLiveTask };
             hasChanges = true;
@@ -283,11 +292,21 @@ function Dashboard({
     [taskFormProject, createTask, loadTasks]
   );
 
-  // Handle marking task as completed
+  // Handle marking task as completed. Completing deletes the task's worktree,
+  // so it takes the same unsaved-work prompt as Merge and Delete.
   const handleCompleteTask = useCallback(
     async (taskId: number): Promise<ActionResult> => {
-      const cleanup = await cleanupWorktreeOnComplete(taskId);
-      if (cleanup.aborted) return { success: false, aborted: true };
+      const outcome = await guard({
+        taskId,
+        intent: 'complete',
+        run: (force) => api.tasks.discardWorktree(taskId, force),
+      });
+      if (outcome.status === 'cancelled' || outcome.status === 'saved') {
+        return { success: false, aborted: true };
+      }
+      if (outcome.status === 'error') {
+        return { success: false, error: outcome.error };
+      }
 
       const result = await updateTask(taskId, { status: 'completed' });
       if (result.success) {
@@ -296,7 +315,36 @@ function Dashboard({
       }
       return result;
     },
-    [updateTask]
+    [updateTask, guard]
+  );
+
+  // Deleting a task deletes its worktree too — same prompt, but with "discard"
+  // as the expected answer since the user explicitly asked for deletion.
+  const handleDeleteTask = useCallback(
+    async (taskId: number): Promise<ActionResult> => {
+      // Routed through the context's `deleteTask` (not `api.tasks.delete`) so
+      // the shared task list stays in sync; `guardWith` consumes the conflict
+      // the context hands back instead of a raw response.
+      const outcome = await guardWith<void>({
+        taskId,
+        intent: 'delete',
+        run: async (force) => {
+          const result = await deleteTask(taskId, force);
+          if (result.conflict) return { kind: 'conflict', conflict: result.conflict };
+          if (!result.success) return { kind: 'error', error: result.error || 'Failed to delete task' };
+          return { kind: 'ok', data: undefined };
+        },
+      });
+      if (outcome.status === 'cancelled' || outcome.status === 'saved') {
+        return { success: false, aborted: true };
+      }
+      if (outcome.status === 'error') {
+        return { success: false, error: outcome.error };
+      }
+      setInProgressTasks((prev) => prev.filter((t) => t.id !== taskId));
+      return { success: true };
+    },
+    [guardWith, deleteTask]
   );
 
   // Handle project card click - navigate to board view
@@ -430,7 +478,7 @@ function Dashboard({
               tasks={inProgressTasks}
               isLoading={isLoadingInProgress}
               onTaskClick={(task) => handleTaskClick(task, true)}
-              onDeleteTask={deleteTask}
+              onDeleteTask={handleDeleteTask}
               onCompleteTask={handleCompleteTask}
               onRefresh={loadInProgressTasks}
             />
@@ -439,6 +487,8 @@ function Dashboard({
       </ScrollArea>
 
       {/* Task Form Modal */}
+      {guardModal}
+
       <TaskForm
         isOpen={showTaskForm}
         onClose={() => {

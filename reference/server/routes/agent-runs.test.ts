@@ -7,7 +7,12 @@ vi.mock('../database/db.js', () => ({
   tasksDb: {
     getWithProject: vi.fn()
   },
-  agentRunsDb: {
+  TaskWorktreeNotReadyError: class TaskWorktreeNotReadyError extends Error {
+    constructor(taskId: number, state: string) {
+      super(`Task ${taskId} worktree: ${state}`);
+    }
+  },
+  taskAgentRunsDb: {
     create: vi.fn(),
     getById: vi.fn(),
     getByTask: vi.fn(),
@@ -25,13 +30,37 @@ vi.mock('../services/projectService.js', () => ({
 // Mock the agentRunner service
 vi.mock('../services/agentRunner.js', () => ({
   startAgentRun: vi.fn(),
-  getRunningAgentForTask: vi.fn()
+  TaskAgentRunConflictError: class TaskAgentRunConflictError extends Error {
+    constructor(
+      public readonly taskId: number,
+      public readonly runningAgent: Record<string, unknown>,
+    ) {
+      super(`Task ${taskId} already has a running agent`);
+      this.name = 'TaskAgentRunConflictError';
+    }
+  },
+  // Real class: the route branches on `instanceof`.
+  BaseSyncConflictError: class BaseSyncConflictError extends Error {
+    constructor(
+      public readonly taskId: number,
+      public readonly baseBranch: string,
+      public readonly gitError: string,
+    ) {
+      super(`Task ${taskId} could not be synced with ${baseBranch}: ${gitError}`);
+      this.name = 'BaseSyncConflictError';
+    }
+  }
 }));
 
 import agentRunsRoutes from './agent-runs.js';
-import { tasksDb, agentRunsDb } from '../database/db.js';
+import { tasksDb, taskAgentRunsDb, TaskWorktreeNotReadyError } from '../database/db.js';
 import { hasProjectAccess } from '../services/projectService.js';
-import { startAgentRun, getRunningAgentForTask } from '../services/agentRunner.js';
+
+import {
+  startAgentRun,
+  BaseSyncConflictError,
+  TaskAgentRunConflictError,
+} from '../services/agentRunner.js';
 
 describe('Agent Runs Routes', () => {
   let app: import("express").Application;
@@ -64,14 +93,14 @@ describe('Agent Runs Routes', () => {
         { id: 2, task_id: 1, agent_type: 'review', status: 'running' }
       ];
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue(mockAgentRuns as never);
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue(mockAgentRuns as never);
 
       const response = await request(app).get('/api/tasks/1/agent-runs');
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual(mockAgentRuns);
       expect(tasksDb.getWithProject).toHaveBeenCalledWith(1);
-      expect(agentRunsDb.getByTask).toHaveBeenCalledWith(1);
+      expect(taskAgentRunsDb.getByTask).toHaveBeenCalledWith(1);
     });
 
     it('should return 400 for invalid task ID', async () => {
@@ -102,7 +131,7 @@ describe('Agent Runs Routes', () => {
 
     it('should return empty array when no agent runs exist', async () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
-      vi.mocked(agentRunsDb.getByTask).mockReturnValue([]);
+      vi.mocked(taskAgentRunsDb.getByTask).mockReturnValue([]);
 
       const response = await request(app).get('/api/tasks/1/agent-runs');
 
@@ -121,6 +150,7 @@ describe('Agent Runs Routes', () => {
     const mockAgentRun = {
       id: 1,
       task_id: 1,
+      epic_id: null,
       agent_type: 'implementation',
       status: 'running',
       conversation_id: 1
@@ -128,7 +158,6 @@ describe('Agent Runs Routes', () => {
 
     beforeEach(() => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
-      vi.mocked(getRunningAgentForTask).mockReturnValue(null);
       vi.mocked(startAgentRun).mockResolvedValue({ agentRun: mockAgentRun } as never);
     });
 
@@ -250,7 +279,6 @@ describe('Agent Runs Routes', () => {
 
     it('should accept yolo as a valid agentType', async () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1, repo_folder_path: '/path' } as never);
-      vi.mocked(getRunningAgentForTask).mockReturnValue(null);
       vi.mocked(startAgentRun).mockResolvedValue({
         agentRun: { id: 42, task_id: 1, agent_type: 'yolo', status: 'running' }
       } as never);
@@ -294,10 +322,14 @@ describe('Agent Runs Routes', () => {
       const runningAgent = {
         id: 1,
         task_id: 1,
+        epic_id: null,
         agent_type: 'review',
         status: 'running'
       };
-      vi.mocked(getRunningAgentForTask).mockReturnValue(runningAgent as never);
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
+      vi.mocked(startAgentRun).mockRejectedValue(
+        new TaskAgentRunConflictError(1, runningAgent as never),
+      );
 
       const response = await request(app)
         .post('/api/tasks/1/agent-runs')
@@ -306,7 +338,21 @@ describe('Agent Runs Routes', () => {
       expect(response.status).toBe(409);
       expect(response.body.error).toBe('An agent is already running for this task');
       expect(response.body.runningAgent).toEqual(runningAgent);
-      expect(startAgentRun).not.toHaveBeenCalled();
+      expect(startAgentRun).toHaveBeenCalledOnce();
+    });
+
+    it('should return 409 with the reason while the worktree is not set up', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
+      vi.mocked(startAgentRun).mockRejectedValue(
+        new TaskWorktreeNotReadyError(1, 'provisioning'),
+      );
+
+      const response = await request(app)
+        .post('/api/tasks/1/agent-runs')
+        .send({ agentType: 'planification' });
+
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe('Task 1 worktree: provisioning');
     });
 
     it('should return 500 if startAgentRun throws an error', async () => {
@@ -319,18 +365,33 @@ describe('Agent Runs Routes', () => {
       expect(response.status).toBe(500);
       expect(response.body.error).toBe('Failed to start agent run');
     });
+
+    it('answers 409 when the worktree conflicts with the epic feature branch', async () => {
+      vi.mocked(startAgentRun).mockRejectedValue(
+        new BaseSyncConflictError(1, 'epic/8-nimbus', 'CONFLICT (content)'),
+      );
+
+      const response = await request(app)
+        .post('/api/tasks/1/agent-runs')
+        .send({ agentType: 'planification' });
+
+      expect(response.status).toBe(409);
+      expect(response.body.error).toContain('epic/8-nimbus');
+      expect(response.body.error).toContain('resume the task');
+    });
   });
 
   describe('GET /api/agent-runs/:id', () => {
     const mockAgentRun = {
       id: 1,
       task_id: 1,
+      epic_id: null,
       agent_type: 'implementation',
       status: 'running'
     };
 
     it('should return agent run by ID', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
 
       const response = await request(app).get('/api/agent-runs/1');
@@ -347,7 +408,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if agent run not found', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(null as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(null as never);
 
       const response = await request(app).get('/api/agent-runs/999');
 
@@ -356,7 +417,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if user is not a project member', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
       vi.mocked(hasProjectAccess).mockReturnValue(false);
 
@@ -371,21 +432,22 @@ describe('Agent Runs Routes', () => {
     const mockAgentRun = {
       id: 1,
       task_id: 1,
+      epic_id: null,
       agent_type: 'implementation',
       status: 'running'
     };
 
     it('should mark agent run as completed', async () => {
       const completedRun = { ...mockAgentRun, status: 'completed' };
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
-      vi.mocked(agentRunsDb.updateStatus).mockReturnValue(completedRun as never);
+      vi.mocked(taskAgentRunsDb.updateStatus).mockReturnValue(completedRun as never);
 
       const response = await request(app).put('/api/agent-runs/1/complete');
 
       expect(response.status).toBe(200);
       expect(response.body.status).toBe('completed');
-      expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(1, 'completed');
+      expect(taskAgentRunsDb.updateStatus).toHaveBeenCalledWith(1, 'completed');
     });
 
     it('should return 400 for invalid agent run ID', async () => {
@@ -396,7 +458,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if agent run not found', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(null as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(null as never);
 
       const response = await request(app).put('/api/agent-runs/999/complete');
 
@@ -405,7 +467,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if user is not a project member', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
       vi.mocked(hasProjectAccess).mockReturnValue(false);
 
@@ -420,6 +482,7 @@ describe('Agent Runs Routes', () => {
     const mockAgentRun = {
       id: 1,
       task_id: 1,
+      epic_id: null,
       agent_type: 'implementation',
       status: 'running',
       conversation_id: null
@@ -427,9 +490,9 @@ describe('Agent Runs Routes', () => {
 
     it('should link conversation to agent run', async () => {
       const linkedRun = { ...mockAgentRun, conversation_id: 5 };
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
-      vi.mocked(agentRunsDb.linkConversation).mockReturnValue(linkedRun as never);
+      vi.mocked(taskAgentRunsDb.linkConversation).mockReturnValue(linkedRun as never);
 
       const response = await request(app)
         .put('/api/agent-runs/1/link-conversation')
@@ -437,7 +500,7 @@ describe('Agent Runs Routes', () => {
 
       expect(response.status).toBe(200);
       expect(response.body.conversation_id).toBe(5);
-      expect(agentRunsDb.linkConversation).toHaveBeenCalledWith(1, 5);
+      expect(taskAgentRunsDb.linkConversation).toHaveBeenCalledWith(1, 5);
     });
 
     it('should return 400 for invalid agent run ID', async () => {
@@ -459,7 +522,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if agent run not found', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(null as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(null as never);
 
       const response = await request(app)
         .put('/api/agent-runs/999/link-conversation')
@@ -470,7 +533,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if user is not a project member', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
       vi.mocked(hasProjectAccess).mockReturnValue(false);
 
@@ -487,20 +550,21 @@ describe('Agent Runs Routes', () => {
     const mockAgentRun = {
       id: 1,
       task_id: 1,
+      epic_id: null,
       agent_type: 'implementation',
       status: 'completed'
     };
 
     it('should delete agent run', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
-      vi.mocked(agentRunsDb.delete).mockReturnValue(true);
+      vi.mocked(taskAgentRunsDb.delete).mockReturnValue(true);
 
       const response = await request(app).delete('/api/agent-runs/1');
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ success: true });
-      expect(agentRunsDb.delete).toHaveBeenCalledWith(1);
+      expect(taskAgentRunsDb.delete).toHaveBeenCalledWith(1);
     });
 
     it('should return 400 for invalid agent run ID', async () => {
@@ -511,7 +575,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if agent run not found', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(null as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(null as never);
 
       const response = await request(app).delete('/api/agent-runs/999');
 
@@ -520,7 +584,7 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if user is not a project member', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
       vi.mocked(hasProjectAccess).mockReturnValue(false);
 
@@ -531,9 +595,9 @@ describe('Agent Runs Routes', () => {
     });
 
     it('should return 404 if delete returns false', async () => {
-      vi.mocked(agentRunsDb.getById).mockReturnValue(mockAgentRun as never);
+      vi.mocked(taskAgentRunsDb.getById).mockReturnValue(mockAgentRun as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
-      vi.mocked(agentRunsDb.delete).mockReturnValue(false);
+      vi.mocked(taskAgentRunsDb.delete).mockReturnValue(false);
 
       const response = await request(app).delete('/api/agent-runs/1');
 

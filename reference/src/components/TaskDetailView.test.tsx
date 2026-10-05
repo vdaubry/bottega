@@ -76,9 +76,11 @@ vi.mock('./ConversationList', () => ({
     onResumeConversation,
     onDeleteConversation,
     activeConversationId,
+    newConversationDisabledReason,
   }: {
     conversations?: Array<{ id: number | string; title?: string | null }>;
     isLoading?: boolean;
+    newConversationDisabledReason?: string | null;
     onNewConversation?: () => void;
     onResumeConversation?: (c: { id: number | string }) => void;
     onDeleteConversation?: (id: number | string) => void;
@@ -87,7 +89,13 @@ vi.mock('./ConversationList', () => ({
     <div data-testid="conversation-list">
       {isLoading && <span data-testid="conv-loading">Loading...</span>}
       <span data-testid="conv-count">{conversations?.length || 0}</span>
-      <button data-testid="new-conv" onClick={onNewConversation}>New</button>
+      <button
+        data-testid="new-conv"
+        onClick={onNewConversation}
+        disabled={!!newConversationDisabledReason}
+      >
+        New
+      </button>
       {conversations?.map((c) => (
         <div key={c.id} data-testid={`conv-${c.id}`}>
           <button data-testid={`resume-${c.id}`} onClick={() => onResumeConversation?.(c)}>
@@ -109,6 +117,17 @@ vi.mock('./ReviewRecording', () => ({
       ReviewRecording
     </div>
   ),
+}));
+
+// The view subscribes to `streaming-ended` to keep the unsaved-work badge
+// honest while an agent is working; these tests don't exercise the socket.
+vi.mock('../contexts/WebSocketContext', () => ({
+  useWebSocket: () => ({
+    subscribe: vi.fn(),
+    unsubscribe: vi.fn(),
+    sendMessage: vi.fn(),
+    isConnected: true,
+  }),
 }));
 
 // Mock the API client. Defaults return non-ok responses so the worktree / web
@@ -165,6 +184,8 @@ vi.mock('lucide-react', () => ({
   GitPullRequest: () => <span data-testid="icon-git-pull-request" />,
   Sparkles: () => <span data-testid="icon-sparkles" />,
   Zap: () => <span data-testid="icon-zap" />,
+  RotateCw: () => <span data-testid="icon-rotate-cw" />,
+  Trash2: () => <span data-testid="icon-trash-2" />,
 }));
 
 describe('TaskDetailView Component', () => {
@@ -235,6 +256,60 @@ describe('TaskDetailView Component', () => {
       render(<TaskDetailView {...defaultProps} />);
       expect(screen.getByTestId('conversation-list')).toBeInTheDocument();
       expect(screen.getByTestId('conv-count')).toHaveTextContent('2');
+    });
+  });
+
+  // Nothing may start a conversation before the background worktree setup
+  // is done: not a chat, not an agent.
+  describe('Worktree setup', () => {
+    it('shows the setup banner and disables new chats and agents while it runs', () => {
+      render(
+        <TaskDetailView
+          {...defaultProps}
+          task={{ ...mockTask, worktree_state: 'provisioning', worktree_error: null }}
+        />,
+      );
+
+      expect(screen.getByTestId('worktree-setup-provisioning')).toBeInTheDocument();
+      expect(screen.getByTestId('new-conv')).toBeDisabled();
+      const runButtons = screen.getAllByRole('button', { name: /^Run$/ });
+      expect(runButtons.length).toBeGreaterThan(0);
+      for (const button of runButtons) expect(button).toBeDisabled();
+    });
+
+    it('offers Retry and Delete when the setup failed', () => {
+      const onRetryWorktreeSetup = vi.fn().mockResolvedValue(undefined);
+      const onDeleteTask = vi.fn();
+      render(
+        <TaskDetailView
+          {...defaultProps}
+          task={{ ...mockTask, worktree_state: 'failed', worktree_error: 'hook exited with code 1' }}
+          onRetryWorktreeSetup={onRetryWorktreeSetup}
+          onDeleteTask={onDeleteTask}
+        />,
+      );
+
+      expect(screen.getByTestId('worktree-setup-failed')).toHaveTextContent('hook exited with code 1');
+      expect(screen.getByTestId('new-conv')).toBeDisabled();
+      fireEvent.click(screen.getByRole('button', { name: /Retry setup/ }));
+      expect(onRetryWorktreeSetup).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole('button', { name: /Delete task/ }));
+      expect(onDeleteTask).toHaveBeenCalledOnce();
+    });
+
+    it('enables everything once the worktree is ready', () => {
+      render(
+        <TaskDetailView
+          {...defaultProps}
+          task={{ ...mockTask, worktree_state: 'ready', worktree_error: null }}
+        />,
+      );
+
+      expect(screen.queryByTestId('worktree-setup-failed')).not.toBeInTheDocument();
+      expect(screen.getByTestId('new-conv')).toBeEnabled();
+      for (const button of screen.getAllByRole('button', { name: /^Run$/ })) {
+        expect(button).toBeEnabled();
+      }
     });
   });
 
@@ -650,6 +725,138 @@ describe('TaskDetailView Component', () => {
       await waitFor(() => {
         expect(api.projects.switchWebServer).toHaveBeenCalledWith('p1', null);
       });
+    });
+  });
+
+  describe('PR repair buttons', () => {
+    // Drive the worktree panel into its "PR exists" shape; `pr` decides which
+    // of the merge / Fix-CI / Fix-conflicts buttons the bar renders.
+    const setupPR = (pr: Record<string, unknown>) => {
+      vi.mocked(api.tasks.getWorktree).mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            success: true,
+            branch: 'feature/x',
+            ahead: 1,
+            behind: 0,
+            mainBranch: 'main',
+            worktreePath: '/tmp/wt',
+          }),
+      } as never);
+      vi.mocked(api.tasks.getPR).mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            success: true,
+            exists: true,
+            url: 'https://github.com/o/r/pull/7',
+            state: 'OPEN',
+            ciStatus: { status: 'none', checks: [] },
+            ...pr,
+          }),
+      } as never);
+      vi.mocked(api.conversations.createWithMessage).mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ id: 42 }),
+      } as never);
+    };
+
+    it('offers "Fix conflicts" instead of merging when the PR conflicts with its base', async () => {
+      setupPR({ mergeable: 'CONFLICTING', baseBranch: 'main' });
+      const onFixConversationCreated = vi.fn();
+
+      render(
+        <TaskDetailView {...defaultProps} onFixConversationCreated={onFixConversationCreated} />,
+      );
+
+      const fixButton = await screen.findByText('Fix conflicts');
+      expect(screen.queryByText('Merge & Cleanup')).not.toBeInTheDocument();
+
+      fireEvent.click(fixButton);
+      expect(screen.getByText('Fix merge conflicts')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('Start fix'));
+
+      await waitFor(() => {
+        expect(api.conversations.createWithMessage).toHaveBeenCalled();
+      });
+      const [, payload] = vi.mocked(api.conversations.createWithMessage).mock.calls[0]!;
+      const message = (payload as { message: string }).message;
+      expect(message).toContain('conflicts with `main`');
+      expect(message).toContain('https://github.com/o/r/pull/7');
+      expect((payload as { projectPath?: string }).projectPath).toBe('/tmp/wt');
+
+      await waitFor(() => {
+        expect(onFixConversationCreated).toHaveBeenCalledWith(
+          expect.objectContaining({ id: 42, __initialMessage: message }),
+        );
+      });
+    });
+
+    it('offers "Fix CI" when the PR is mergeable but CI failed', async () => {
+      setupPR({
+        mergeable: 'MERGEABLE',
+        baseBranch: 'main',
+        ciStatus: { status: 'failed', checks: [] },
+      });
+
+      render(<TaskDetailView {...defaultProps} />);
+
+      fireEvent.click(await screen.findByText('Fix CI'));
+      expect(screen.getByText('Fix CI failures')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('Start fix'));
+
+      await waitFor(() => {
+        expect(api.conversations.createWithMessage).toHaveBeenCalled();
+      });
+      const [, payload] = vi.mocked(api.conversations.createWithMessage).mock.calls[0]!;
+      expect((payload as { message: string }).message).toContain('CI is failing for the PR');
+    });
+
+    it('renders no merge button while GitHub is still computing mergeability', async () => {
+      setupPR({ mergeable: 'UNKNOWN' });
+
+      render(<TaskDetailView {...defaultProps} />);
+
+      await screen.findByText('View PR');
+      expect(screen.queryByText('Fix conflicts')).not.toBeInTheDocument();
+      expect(screen.queryByText('Fix CI')).not.toBeInTheDocument();
+      expect(screen.queryByText('Merge & Cleanup')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('Workflow blocked reason', () => {
+    const reason = 'Needs a technical user: the orders tables change';
+
+    it('shows the agent reason as a Paused banner and on the Resume button', () => {
+      const blockedTask = {
+        ...mockTask,
+        workflow_blocked: 1,
+        workflow_blocked_reason: reason,
+      } as unknown as TaskRow;
+      render(<TaskDetailView {...defaultProps} task={blockedTask} onResumeWorkflow={vi.fn()} />);
+
+      expect(screen.getByTestId('workflow-blocked-reason')).toHaveTextContent(`Paused: ${reason}`);
+      expect(screen.getByTitle(reason)).toBeInTheDocument();
+    });
+
+    it('shows no banner when the block carries no reason', () => {
+      const blockedTask = {
+        ...mockTask,
+        workflow_blocked: 1,
+        workflow_blocked_reason: null,
+      } as unknown as TaskRow;
+      render(<TaskDetailView {...defaultProps} task={blockedTask} onResumeWorkflow={vi.fn()} />);
+
+      expect(screen.queryByTestId('workflow-blocked-reason')).toBeNull();
+      expect(screen.getByTitle('Workflow is blocked - click to resume agent loop')).toBeInTheDocument();
+    });
+
+    it('shows no banner when the workflow is not blocked', () => {
+      render(<TaskDetailView {...defaultProps} />);
+      expect(screen.queryByTestId('workflow-blocked-reason')).toBeNull();
     });
   });
 });

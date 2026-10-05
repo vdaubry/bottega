@@ -76,6 +76,13 @@ function BoardTaskCard({
 }: BoardTaskCardProps) {
   // Extract preview text from documentation
   const preview = useMemo(() => extractPreview(docPreview), [docPreview]);
+  // The worktree is set up in the background after creation.
+  const setupBadge =
+    task.worktree_state === 'provisioning'
+      ? { label: 'SETTING UP', className: 'bg-blue-600 text-white' }
+      : task.worktree_state === 'failed'
+        ? { label: 'SETUP FAILED', className: 'bg-red-600 text-white' }
+        : null;
 
   const handleEditClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
@@ -126,8 +133,22 @@ function BoardTaskCard({
         </div>
       )}
 
+      {/* Worktree setup indicator */}
+      {setupBadge && !isLive && (
+        <div className="absolute top-2 right-2" data-testid={`board-task-setup-${task.id}`}>
+          <span
+            className={cn(
+              'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold',
+              setupBadge.className,
+            )}
+          >
+            {setupBadge.label}
+          </span>
+        </div>
+      )}
+
       {/* BLOCKED indicator */}
-      {isBlocked && !isLive && (
+      {isBlocked && !isLive && !setupBadge && (
         <div className="absolute top-2 right-2">
           <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-600 text-white">
             BLOCKED
@@ -139,7 +160,8 @@ function BoardTaskCard({
       <h4 className={cn(
         'font-semibold text-sm text-foreground leading-tight',
         'line-clamp-2',
-        (isLive || isBlocked) && 'pr-14' // Make room for LIVE/BLOCKED indicator
+        (isLive || isBlocked) && 'pr-14', // Make room for LIVE/BLOCKED indicator
+        setupBadge && !isLive && 'pr-24' // …or the wider worktree setup badge
       )}>
         {task.title || `Task ${task.id}`}
       </h4>

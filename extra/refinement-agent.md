@@ -20,7 +20,7 @@ straight `workflow_complete → PR`, exactly as core describes.
 
 The finish pipeline lives in the completion handler's `workflow_complete`
 branch — see `handleAgentChaining` in
-[`../reference/server/services/conversation/agentRunLifecycle.ts`](../reference/server/services/conversation/agentRunLifecycle.ts).
+[`../reference/server/services/tasks/adapter.ts`](../reference/server/services/tasks/adapter.ts).
 Core's version of that branch reads "if `workflow_complete` and not yet
 `pr_agent_complete`, start the PR agent." This extra wedges one check **in
 front of** the PR check:
@@ -37,7 +37,7 @@ ordering is the whole trick — the refinement check sits between the
 `workflow_complete` gate and the `pr_agent_complete` gate, the same way core's
 PR check does. Refinement is one of the agent types that the completion handler
 treats as chainable (alongside planning, implementation, review); see the
-`shouldChain` set in `buildAgentRunCompletionHandler` in the same file. The PR
+`shouldChain` decision in `onTurnEnded` in the same file. The PR
 agent remains terminal.
 
 Because the gate is the persistent `refinement_complete` flag (not "did
@@ -117,7 +117,7 @@ PR untouched.
 
 | Concern | File |
 |---|---|
-| Insertion point + flag flip | `../reference/server/services/conversation/agentRunLifecycle.ts` (`handleAgentChaining`, `workflow_complete` branch) |
+| Insertion point + flag flip | `../reference/server/services/tasks/adapter.ts` (`handleAgentChaining`, `workflow_complete` branch) |
 | What the agent does (prompt) | `../reference/server/constants/prompts/refinement.md` |
 | Message assembly | `../reference/server/constants/agentPrompts.ts` (`generateRefinementMessage`) |
 | Run start (no sub-agent ban) | `../reference/server/services/agentRunner.ts` (`case 'refinement'`) |

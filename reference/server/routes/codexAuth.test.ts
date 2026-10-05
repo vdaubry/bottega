@@ -188,6 +188,17 @@ describe('Codex auth routes', () => {
       expect(res.body.code).toBe('CODEX_AUTH_INVALID_PAYLOAD');
     });
 
+    it('rejects API-key auth.json without persisting it', async () => {
+      const res = await request(app)
+        .post('/api/codex-auth/paste')
+        .send({ authJson: JSON.stringify({ OPENAI_API_KEY: 'sk-test-123' }) });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('CODEX_AUTH_INVALID_PAYLOAD');
+      expect(res.body.error).toMatch(/API key authentication is disabled/);
+      expect(writeCodexAuth).not.toHaveBeenCalled();
+    });
+
     it('persists a valid OAuth auth.json and reports authenticated', async () => {
       vi.mocked(writeCodexAuth).mockReturnValueOnce({ authPath: '/x/auth.json' });
       vi.mocked(getCodexAuthStatus).mockResolvedValueOnce({

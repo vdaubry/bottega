@@ -11,20 +11,32 @@ import {
   AGENT_TYPES_WITH_SETTINGS,
   MODELS_FOR_UI,
   EFFORTS_FOR_UI,
+  isAnthropicLockedKey,
+  type AgentModelKey,
   type AgentModelSetting,
   type AgentModelSettings,
 } from '../../shared/types/agentModelSettings';
-import type { AgentType } from '../../shared/types/db';
 import type { Provider } from '../../shared/providers/types';
 import type { OpenCodeModelEntry } from '../../shared/api/openCodeAuth';
 
-const AGENT_LABELS: Record<AgentType, string> = {
+const AGENT_LABELS: Record<AgentModelKey, string> = {
   planification: 'Planning',
   implementation: 'Implementation',
   refinement: 'Refinement',
   review: 'Review',
   pr: 'PR',
   yolo: 'YOLO',
+  schema: 'Schema',
+  'epic-architecture': 'Epic: Architecture',
+  'epic-specification': 'Epic: Specification',
+  'epic-stories': 'Epic: Stories',
+  'epic-spec-review': 'Epic: Specification review',
+  'epic-orchestrator': 'Epic: Orchestrator',
+  'epic-pr-review': 'Epic: PR reviewer',
+  'epic-delivery': 'Epic: Delivery',
+  'epic-qa-scenarios': 'Epic: QA scenarios',
+  'epic-qa-execution': 'Epic: QA execution',
+  'epic-qa-fix': 'Epic: QA fix',
 };
 
 function AgentModelsTab() {
@@ -87,7 +99,7 @@ function AgentModelsTab() {
   }, [loadOpenCodeModels]);
 
   const updateAgentSetting = useCallback(
-    async (agent: AgentType, patch: Partial<AgentModelSetting>) => {
+    async (agent: AgentModelKey, patch: Partial<AgentModelSetting>) => {
       if (!settings) return;
       const current = settings[agent];
 
@@ -97,7 +109,7 @@ function AgentModelsTab() {
       if (patch.provider && patch.provider !== current.provider) {
         const p = patch.provider;
         const nextModel =
-          p === 'opencode' ? (openCodeModels?.[0]?.id ?? null) : MODELS_FOR_UI[p][0]!;
+          p === 'opencode' ? (openCodeModels?.[0]?.id ?? null) : MODELS_FOR_UI[p][0];
         if (nextModel === null) {
           setError(
             'OpenCode catalog is still loading or no Zen key is configured. ' +
@@ -189,6 +201,8 @@ function AgentModelsTab() {
             openCodeModels={openCodeModels}
             isLoadingOpenCodeModels={isLoadingOpenCodeModels}
             disabled={isSaving}
+            // Schema generation is Anthropic-only — lock its provider to Claude.
+            lockedProvider={isAnthropicLockedKey(agent) ? 'anthropic' : undefined}
             onChange={updateAgentSetting}
           />
         ))}

@@ -10,6 +10,7 @@ import {
   listOpenCodeModels,
   OpenCodeProvider,
   parseOpenCodeModel,
+  RETRY_WAIT_LIMIT_MS,
 } from './index.js';
 
 interface FakeClient {
@@ -57,10 +58,10 @@ function makeFakeHandle(events: unknown[]): { handle: { client: FakeClient; pid:
 const ENV_WITH_USER = { BOTTEGA_USER_ID: '7', XDG_DATA_HOME: '/tmp/fake/7/data' };
 
 describe('parseOpenCodeModel', () => {
-  it("returns { providerID: 'opencode', modelID } for canonical kimi-k2.6", () => {
-    expect(parseOpenCodeModel('opencode/kimi-k2.6')).toEqual({
+  it("returns { providerID: 'opencode', modelID } for canonical kimi-k2.7-code", () => {
+    expect(parseOpenCodeModel('opencode/kimi-k2.7-code')).toEqual({
       providerID: 'opencode',
-      modelID: 'kimi-k2.6',
+      modelID: 'kimi-k2.7-code',
     });
   });
 
@@ -89,7 +90,7 @@ describe('parseOpenCodeModel', () => {
   });
 
   it('throws on missing prefix', () => {
-    expect(() => parseOpenCodeModel('kimi-k2.6')).toThrow(InvalidOpenCodeModelError);
+    expect(() => parseOpenCodeModel('kimi-k2.7-code')).toThrow(InvalidOpenCodeModelError);
   });
 
   it('throws on the wrong prefix (e.g. an old anthropic shape)', () => {
@@ -110,13 +111,13 @@ describe('OpenCodeProvider', () => {
     vi.resetAllMocks();
   });
 
-  it("name is 'opencode' and capabilities match the D8 matrix (all false)", () => {
+  it("name is 'opencode' and advertises the portable interaction/MCP capabilities", () => {
     const p = new OpenCodeProvider();
     expect(p.name).toBe('opencode');
     const caps = p.getCapabilities();
-    expect(caps.supportsAskUserQuestion).toBe(false);
+    expect(caps.supportsAskUserQuestion).toBe(true);
     expect(caps.supportsThinkingDelta).toBe(false);
-    expect(caps.supportsMcpServers).toBe(false);
+    expect(caps.supportsMcpServers).toBe(true);
     expect(caps.supportsImages).toBe(false);
     expect(caps.supportsContextUsageBreakdown).toBe(false);
   });
@@ -143,7 +144,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo/worktree',
       prompt: 'ping',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
@@ -158,7 +159,7 @@ describe('OpenCodeProvider', () => {
     expect(client.session.promptAsync).toHaveBeenCalledTimes(1);
     const call = client.session.promptAsync.mock.calls[0]![0];
     expect(call.path).toEqual({ id: 'sess_new_123' });
-    expect(call.body.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.6' });
+    expect(call.body.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.7-code' });
     expect(call.body.agent).toBe('build');
     expect(call.body.parts).toEqual([{ type: 'text', text: 'ping' }]);
 
@@ -167,6 +168,92 @@ describe('OpenCodeProvider', () => {
     // session.idle terminates the stream and yields a result event.
     const lastResult = collected[collected.length - 1];
     expect(lastResult?.type).toBe('result');
+  });
+
+  // `session.status` carries OpenCode's own LLM retry loop. `next` is an
+  // absolute epoch-ms timestamp (`next: Date.now() + backoff` in the retry
+  // policy), so these fixtures build it the same way.
+  const retryStatus = (attempt: number, waitMs: number, message = 'Endpoint is unavailable.') => ({
+    type: 'session.status',
+    properties: {
+      sessionID: 'sess_new_123',
+      status: { type: 'retry', attempt, message, next: Date.now() + waitMs },
+    },
+  });
+
+  const startTurnOn = async (events: unknown[]) => {
+    const { handle, client } = makeFakeHandle(events);
+    vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
+    const run = await new OpenCodeProvider().startTurn({
+      cwd: '/repo/worktree',
+      prompt: 'ping',
+      model: 'opencode/kimi-k2.7-code',
+      effort: null,
+      env: ENV_WITH_USER,
+    });
+    const collected: { type: string; isError?: boolean; errors?: { message: string }[] }[] = [];
+    for await (const m of run.events) collected.push(m as never);
+    return { collected, client };
+  };
+
+  // The 2026-08-25 14:56 outage: six "Endpoint is unavailable" retries with
+  // waits of 2s…64s, then the seventh attempt succeeded and the turn ran to
+  // completion. A rule that stopped on the first retry would have killed it.
+  it('rides out a retry storm whose backoff stays under the limit', async () => {
+    const { collected, client } = await startTurnOn([
+      retryStatus(1, 2_000),
+      retryStatus(2, 4_000),
+      retryStatus(3, 8_000),
+      retryStatus(4, 16_000),
+      retryStatus(5, 32_000),
+      retryStatus(6, 64_000),
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: { id: 'p1', sessionID: 'sess_new_123', messageID: 'm', type: 'text', text: 'done' },
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
+    ]);
+
+    expect(client.session.abort).not.toHaveBeenCalled();
+    const result = collected[collected.length - 1];
+    expect(result?.type).toBe('result');
+    expect(result?.isError).toBe(false);
+  });
+
+  // Ticket #1664: the backoff kept doubling past two minutes and never
+  // recovered. Stop there rather than stream nothing for a quarter of an hour.
+  it('gives up, aborts the session and reports the provider error once the wait passes the limit', async () => {
+    const { collected, client } = await startTurnOn([
+      retryStatus(1, 2_000),
+      retryStatus(7, RETRY_WAIT_LIMIT_MS + 8_000),
+      // Never reached: the turn is over before OpenCode's next attempt.
+      { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
+    ]);
+
+    expect(client.session.abort).toHaveBeenCalledWith(
+      expect.objectContaining({ path: { id: 'sess_new_123' } }),
+    );
+    const result = collected[collected.length - 1];
+    expect(result?.type).toBe('result');
+    expect(result?.isError).toBe(true);
+    // The upstream message is what a human needs to see in the conversation.
+    expect(result?.errors?.[0]?.message).toContain('Endpoint is unavailable.');
+    expect(result?.errors?.[0]?.message).toContain('128s');
+    // Exactly one terminal result — not the synthetic stream-closed one too.
+    expect(collected.filter((m) => m.type === 'result')).toHaveLength(1);
+  });
+
+  it('ignores non-retry session.status transitions', async () => {
+    const { collected, client } = await startTurnOn([
+      { type: 'session.status', properties: { sessionID: 'sess_new_123', status: { type: 'busy' } } },
+      { type: 'session.status', properties: { sessionID: 'sess_new_123', status: { type: 'idle' } } },
+      { type: 'session.idle', properties: { sessionID: 'sess_new_123' } },
+    ]);
+
+    expect(client.session.abort).not.toHaveBeenCalled();
+    expect(collected[collected.length - 1]?.isError).toBe(false);
   });
 
   it('sendTurnMessage skips session.create and uses the supplied resumeSessionId', async () => {
@@ -206,7 +293,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
@@ -223,7 +310,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hello world',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
@@ -244,14 +331,21 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
       disallowedTools: ['Bash', 'Edit'],
     });
     for await (const _ of run.events) void _;
     const call = client.session.promptAsync.mock.calls[0]![0];
-    expect(call.body.tools).toEqual({ question: false, Bash: false, Edit: false });
+    expect(call.body.tools).toEqual({
+      question: false,
+      Bash: false,
+      bash: false,
+      Edit: false,
+      edit: false,
+      patch: false,
+    });
   });
 
   it('always disables `question` even when disallowedTools is empty (Bottega has no UI to answer it)', async () => {
@@ -263,7 +357,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
@@ -279,18 +373,18 @@ describe('OpenCodeProvider', () => {
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
     const p = new OpenCodeProvider();
     const run = await p.startTurn({
-      cwd: '/home/ubuntu/misc/hello_world-worktrees/task-1036',
+      cwd: '/home/dev/projects/hello_world-worktrees/task-1036',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
     for await (const _ of run.events) void _;
     const call = client.session.promptAsync.mock.calls[0]![0];
-    expect(call.query?.directory).toBe('/home/ubuntu/misc/hello_world-worktrees/task-1036');
+    expect(call.query?.directory).toBe('/home/dev/projects/hello_world-worktrees/task-1036');
     // session.create is the other call that gets the directory.
     const createCall = client.session.create.mock.calls[0]![0];
-    expect(createCall.query?.directory).toBe('/home/ubuntu/misc/hello_world-worktrees/task-1036');
+    expect(createCall.query?.directory).toBe('/home/dev/projects/hello_world-worktrees/task-1036');
   });
 
   it('includes the model in the promptAsync body when one is supplied (new session)', async () => {
@@ -302,13 +396,13 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
     for await (const _ of run.events) void _;
     const call = client.session.promptAsync.mock.calls[0]![0];
-    expect(call.body.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.6' });
+    expect(call.body.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.7-code' });
   });
 
   it('resumes WITH the stored model — always includes body.model (deterministic resume)', async () => {
@@ -323,7 +417,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.sendTurnMessage({
       cwd: '/repo',
       prompt: 'follow-up message',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       resumeSessionId: 'sess_existing_42',
       env: ENV_WITH_USER,
@@ -331,7 +425,7 @@ describe('OpenCodeProvider', () => {
     for await (const _ of run.events) void _;
     const call = client.session.promptAsync.mock.calls[0]![0];
     expect(call.path.id).toBe('sess_existing_42');
-    expect(call.body.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.6' });
+    expect(call.body.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.7-code' });
     // The turn still runs (agent + parts present).
     expect(call.body.agent).toBe('build');
     expect(call.body.parts).toEqual([{ type: 'text', text: 'follow-up message' }]);
@@ -344,15 +438,15 @@ describe('OpenCodeProvider', () => {
     vi.mocked(getOrSpawnOpenCodeServer).mockResolvedValue(handle as never);
     const p = new OpenCodeProvider();
     const run = await p.startTurn({
-      cwd: '/home/ubuntu/misc/hello_world-worktrees/task-1036',
+      cwd: '/home/dev/projects/hello_world-worktrees/task-1036',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
     for await (const _ of run.events) void _;
     const subscribeCall = client.event.subscribe.mock.calls[0]![0];
-    expect(subscribeCall.query?.directory).toBe('/home/ubuntu/misc/hello_world-worktrees/task-1036');
+    expect(subscribeCall.query?.directory).toBe('/home/dev/projects/hello_world-worktrees/task-1036');
     // sseMaxRetryAttempts=1 disables the SDK's default infinite retry loop so
     // the for-await's `finally` can fire when the upstream closes.
     expect(subscribeCall.sseMaxRetryAttempts).toBe(1);
@@ -382,13 +476,13 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
     const collected: { type: string }[] = [];
     for await (const m of run.events) {
-      collected.push(m as { type: string });
+      collected.push(m);
     }
     // Only the synthetic user + the session.idle result — no orphan tool_use/tool_result.
     expect(collected.map((m) => m.type)).toEqual(['user', 'result']);
@@ -415,7 +509,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
@@ -442,7 +536,7 @@ describe('OpenCodeProvider', () => {
     const run = await p.startTurn({
       cwd: '/repo',
       prompt: 'hi',
-      model: 'opencode/kimi-k2.6',
+      model: 'opencode/kimi-k2.7-code',
       effort: null,
       env: ENV_WITH_USER,
     });
@@ -472,7 +566,7 @@ describe('OpenCodeProvider', () => {
       p.startTurn({
         cwd: '/repo',
         prompt: 'hi',
-        model: 'opencode/kimi-k2.6',
+        model: 'opencode/kimi-k2.7-code',
         effort: null,
         env: { XDG_DATA_HOME: '/tmp/x' },
       }),
@@ -506,11 +600,11 @@ describe('listOpenCodeModels', () => {
                 status: 'active',
                 limit: { context: 128000, output: 8000 },
               },
-              'kimi-k2.6': {
-                id: 'kimi-k2.6',
-                name: 'Kimi K2.6',
+              'kimi-k2.7-code': {
+                id: 'kimi-k2.7-code',
+                name: 'Kimi K2.7 Code',
                 status: 'active',
-                limit: { context: 200000, output: 8000 },
+                limit: { context: 262144, output: 8000 },
               },
               'glm-5': {
                 id: 'glm-5',
@@ -527,7 +621,7 @@ describe('listOpenCodeModels', () => {
     const result = await listOpenCodeModels(7);
     expect(result.map((m) => m.id)).toEqual([
       'opencode/glm-5',
-      'opencode/kimi-k2.6',
+      'opencode/kimi-k2.7-code',
       'opencode/qwen3.6-plus',
     ]);
     expect(result[0]).toMatchObject({
@@ -538,8 +632,8 @@ describe('listOpenCodeModels', () => {
       contextWindow: null,
     });
     expect(result[1]).toMatchObject({
-      id: 'opencode/kimi-k2.6',
-      contextWindow: 200000,
+      id: 'opencode/kimi-k2.7-code',
+      contextWindow: 262144,
     });
   });
 
@@ -569,12 +663,12 @@ describe('listOpenCodeModels', () => {
         {
           id: 'opencode',
           name: 'OpenCode',
-          models: { 'kimi-k2.6': { id: 'kimi-k2.6', name: 'Kimi K2.6' } },
+          models: { 'kimi-k2.7-code': { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' } },
         },
       ],
     });
     const result = await listOpenCodeModels(7);
-    expect(result.map((m) => m.id)).toEqual(['opencode/kimi-k2.6']);
+    expect(result.map((m) => m.id)).toEqual(['opencode/kimi-k2.7-code']);
   });
 
   it('falls back to bareModelId for the label when OpenCode omits `name`', async () => {

@@ -31,12 +31,20 @@ Make the requested modifications in a coordinated way:
 ### 4. Test
 Run tests to ensure changes don't break existing functionality:
 1. Run targeted tests for changed files first (check CLAUDE.md for the test command)
-2. For the full test suite, use `run_in_background: true` (suites can take 5-15+ minutes)
-3. Wait for background task via TaskOutput with `block: true`
-4. Wait for backgrounded tests to complete before re-launching — never run parallel test suites
+2. Run the full test suite in the foreground with a generous `timeout` (up to `timeout: 600000`, i.e. 10 minutes). Do NOT background the suite and do NOT use a monitor/watcher tool to wait for it — backgrounded and monitored tasks are terminated when the turn ends in this environment and never deliver a completion notification, so the suite silently dies and the turn deadlocks
+3. Do not launch a second suite while one is running — never run parallel test suites; only re-run after the previous foreground run has returned
 
 ### 5. Commit & Push
-Commit your changes with a clear message referencing the feedback:
+First look at what the work actually left behind:
+```bash
+git status --porcelain --untracked-files=all
+```
+Triage every path — **keep** source, tests and docs; **delete** the byproducts of
+getting here (screenshots, recordings, traces, logs, coverage output, scratch or
+one-off scripts, `*.bak`). `rm` them rather than committing them or hiding them
+behind a new `.gitignore` entry.
+
+Then commit what is left, with a message referencing the feedback, and push:
 ```bash
 git add -A && git commit -m "Address PR feedback: <brief description>" && git push
 ```
@@ -70,15 +78,12 @@ gh pr view --json mergeStateStatus,mergeable --jq '{ mergeStateStatus, mergeable
 ```
 
 **If mergeable is "MERGEABLE" (no conflicts):**
-Run the completion script:
-```bash
-tsx /home/ubuntu/bottega/reference/scripts/complete-pr.ts {{taskId}}
-```
+Proceed to step 8.
 
 **If mergeable is "CONFLICTING" (has conflicts):**
 1. Rebase onto the base branch to resolve conflicts:
    ```bash
-   git fetch origin main && git rebase origin/main
+   git fetch origin {{baseBranch}} && git rebase origin/{{baseBranch}}
    ```
 2. Resolve any conflicts during the rebase
 3. Continue the rebase: `git rebase --continue`
@@ -89,8 +94,25 @@ tsx /home/ubuntu/bottega/reference/scripts/complete-pr.ts {{taskId}}
 - Wait 10 seconds and re-check (GitHub may still be computing mergeability)
 - Retry up to 5 times
 
+### 8. Leave the Worktree Deletable, Then Complete
+This worktree is deleted when the PR merges, so nothing may be left in it that
+has not reached the PR. Check both kinds of unpublished work:
+```bash
+git status --porcelain --untracked-files=all
+git log --oneline HEAD --not --remotes=origin
+```
+Both must come back **empty** — delete the byproducts, commit and push what
+belongs in the PR. `complete-pr.ts` refuses to mark the stage complete while
+either one is non-empty.
+
+Once both are empty, complete the task:
+```bash
+tsx {{scriptsDir}}/complete-pr.ts {{taskId}}
+```
+
 ## Important Constraints
 - Do NOT merge the PR - the user will merge manually
+- Leave **nothing** behind in the worktree: every change either reaches the PR or gets deleted
 - Address ALL feedback items - don't skip any
 - If feedback is unclear, make reasonable assumptions based on context
 - Commit messages should reference the feedback (e.g., "Address PR feedback: ...")

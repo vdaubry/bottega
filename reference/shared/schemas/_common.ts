@@ -20,3 +20,12 @@ export const ProjectIdParamsSchema = z.object({
   projectId: z.coerce.number().int().positive(),
 });
 export type ProjectIdParams = z.infer<typeof ProjectIdParamsSchema>;
+
+// Both segments of the nested conversation routes
+// (`/tasks/:taskId/conversations/:conversationId[/messages]`). Same
+// positive-int coercion as the single-id schemas above.
+export const TaskConversationParamsSchema = z.object({
+  taskId: z.coerce.number().int().positive(),
+  conversationId: z.coerce.number().int().positive(),
+});
+export type TaskConversationParams = z.infer<typeof TaskConversationParamsSchema>;

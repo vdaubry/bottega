@@ -209,8 +209,8 @@ exception here). For a non-technical user that gate is friction, so:
    gate. The decision tracks the user who *triggered planning* (carried on the
    streaming context), falling back to the task owner only when context has no
    user. See the `agentType === 'planification'` branch in
-   [`../reference/server/services/conversation/agentRunLifecycle.ts`](../reference/server/services/conversation/agentRunLifecycle.ts)
-   (`handleAgentChaining`, lines ~138–167).
+   [`../reference/server/services/tasks/adapter.ts`](../reference/server/services/tasks/adapter.ts)
+   (`handleAgentChaining`).
 2. **Prompt variant.** A non-technical run also uses a different planning
    prompt (`planification-nontechnical` instead of `planification`), selected
    by the same `is_technical` resolution at run start. See
@@ -300,7 +300,7 @@ become per-user / membership-gated:
 | `hasProjectAccess` + access-scoped project helpers | `reference/server/services/projectService.ts` |
 | Schema (users, project_members, token_version, is_technical, api_key_hash) | `reference/server/database/init.sql` |
 | Owner-membership on create, membership-filtered queries | `reference/server/database/db.ts` |
-| Non-technical auto-advance after planning | `reference/server/services/conversation/agentRunLifecycle.ts` |
+| Non-technical auto-advance after planning | `reference/server/services/tasks/adapter.ts` |
 | Non-technical planning prompt selection | `reference/server/constants/agentPrompts.ts`, `reference/server/services/agentRunner.ts` |
 | WebSocket per-action access checks | `reference/server/websocket/dispatch.ts` |
 | Admin UI | `reference/src/pages/AdminPage.tsx`, `reference/src/components/Admin/` |

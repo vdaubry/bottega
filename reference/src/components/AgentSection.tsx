@@ -9,7 +9,7 @@ import React, { useState, type ComponentType } from 'react';
 import { Play, Check, Loader2, FileText, Code, CheckCircle, MessageCircle, AlertCircle, GitPullRequest, Sparkles, Zap } from 'lucide-react';
 import { Button } from './ui/button';
 import { cn } from '../lib/utils';
-import type { AgentRunRow, AgentType } from '../../shared/types/db';
+import type { TaskAgentRunRow, AgentType } from '../../shared/types/db';
 
 type IconComponent = ComponentType<{ className?: string | undefined }>;
 
@@ -62,12 +62,14 @@ const AGENT_TYPES: AgentConfig[] = [
 ];
 
 interface AgentSectionProps {
-  agentRuns?: AgentRunRow[] | undefined;
+  agentRuns?: TaskAgentRunRow[] | undefined;
   isLoading?: boolean | undefined;
   onRunAgent: (agentType: AgentType) => void | Promise<void>;
   onResumeAgent?: ((conversationId: number) => void) | undefined;
   yoloMode?: boolean | undefined;
   className?: string | undefined;
+  /** Why no agent can start yet (the worktree is not set up); disables every run button. */
+  disabledReason?: string | null | undefined;
 }
 
 function AgentSection({
@@ -76,7 +78,8 @@ function AgentSection({
   onRunAgent,
   onResumeAgent,
   yoloMode = false,
-  className
+  className,
+  disabledReason,
 }: AgentSectionProps) {
   const visibleAgents = AGENT_TYPES.filter(a =>
     yoloMode ? a.type === 'yolo' : a.type !== 'yolo'
@@ -101,10 +104,10 @@ function AgentSection({
   // "first in the array" nor array order is reliable. The agent run id is a
   // monotonically increasing autoincrement, so the highest id is the most
   // recent run — that's the one whose status reflects the current step.
-  const getAgentRun = (agentType: AgentType): AgentRunRow | undefined => {
+  const getAgentRun = (agentType: AgentType): TaskAgentRunRow | undefined => {
     return agentRuns
       .filter(r => r.agent_type === agentType)
-      .reduce<AgentRunRow | undefined>(
+      .reduce<TaskAgentRunRow | undefined>(
         (latest, r) => (!latest || r.id > latest.id ? r : latest),
         undefined,
       );
@@ -114,7 +117,7 @@ function AgentSection({
     return getAgentRun(agentType)?.status ?? null;
   };
 
-  const handleResumeAgent = (agentRun: AgentRunRow | undefined) => {
+  const handleResumeAgent = (agentRun: TaskAgentRunRow | undefined) => {
     if (agentRun?.conversation_id && onResumeAgent) {
       onResumeAgent(agentRun.conversation_id);
     }
@@ -216,7 +219,8 @@ function AgentSection({
                   variant={isCompleted ? 'ghost' : isFailed ? 'ghost' : 'outline'}
                   size="sm"
                   onClick={() => handleRunAgent(agent)}
-                  disabled={isRunning || isInProgress}
+                  disabled={isRunning || isInProgress || !!disabledReason}
+                  title={disabledReason ?? undefined}
                   className={cn(
                     'gap-2',
                     isCompleted && 'text-green-600 dark:text-green-400',

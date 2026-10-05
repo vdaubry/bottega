@@ -1,6 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express from 'express';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 // Mock the database module
 vi.mock('../database/db.js', () => ({
@@ -14,12 +17,18 @@ vi.mock('../database/db.js', () => ({
     getById: vi.fn(),
     updateClaudeId: vi.fn(),
     updateName: vi.fn(),
+    setAtlasEnabled: vi.fn(),
     delete: vi.fn(),
     getContextUsage: vi.fn()
   },
   projectsDb: {
     getById: vi.fn()
-  }
+  },
+  TaskWorktreeNotReadyError: class TaskWorktreeNotReadyError extends Error {
+    constructor(taskId: number, state: string) {
+      super(`Task ${taskId} worktree: ${state}`);
+    }
+  },
 }));
 
 // Mock the projectService
@@ -39,12 +48,18 @@ vi.mock('../services/conversationContentStore.js', () => ({
 
 // Mock the conversationAdapter service
 vi.mock('../services/conversationAdapter.js', () => ({
-  startConversation: vi.fn()
+  startConversation: vi.fn(),
+  sendMessage: vi.fn().mockResolvedValue(undefined),
+  getActiveStreamingByConversation: vi.fn().mockReturnValue(null)
 }));
 
 // Mock the documentation service
 vi.mock('../services/documentation.js', () => ({
   buildContextPrompt: vi.fn()
+}));
+
+vi.mock('../services/conversationImages.js', () => ({
+  getConversationImagePath: vi.fn(),
 }));
 
 // Mock the notifications service
@@ -60,12 +75,19 @@ import conversationsRoutes from './conversations.js';
 import { tasksDb, conversationsDb } from '../database/db.js';
 import { hasProjectAccess, getProject } from '../services/projectService.js';
 import { conversationContentStore, purgeConversationMessages } from '../services/conversationContentStore.js';
-import { startConversation } from '../services/conversationAdapter.js';
+import {
+  startConversation,
+  sendMessage,
+  getActiveStreamingByConversation,
+} from '../services/conversationAdapter.js';
 import { buildContextPrompt } from '../services/documentation.js';
+import { getConversationImagePath } from '../services/conversationImages.js';
 import { validateClaudeCredentials } from '../services/claudeCredentials.js';
 
 describe('Conversations Routes - Phase 3', () => {
   let app: import("express").Application;
+  let broadcastToConversationSubscribers: ReturnType<typeof vi.fn>;
+  let broadcastToTaskSubscribers: ReturnType<typeof vi.fn>;
   const testUserId = 1;
 
   beforeEach(() => {
@@ -73,8 +95,16 @@ describe('Conversations Routes - Phase 3', () => {
 
     // Default to allowing access - tests can override if needed
     vi.mocked(hasProjectAccess).mockReturnValue(true);
+    // Re-establish adapter defaults after clearAllMocks wiped them.
+    vi.mocked(sendMessage).mockResolvedValue(undefined);
+    vi.mocked(getActiveStreamingByConversation).mockReturnValue(null);
+
+    broadcastToConversationSubscribers = vi.fn();
+    broadcastToTaskSubscribers = vi.fn();
 
     app = express();
+    app.locals.broadcastToConversationSubscribers = broadcastToConversationSubscribers;
+    app.locals.broadcastToTaskSubscribers = broadcastToTaskSubscribers;
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: testUserId, username: 'testuser' } as never;
@@ -141,6 +171,23 @@ describe('Conversations Routes - Phase 3', () => {
       expect(conversationsDb.create).toHaveBeenCalledWith(1, 'anthropic', 'opus', null);
     });
 
+    it('answers 409 with the reason while the worktree is not set up', async () => {
+      const { TaskWorktreeNotReadyError } = await import('../database/db.js');
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({ id: 1, project_id: 1 } as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      vi.mocked(conversationsDb.create).mockImplementation(() => {
+        throw new TaskWorktreeNotReadyError(1, 'provisioning');
+      });
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations')
+        .send({ provider: 'anthropic', model: 'opus' });
+
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe('Task 1 worktree: provisioning');
+      expect(tasksDb.updateStatus).not.toHaveBeenCalled();
+    });
+
     it('should return 404 if task not found', async () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(undefined);
 
@@ -198,6 +245,50 @@ describe('Conversations Routes - Phase 3', () => {
       expect(tasksDb.updateStatus).not.toHaveBeenCalled();
     });
 
+    it('stamps atlas_enabled before any session starts when atlas:true', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'in_progress' };
+      const newConversation = { id: 7, taskId: 1, claudeConversationId: null };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      vi.mocked(conversationsDb.create).mockReturnValue(newConversation as never);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations')
+        .send({ provider: 'anthropic', model: 'opus', atlas: true });
+
+      expect(response.status).toBe(201);
+      expect(conversationsDb.setAtlasEnabled).toHaveBeenCalledWith(7);
+    });
+
+    it('does not stamp atlas_enabled without the flag', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'in_progress' };
+      const newConversation = { id: 7, taskId: 1, claudeConversationId: null };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      vi.mocked(conversationsDb.create).mockReturnValue(newConversation as never);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations')
+        .send({ provider: 'anthropic', model: 'opus' });
+
+      expect(response.status).toBe(201);
+      expect(conversationsDb.setAtlasEnabled).not.toHaveBeenCalled();
+    });
+
+    it('rejects atlas conversations on non-anthropic providers', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, status: 'in_progress' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations')
+        .send({ provider: 'openai', model: 'gpt-6.1-sol', atlas: true });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe('Validation failed');
+      expect(conversationsDb.create).not.toHaveBeenCalled();
+    });
+
     // Tests for the "with message" flow (modal-first conversation creation)
     describe('with message parameter (modal-first flow)', () => {
       it('should create conversation and start Claude session when message is provided', async () => {
@@ -207,7 +298,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'pending',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(hasProjectAccess).mockReturnValue(true);
@@ -231,7 +322,7 @@ describe('Conversations Routes - Phase 3', () => {
         expect(response.status).toBe(201);
         expect(response.body.claude_conversation_id).toBe('real-claude-session-id');
         expect(startConversation).toHaveBeenCalledWith(
-          1, // taskId
+          { kind: 'task', taskId: 1 },
           'Hello Claude, help me with this task', // message
           expect.objectContaining({
             permissionMode: 'bypassPermissions',
@@ -247,7 +338,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'in_progress',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(hasProjectAccess).mockReturnValue(true);
@@ -273,7 +364,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'in_progress',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(hasProjectAccess).mockReturnValue(true);
@@ -290,7 +381,7 @@ describe('Conversations Routes - Phase 3', () => {
 
         expect(response.status).toBe(201);
         expect(startConversation).toHaveBeenCalledWith(
-          1,
+          { kind: 'task', taskId: 1 },
           'Test message',
           expect.objectContaining({
             permissionMode: 'bypassPermissions'
@@ -305,7 +396,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'in_progress',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(conversationsDb.create).mockReturnValue(newConversation);
@@ -349,7 +440,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'in_progress',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(conversationsDb.create).mockReturnValue(newConversation);
@@ -371,7 +462,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'in_progress',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(conversationsDb.create).mockReturnValue(newConversation);
@@ -387,7 +478,7 @@ describe('Conversations Routes - Phase 3', () => {
 
         expect(response.status).toBe(201);
         expect(startConversation).toHaveBeenCalledWith(
-          1,
+          { kind: 'task', taskId: 1 },
           'Hello with whitespace', // Trimmed
           expect.any(Object)
         );
@@ -400,7 +491,7 @@ describe('Conversations Routes - Phase 3', () => {
           status: 'pending',
           repo_folder_path: '/path/to/repo'
         };
-        const newConversation = { id: 5, task_id: 1, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
+        const newConversation = { id: 5, task_id: 1, epic_id: null, claude_conversation_id: null, provider: 'anthropic' as const, provider_session_id: null, model: 'opus', effort: null };
 
         vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
         vi.mocked(tasksDb.updateStatus).mockReturnValue({ ...mockTaskWithProject, status: 'in_progress' } as never);
@@ -434,6 +525,7 @@ describe('Conversations Routes - Phase 3', () => {
       const precreated = {
         id: 9,
         task_id: 1,
+        epic_id: null,
         claude_conversation_id: null,
         provider: 'opencode' as const,
         provider_session_id: null,
@@ -459,14 +551,14 @@ describe('Conversations Routes - Phase 3', () => {
 
         const response = await request(app)
           .post('/api/tasks/1/conversations')
-          .send({ message: 'count to 30', provider: 'opencode', model: 'opencode/kimi-k2.6' });
+          .send({ message: 'count to 30', provider: 'opencode', model: 'opencode/kimi-k2.7-code' });
 
         expect(response.status).toBe(201);
-        expect(conversationsDb.create).toHaveBeenCalledWith(1, 'opencode', 'opencode/kimi-k2.6', null);
+        expect(conversationsDb.create).toHaveBeenCalledWith(1, 'opencode', 'opencode/kimi-k2.7-code', null);
         expect(startConversation).toHaveBeenCalledWith(
-          1,
+          { kind: 'task', taskId: 1 },
           'count to 30',
-          expect.objectContaining({ provider: 'opencode', model: 'opencode/kimi-k2.6' }),
+          expect.objectContaining({ provider: 'opencode', model: 'opencode/kimi-k2.7-code' }),
         );
       });
 
@@ -479,7 +571,7 @@ describe('Conversations Routes - Phase 3', () => {
 
         const response = await request(app)
           .post('/api/tasks/1/conversations')
-          .send({ message: 'hi', provider: 'opencode', model: 'opencode/kimi-k2.6' });
+          .send({ message: 'hi', provider: 'opencode', model: 'opencode/kimi-k2.7-code' });
 
         expect(response.status).toBe(201);
         expect(validateClaudeCredentials).not.toHaveBeenCalled();
@@ -517,7 +609,7 @@ describe('Conversations Routes - Phase 3', () => {
 
         const response = await request(app)
           .post('/api/tasks/1/conversations')
-          .send({ message: 'hi', provider: 'anthropic', model: 'opencode/kimi-k2.6' });
+          .send({ message: 'hi', provider: 'anthropic', model: 'opencode/kimi-k2.7-code' });
 
         expect(response.status).toBe(400);
         expect(response.body.error).toBe('Validation failed');
@@ -924,6 +1016,330 @@ describe('Conversations Routes - Phase 3', () => {
 
       expect(response.status).toBe(404);
       expect(response.body.error).toBe('Project not found');
+    });
+  });
+
+  describe('GET /api/conversations/:id/images/:fileName', () => {
+    let imageDir: string;
+
+    beforeEach(async () => {
+      imageDir = await fs.mkdtemp(path.join(os.tmpdir(), 'conversation-image-'));
+      await fs.writeFile(path.join(imageDir, 'exec-1.png'), 'png-bytes');
+      vi.mocked(conversationsDb.getById).mockReturnValue({ id: 5, task_id: 1 } as never);
+      vi.mocked(tasksDb.getWithProject).mockReturnValue({
+        id: 1,
+        project_id: 7,
+        repo_folder_path: '/repo',
+      } as never);
+      vi.mocked(getConversationImagePath).mockImplementation((_id, fileName) =>
+        path.join(imageDir, fileName),
+      );
+    });
+
+    afterEach(async () => {
+      await fs.rm(imageDir, { recursive: true, force: true });
+    });
+
+    it('serves a stored image with its type, cacheable privately', async () => {
+      const res = await request(app).get('/api/conversations/5/images/exec-1.png');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toBe('image/png');
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+      expect(res.headers['cache-control']).toBe('private, max-age=31536000, immutable');
+      expect(res.body.toString()).toBe('png-bytes');
+      expect(getConversationImagePath).toHaveBeenCalledWith(5, 'exec-1.png');
+    });
+
+    it('answers 404 when the caller cannot see the conversation', async () => {
+      vi.mocked(hasProjectAccess).mockReturnValue(false);
+
+      const res = await request(app).get('/api/conversations/5/images/exec-1.png');
+
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: 'Image not found' });
+    });
+
+    it('answers 404 for an image the conversation does not have', async () => {
+      const res = await request(app).get('/api/conversations/5/images/other.png');
+
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: 'Image not found' });
+    });
+
+    it('rejects a file name that is not a plain image name before touching the disk', async () => {
+      const res = await request(app).get('/api/conversations/5/images/..%2F..%2Fauth.json');
+
+      expect(res.status).toBe(400);
+      expect(getConversationImagePath).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /api/tasks/:taskId/conversations/:conversationId', () => {
+    it('returns the conversation plus paginated messages and passes limit/offset through', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/repo' };
+      const mockConversation = {
+        id: 5,
+        task_id: 1,
+        claude_conversation_id: 'sess-5',
+        session_path: '/worktree',
+      };
+      const mockProject = { id: 1, repo_folder_path: '/repo' };
+      const mockMessages = { messages: [{ type: 'user' }], total: 1, hasMore: false };
+
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(mockConversation as never);
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      vi.mocked(conversationContentStore.getSessionMessages).mockResolvedValue(mockMessages);
+
+      const response = await request(app).get('/api/tasks/1/conversations/5?limit=50&offset=10');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        conversation: mockConversation,
+        messages: [{ type: 'user' }],
+        total: 1,
+        hasMore: false,
+      });
+      expect(conversationContentStore.getSessionMessages).toHaveBeenCalledWith(
+        'sess-5',
+        '/worktree',
+        50,
+        10,
+        { userId: testUserId },
+      );
+    });
+
+    it('normalizes a bare-array result (no limit) into the envelope', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/repo' };
+      const mockConversation = { id: 5, task_id: 1, claude_conversation_id: 'sess-5', session_path: null };
+      const mockProject = { id: 1, repo_folder_path: '/repo' };
+      // limit omitted → getSessionMessages returns a bare array.
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(mockConversation as never);
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      vi.mocked(conversationContentStore.getSessionMessages).mockResolvedValue([
+        { type: 'user' },
+        { type: 'assistant' },
+      ] as never);
+
+      const response = await request(app).get('/api/tasks/1/conversations/5');
+
+      expect(response.status).toBe(200);
+      expect(response.body.total).toBe(2);
+      expect(response.body.hasMore).toBe(false);
+      expect(response.body.messages).toHaveLength(2);
+      // null limit + repo fallback path when session_path is null.
+      expect(conversationContentStore.getSessionMessages).toHaveBeenCalledWith(
+        'sess-5',
+        '/repo',
+        null,
+        0,
+        { userId: testUserId },
+      );
+    });
+
+    it('returns an empty envelope when claude_conversation_id is null', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/repo' };
+      const mockConversation = { id: 5, task_id: 1, claude_conversation_id: null };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(mockConversation as never);
+
+      const response = await request(app).get('/api/tasks/1/conversations/5');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        conversation: mockConversation,
+        messages: [],
+        total: 0,
+        hasMore: false,
+      });
+      expect(conversationContentStore.getSessionMessages).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when the conversation belongs to a different task (cross-task guard)', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/repo' };
+      // Conversation belongs to task 2, but the URL nests it under task 1.
+      const mockConversation = { id: 5, task_id: 2, claude_conversation_id: 'sess-5' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(mockConversation as never);
+
+      const response = await request(app).get('/api/tasks/1/conversations/5');
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Conversation not found');
+    });
+
+    it('returns 404 when task missing / no access', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(undefined);
+
+      const response = await request(app).get('/api/tasks/999/conversations/5');
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+    });
+
+    it('returns 400 on a non-numeric conversation id', async () => {
+      const response = await request(app).get('/api/tasks/1/conversations/abc');
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe('Validation failed');
+    });
+
+    it('returns 400 on an invalid offset query', async () => {
+      const mockTaskWithProject = { id: 1, project_id: 1, repo_folder_path: '/repo' };
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTaskWithProject as never);
+
+      const response = await request(app).get('/api/tasks/1/conversations/5?offset=-1');
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe('Validation failed');
+    });
+  });
+
+  describe('POST /api/tasks/:taskId/conversations/:conversationId/messages', () => {
+    const taskWithProject = { id: 1, project_id: 1, repo_folder_path: '/repo' };
+    const startedConversation = {
+      id: 5,
+      task_id: 1,
+      claude_conversation_id: 'sess-5',
+      session_path: '/worktree',
+    };
+
+    it('accepts the message (202), fires sendMessage with wired broadcastFn, and does not await completion', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(startedConversation as never);
+      vi.mocked(getProject).mockReturnValue({ id: 1, repo_folder_path: '/repo' } as never);
+      // Existing message count (bare array) = 3 → messages_before.
+      vi.mocked(conversationContentStore.getSessionMessages).mockResolvedValue([
+        {}, {}, {},
+      ] as never);
+      // A never-resolving turn proves the handler does NOT await completion.
+      let resolveTurn: (() => void) | undefined;
+      vi.mocked(sendMessage).mockReturnValue(
+        new Promise<void>((resolve) => {
+          resolveTurn = resolve;
+        }),
+      );
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations/5/messages')
+        .send({ message: 'hello' });
+
+      expect(response.status).toBe(202);
+      expect(response.body).toEqual({
+        status: 'accepted',
+        task_id: 1,
+        conversation_id: 5,
+        messages_before: 3,
+      });
+      expect(sendMessage).toHaveBeenCalledWith(
+        5,
+        'hello',
+        expect.objectContaining({
+          userId: testUserId,
+          permissionMode: 'bypassPermissions',
+          broadcastFn: expect.any(Function),
+          broadcastToTaskSubscribersFn: broadcastToTaskSubscribers,
+        }),
+      );
+      resolveTurn?.();
+    });
+
+    it('threads an explicit permissionMode through', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(startedConversation as never);
+      vi.mocked(getProject).mockReturnValue({ id: 1, repo_folder_path: '/repo' } as never);
+      vi.mocked(conversationContentStore.getSessionMessages).mockResolvedValue([] as never);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations/5/messages')
+        .send({ message: 'hi', permissionMode: 'default' });
+
+      expect(response.status).toBe(202);
+      expect(sendMessage).toHaveBeenCalledWith(
+        5,
+        'hi',
+        expect.objectContaining({ permissionMode: 'default' }),
+      );
+    });
+
+    it('returns 409 CONVERSATION_BUSY when a turn is already streaming', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(startedConversation as never);
+      vi.mocked(getActiveStreamingByConversation).mockReturnValue({
+        sessionId: 'sess-5',
+        conversationId: 5,
+      });
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations/5/messages')
+        .send({ message: 'hello' });
+
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe('CONVERSATION_BUSY');
+      expect(response.body.conversation_id).toBe(5);
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('returns 409 CONVERSATION_NOT_STARTED when claude_conversation_id is null', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue({
+        id: 5,
+        task_id: 1,
+        epic_id: null,
+        claude_conversation_id: null,
+      } as never);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations/5/messages')
+        .send({ message: 'hello' });
+
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe('CONVERSATION_NOT_STARTED');
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 on the cross-task guard', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue({
+        id: 5,
+        task_id: 2,
+        claude_conversation_id: 'sess-5',
+      } as never);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations/5/messages')
+        .send({ message: 'hello' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Conversation not found');
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when task missing / no access', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(undefined);
+
+      const response = await request(app)
+        .post('/api/tasks/999/conversations/5/messages')
+        .send({ message: 'hello' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 on an empty message (zod min(1))', async () => {
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(taskWithProject as never);
+      vi.mocked(conversationsDb.getById).mockReturnValue(startedConversation as never);
+
+      const response = await request(app)
+        .post('/api/tasks/1/conversations/5/messages')
+        .send({ message: '' });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe('Validation failed');
+      expect(sendMessage).not.toHaveBeenCalled();
     });
   });
 });

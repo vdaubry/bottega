@@ -55,7 +55,7 @@ function unifiedToTranscriptEntry(unified: UnifiedMessage): {
         message: { role: 'user', content: unified.content },
       };
     case 'assistant': {
-      // OpenCode reports `modelID` (bare, like `kimi-k2.6`); we re-prefix
+      // OpenCode reports `modelID` (bare, like `kimi-k2.7-code`); we re-prefix
       // to the canonical persisted form for unambiguous attribution.
       const canonicalModel = unified.model
         ? unified.model.startsWith('opencode/')
@@ -140,6 +140,8 @@ function unifiedToTranscriptEntry(unified: UnifiedMessage): {
       };
     case 'stream_delta':
       return null;
+    case 'assistant_image':
+      return null; // Only Codex reports generated images today.
   }
 }
 

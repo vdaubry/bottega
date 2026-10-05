@@ -1,10 +1,44 @@
 name: Unit Tests
 
+# Documentation-only changes skip CI.
+#
+# `paths-ignore` skips the run only when *every* changed file matches one of
+# the patterns below — a commit touching both a doc and a source file still
+# runs the full suite.
+#
+# `*.md` and `reference/*.md` use a single `*`, which does not match `/`, so
+# they cover only top-level markdown. That keeps
+# `reference/server/constants/prompts/*.md` OUT of the ignore list: those are
+# runtime agent templates whose rendered text is asserted by the test suite,
+# so editing one must still trigger CI. The same goes for `.claude/commands/`,
+# which the app serves as built-in slash commands.
+#
+# The list is duplicated across the two triggers on purpose; keep the copies
+# in sync by hand.
+
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '*.md'                             # README.md, SPEC.md, CONTRIBUTING.md
+      - 'LICENSE'
+      - 'core/**'                          # spec prose
+      - 'extra/**'                         # spec prose
+      - 'reference/*.md'                   # CLAUDE.md, AGENTS.md
+      - 'reference/CLAUDE.local.md.example'
+      - 'reference/docs/**'
+      - 'reference/**/README.md'
   push:
     branches: [main]
+    paths-ignore:
+      - '*.md'                             # README.md, SPEC.md, CONTRIBUTING.md
+      - 'LICENSE'
+      - 'core/**'                          # spec prose
+      - 'extra/**'                         # spec prose
+      - 'reference/*.md'                   # CLAUDE.md, AGENTS.md
+      - 'reference/CLAUDE.local.md.example'
+      - 'reference/docs/**'
+      - 'reference/**/README.md'
 
 jobs:
   test:

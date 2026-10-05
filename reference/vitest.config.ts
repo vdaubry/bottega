@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  // Same reason as vite.config.ts: vitest's cache defaults to
+  // `node_modules/.vite/vitest`, which every worktree shares through the
+  // symlinked node_modules. Give each checkout its own.
+  cacheDir: path.resolve(__dirname, '.vite-cache'),
   plugins: [react()],
   resolve: {
     // Mirror the aliases declared in vite.config.ts so vitest can resolve

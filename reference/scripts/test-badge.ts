@@ -7,7 +7,7 @@
  *
  * Usage:
  *   tsx scripts/test-badge.ts <username> [badge_count]
- *   tsx scripts/test-badge.ts dev-box 5
+ *   tsx scripts/test-badge.ts alice 5
  */
 
 import path from 'path';
@@ -142,7 +142,7 @@ const badgeCount = parseInt(process.argv[3] ?? '3', 10) || 3;
 
 if (!username) {
     console.log('Usage: tsx scripts/test-badge.ts <username> [badge_count]');
-    console.log('Example: tsx scripts/test-badge.ts dev-box 5');
+    console.log('Example: tsx scripts/test-badge.ts alice 5');
     process.exit(1);
 }
 

@@ -7,8 +7,9 @@
  */
 
 import crypto from 'crypto';
-import { tasksDb, userDb, agentRunsDb, appSettingsDb } from '../database/db.js';
+import { tasksDb, userDb, appSettingsDb } from '../database/db.js';
 import { worktreeExists } from './worktree.js';
+import { getRunningAgentForTask } from './agentRunner.js';
 import type {
   BroadcastFn,
   BroadcastToConversationSubscribersFn,
@@ -45,6 +46,25 @@ export function validateGitHubWebhookSignature(
 export function parseTaskIdFromBranch(branchName: string | null | undefined): number | null {
   if (!branchName) return null;
   const match = branchName.match(/^task\/(\d+)-/);
+  if (match?.[1]) {
+    return parseInt(match[1], 10);
+  }
+  return null;
+}
+
+/**
+ * Parse an EPIC id from a branch name.
+ * Expected format: epic/{id}-{slug} — the epic's feature branch, which the
+ * final pull request is opened from (`epics/epicBranch.ts`).
+ *
+ * The counterpart of `parseTaskIdFromBranch`, and disjoint from it by
+ * construction: both are anchored, so a branch resolves to a task, to an epic,
+ * or to neither — never to both. Which one it is decides whether the comment
+ * reaches the ticket's `pr` agent or the epic's delivery agent.
+ */
+export function parseEpicIdFromBranch(branchName: string | null | undefined): number | null {
+  if (!branchName) return null;
+  const match = branchName.match(/^epic\/(\d+)-/);
   if (match?.[1]) {
     return parseInt(match[1], 10);
   }
@@ -148,11 +168,13 @@ export async function triggerPrAgentFromComment({
     throw new Error(`No worktree found for task ${taskId}`);
   }
 
-  // 5. Check for already running PR agent (concurrency guard)
-  const agentRuns = agentRunsDb.getByTask(taskId);
-  const runningPrAgent = agentRuns.find((r) => r.agent_type === 'pr' && r.status === 'running');
-  if (runningPrAgent) {
-    throw new Error(`PR agent already running for task ${taskId}`);
+  // Friendly pre-check; startAgentRun repeats this at its write boundary.
+  const runningAgent = getRunningAgentForTask(taskId);
+  if (runningAgent) {
+    throw new Error(
+      `Task ${taskId} is already running: a ${runningAgent.agent_type} agent ` +
+        `(run ${runningAgent.id}) is running on this task`,
+    );
   }
 
   // 6. Resolve the user to run the agent as (the task owner)
@@ -244,11 +266,13 @@ export async function triggerPrAgentFromReview({
     throw new Error(`No worktree found for task ${taskId}`);
   }
 
-  // 5. Check for already running PR agent (concurrency guard)
-  const agentRuns = agentRunsDb.getByTask(taskId);
-  const runningPrAgent = agentRuns.find((r) => r.agent_type === 'pr' && r.status === 'running');
-  if (runningPrAgent) {
-    throw new Error(`PR agent already running for task ${taskId}`);
+  // Friendly pre-check; startAgentRun repeats this at its write boundary.
+  const runningAgent = getRunningAgentForTask(taskId);
+  if (runningAgent) {
+    throw new Error(
+      `Task ${taskId} is already running: a ${runningAgent.agent_type} agent ` +
+        `(run ${runningAgent.id}) is running on this task`,
+    );
   }
 
   // 6. Resolve the user to run the agent as (the task owner)

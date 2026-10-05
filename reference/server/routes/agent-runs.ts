@@ -1,7 +1,11 @@
 import express, { type Request, type Response } from 'express';
-import { tasksDb, agentRunsDb } from '../database/db.js';
+import { tasksDb, taskAgentRunsDb, TaskWorktreeNotReadyError } from '../database/db.js';
 import { hasProjectAccess } from '../services/projectService.js';
-import { startAgentRun, getRunningAgentForTask } from '../services/agentRunner.js';
+import {
+  startAgentRun,
+  BaseSyncConflictError,
+  TaskAgentRunConflictError,
+} from '../services/agentRunner.js';
 import { ProviderCredentialsMissingError } from '../services/credentials/types.js';
 import type { AgentType } from '../../shared/types/db.js';
 import type { ApiError } from '../../shared/api/_common.js';
@@ -45,7 +49,7 @@ router.get(
         return res.status(404).json({ error: 'Task not found' });
       }
 
-      const agentRuns = agentRunsDb.getByTask(taskId);
+      const agentRuns = taskAgentRunsDb.getByTask(taskId);
       res.json(agentRuns);
     } catch (error) {
       console.error('Error listing agent runs:', error);
@@ -84,14 +88,6 @@ router.post(
         return res.status(404).json({ error: 'Task not found' });
       }
 
-      const runningRun = getRunningAgentForTask(taskId);
-      if (runningRun) {
-        return res.status(409).json({
-          error: 'An agent is already running for this task',
-          runningAgent: runningRun,
-        });
-      }
-
       const broadcastToConversationSubscribers =
         req.app.locals.broadcastToConversationSubscribers as
           | ((convId: number, msg: ServerToClientMessage) => void)
@@ -112,6 +108,26 @@ router.post(
 
       res.status(201).json(agentRun);
     } catch (error) {
+      if (error instanceof TaskWorktreeNotReadyError) {
+        res.status(409).json({ error: error.message } satisfies ApiError);
+        return;
+      }
+      if (error instanceof TaskAgentRunConflictError) {
+        res.status(409).json({
+          error: 'An agent is already running for this task',
+          runningAgent: error.runningAgent,
+        });
+        return;
+      }
+      if (error instanceof BaseSyncConflictError) {
+        // The run was already failed and the task blocked by the sync step.
+        res.status(409).json({
+          error:
+            `This ticket's worktree conflicts with ${error.baseBranch}. Resolve the conflicts ` +
+            'in the worktree, then resume the task.',
+        });
+        return;
+      }
       if (error instanceof ProviderCredentialsMissingError) {
         // 403 = user needs to authenticate the configured provider.
         // The body carries `provider` so the frontend can open the
@@ -146,12 +162,17 @@ router.get(
         return res.status(400).json({ error: 'Invalid agent run ID' });
       }
 
-      const agentRun = agentRunsDb.getById(agentRunId);
+      const agentRun = taskAgentRunsDb.getById(agentRunId);
       if (!agentRun) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const taskWithProject = tasksDb.getWithProject(agentRun.task_id);
+      // These routes are task-scoped: an epic run (task_id NULL) is simply not
+      // addressable here, and reads as "not found" like any other row the
+      // caller may not see.
+      const taskWithProject = agentRun.task_id
+        ? tasksDb.getWithProject(agentRun.task_id)
+        : undefined;
       if (!taskWithProject || !hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
@@ -175,17 +196,19 @@ router.put(
         return res.status(400).json({ error: 'Invalid agent run ID' });
       }
 
-      const agentRun = agentRunsDb.getById(agentRunId);
+      const agentRun = taskAgentRunsDb.getById(agentRunId);
       if (!agentRun) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const taskWithProject = tasksDb.getWithProject(agentRun.task_id);
+      const taskWithProject = agentRun.task_id
+        ? tasksDb.getWithProject(agentRun.task_id)
+        : undefined;
       if (!taskWithProject || !hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const updated = agentRunsDb.updateStatus(agentRunId, 'completed');
+      const updated = taskAgentRunsDb.updateStatus(agentRunId, 'completed');
       if (!updated) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
@@ -216,17 +239,19 @@ router.put(
         return res.status(400).json({ error: 'Conversation ID is required' });
       }
 
-      const agentRun = agentRunsDb.getById(agentRunId);
+      const agentRun = taskAgentRunsDb.getById(agentRunId);
       if (!agentRun) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const taskWithProject = tasksDb.getWithProject(agentRun.task_id);
+      const taskWithProject = agentRun.task_id
+        ? tasksDb.getWithProject(agentRun.task_id)
+        : undefined;
       if (!taskWithProject || !hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const updated = agentRunsDb.linkConversation(agentRunId, conversationId);
+      const updated = taskAgentRunsDb.linkConversation(agentRunId, conversationId);
       if (!updated) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
@@ -249,17 +274,19 @@ router.delete(
         return res.status(400).json({ error: 'Invalid agent run ID' });
       }
 
-      const agentRun = agentRunsDb.getById(agentRunId);
+      const agentRun = taskAgentRunsDb.getById(agentRunId);
       if (!agentRun) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const taskWithProject = tasksDb.getWithProject(agentRun.task_id);
+      const taskWithProject = agentRun.task_id
+        ? tasksDb.getWithProject(agentRun.task_id)
+        : undefined;
       if (!taskWithProject || !hasProjectAccess(taskWithProject.project_id, userId)) {
         return res.status(404).json({ error: 'Agent run not found' });
       }
 
-      const deleted = agentRunsDb.delete(agentRunId);
+      const deleted = taskAgentRunsDb.delete(agentRunId);
       if (!deleted) {
         return res.status(404).json({ error: 'Agent run not found' });
       }

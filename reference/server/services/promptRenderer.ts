@@ -47,6 +47,8 @@ export interface PromptDefinition {
   kind: PromptKind;
   file: string;
   variables: string[];
+  /** Operator-facing explanation shown under the label in the editor. */
+  description?: string;
 }
 
 const PROMPT_DEFINITIONS: PromptDefinition[] = [
@@ -55,14 +57,18 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
     label: 'Planification',
     kind: 'prompt',
     file: 'planification.md',
-    variables: ['taskDocPath', 'taskId', 'planTemplatePath'],
+    // planTemplatePath is legacy (pre-inlining overrides may still use it)
+    variables: ['taskDocPath', 'taskId', 'planTemplate', 'planTemplatePath'],
   },
   {
     name: 'planification-nontechnical',
     label: 'Planification (non-technical)',
     kind: 'prompt',
     file: 'planification-nontechnical.md',
-    variables: ['taskDocPath', 'taskId', 'planTemplatePath'],
+    // planTemplatePath is legacy (pre-inlining overrides may still use it).
+    // sensitiveAreasSection is the project's sensitive-areas guardrail,
+    // pre-rendered by generatePlanificationMessage (empty when the list is).
+    variables: ['taskDocPath', 'taskId', 'planTemplate', 'planTemplatePath', 'sensitiveAreasSection'],
   },
   {
     name: 'implementation',
@@ -83,28 +89,46 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
     label: 'Refinement',
     kind: 'prompt',
     file: 'refinement.md',
-    variables: ['taskDocPath', 'taskId'],
+    variables: ['taskDocPath', 'taskId', 'baseBranch'],
   },
   {
     name: 'pr',
     label: 'PR Agent',
     kind: 'prompt',
     file: 'pr.md',
-    variables: ['taskDocPath', 'taskId', 'prContextLine', 'prCreateOrVerifyBlock'],
+    // prCreateOrVerifyBlock is legacy — the same text as prPublishBlock, kept so
+    // overrides written before the block stopped branching on "a PR exists"
+    // still render. Use prPublishBlock in new text.
+    variables: [
+      'taskDocPath',
+      'taskId',
+      'prContextLine',
+      'prPublishBlock',
+      'prCreateOrVerifyBlock',
+      'baseBranch',
+    ],
   },
   {
     name: 'yolo',
     label: 'YOLO Agent',
     kind: 'prompt',
     file: 'yolo.md',
-    variables: ['taskDocPath', 'taskId', 'prContextLine', 'prCreateOrVerifyBlock'],
+    // prCreateOrVerifyBlock is legacy — see the 'pr' definition above.
+    variables: [
+      'taskDocPath',
+      'taskId',
+      'prContextLine',
+      'prPublishBlock',
+      'prCreateOrVerifyBlock',
+      'baseBranch',
+    ],
   },
   {
     name: 'pr-feedback',
     label: 'PR Feedback Response',
     kind: 'prompt',
     file: 'pr-feedback.md',
-    variables: ['taskDocPath', 'taskId', 'prUrl', 'feedbackSection'],
+    variables: ['taskDocPath', 'taskId', 'prUrl', 'feedbackSection', 'baseBranch'],
   },
   {
     name: 'plan-template',
@@ -113,7 +137,229 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
     file: 'plan-template.md',
     variables: [],
   },
+  {
+    name: 'planification-sensitive-areas',
+    label: 'Planification: sensitive-areas protocol',
+    kind: 'prompt',
+    file: 'planification-sensitive-areas.md',
+    variables: ['sensitiveAreas', 'taskId'],
+    description:
+      "The escalation protocol wrapped around a project's \"Sensitive areas\" list (Edit project) and injected into the non-technical planification prompt — only when that list is non-empty.",
+  },
+  {
+    name: 'atlas-artifact',
+    label: 'Explore Artifact Generation',
+    kind: 'prompt',
+    file: 'atlas-artifact.md',
+    variables: ['taskDocPath', 'taskId', 'kind', 'styleRefsDir'],
+  },
+  {
+    name: 'epic-architecture',
+    label: 'Epic: Architecture',
+    kind: 'prompt',
+    file: 'epic-architecture.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'specDir',
+      'specFileList',
+      'architectureDir',
+      'architectureFileList',
+      'repoPath',
+    ],
+  },
+  {
+    name: 'epic-specification',
+    label: 'Epic: Specification',
+    kind: 'prompt',
+    file: 'epic-specification.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'specDir',
+      'specFileList',
+      'docsDir',
+      'docsFileList',
+      'architectureDir',
+      'architectureFileList',
+      'repoPath',
+    ],
+  },
+  {
+    name: 'epic-stories',
+    label: 'Epic: Stories',
+    kind: 'prompt',
+    file: 'epic-stories.md',
+    variables: ['epicId', 'epicName', 'specDir', 'docsDir', 'docsFileList', 'repoPath'],
+  },
+  {
+    name: 'epic-spec-review',
+    label: 'Epic: Specification review',
+    kind: 'prompt',
+    file: 'epic-spec-review.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'specDir',
+      'specFileList',
+      'architectureDir',
+      'architectureFileList',
+      'docsDir',
+      'docsFileList',
+      'ticketTable',
+      'reviewDir',
+      'reviewFileList',
+      'repoPath',
+    ],
+  },
+  {
+    name: 'epic-orchestrator',
+    label: 'Epic: Orchestrator',
+    kind: 'prompt',
+    file: 'epic-orchestrator.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'ticketTaskId',
+      'ticketTitle',
+      'ticketPosition',
+      'ticketCount',
+      'ticketDoc',
+      'masterDoc',
+      'docsDir',
+      'storyTable',
+      'outcomeNotes',
+      'repoPath',
+    ],
+  },
+  {
+    name: 'epic-pr-review',
+    label: 'Epic: PR reviewer',
+    kind: 'prompt',
+    file: 'epic-pr-review.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'ticketTaskId',
+      'ticketTitle',
+      'ticketPosition',
+      'ticketCount',
+      'ticketDoc',
+      'taskDocPath',
+      'masterDoc',
+      'docsDir',
+      'storyTable',
+      'outcomeNotes',
+      'worktreePath',
+      'prUrl',
+      'baseBranch',
+    ],
+  },
+  {
+    name: 'epic-delivery',
+    label: 'Epic: Delivery',
+    kind: 'prompt',
+    file: 'epic-delivery.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'openingSection',
+      'worktreePath',
+      'featureBranch',
+      'defaultBranch',
+      'prSection',
+      'repoPath',
+      'ticketTable',
+    ],
+  },
+  {
+    name: 'epic-qa-scenarios',
+    label: 'Epic: QA scenarios',
+    kind: 'prompt',
+    file: 'epic-qa-scenarios.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'specDir',
+      'specFileList',
+      'architectureDir',
+      'architectureFileList',
+      'docsDir',
+      'docsFileList',
+      'ticketTable',
+      'qaDir',
+      'qaCsvPath',
+      'qaCsvState',
+      'repoPath',
+    ],
+  },
+  {
+    name: 'epic-qa-execution',
+    label: 'Epic: QA execution',
+    kind: 'prompt',
+    file: 'epic-qa-execution.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'worktreePath',
+      'featureBranch',
+      'devServerPort',
+      'qaCsvPath',
+      'qaProgress',
+      'docsDir',
+      'docsFileList',
+      'repoPath',
+    ],
+  },
+  {
+    name: 'epic-qa-fix',
+    label: 'Epic: QA fix',
+    kind: 'prompt',
+    file: 'epic-qa-fix.md',
+    variables: [
+      'epicId',
+      'epicName',
+      'repoPath',
+      'deliveryWorktreePath',
+      'featureBranch',
+      'devServerPort',
+      'qaCsvPath',
+      'failCount',
+      'failedScenarios',
+      'masterDoc',
+      'docsDir',
+      'docsFileList',
+      'storyTable',
+    ],
+  },
 ];
+
+/**
+ * Absolute path to the vendored effective-html style-reference corpus the
+ * `atlas-artifact` prompt points the agent at. Resolved from this module's
+ * location so it works in any checkout (dev, worktree, deploy).
+ */
+export function getAtlasStyleRefsDir(): string {
+  return path.join(DEFAULTS_ROOT, 'atlas-style-refs');
+}
+
+/**
+ * Absolute path to the completion scripts (`complete-plan.ts`, `complete-pr.ts`,
+ * …) the prompts tell agents to run. An agent runs them by absolute path from
+ * its own task worktree, so the path is resolved from this module's location —
+ * it works wherever Bottega is installed.
+ */
+export function getScriptsDir(): string {
+  return path.resolve(__dirname, '..', '..', 'scripts');
+}
+
+/** Variables every prompt may use without listing them in its definition. */
+const BUILTIN_VARIABLES = ['scriptsDir'];
+
+/** Every variable a prompt's text may reference: its own plus the built-ins. */
+export function allowedVariables(def: PromptDefinition): string[] {
+  return def.kind === 'template' ? def.variables : [...def.variables, ...BUILTIN_VARIABLES];
+}
 
 const PROMPT_BY_NAME = new Map(PROMPT_DEFINITIONS.map((p) => [p.name, p]));
 
@@ -174,7 +420,10 @@ export function loadPrompt(name: string): string {
 /**
  * Return the absolute path to the active version of a prompt or template:
  * the override path if an override exists, otherwise the bundled default path.
- * Used to inject e.g. `@{{planTemplatePath}}` references into other prompts.
+ * Only used for the legacy {{planTemplatePath}} variable — never @-reference
+ * this path from a prompt: an @-file mention makes the Claude Agent SDK pull
+ * Bottega's own CLAUDE.md into the target repo's agent context. Inline the
+ * content (loadPrompt) instead.
  */
 export function resolvePromptPath(name: string): string {
   return hasOverride(name) ? overridePath(name) : defaultPath(name);
@@ -204,7 +453,8 @@ export function deleteOverride(name: string): boolean {
  * Replace {{var}} placeholders. Throws on missing variable to surface
  * misconfiguration early rather than silently rendering empty strings.
  */
-export function render(template: string, vars: Record<string, unknown>): string {
+export function render(template: string, callerVars: Record<string, unknown>): string {
+  const vars: Record<string, unknown> = { scriptsDir: getScriptsDir(), ...callerVars };
   return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) => {
     if (!(key in vars)) {
       throw new Error(`Missing prompt variable: ${key}`);
@@ -240,7 +490,7 @@ export function extractVariables(template: string): string[] {
 export function findUnknownVariables(name: string, content: string): string[] {
   const def = requireDef(name);
   if (def.kind === 'template') return [];
-  const allowed = new Set(def.variables);
+  const allowed = new Set(allowedVariables(def));
   const used = extractVariables(content);
   return used.filter((v) => !allowed.has(v));
 }

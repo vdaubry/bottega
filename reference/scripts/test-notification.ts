@@ -6,7 +6,7 @@
  *
  * Usage:
  *   tsx scripts/test-notification.ts <username>
- *   tsx scripts/test-notification.ts dev-box
+ *   tsx scripts/test-notification.ts alice
  */
 
 import path from 'path';
@@ -128,7 +128,7 @@ async function sendTestNotification(username: string): Promise<void> {
 const username = process.argv[2];
 if (!username) {
     console.log('Usage: tsx scripts/test-notification.ts <username>');
-    console.log('Example: tsx scripts/test-notification.ts dev-box');
+    console.log('Example: tsx scripts/test-notification.ts alice');
     process.exit(1);
 }
 

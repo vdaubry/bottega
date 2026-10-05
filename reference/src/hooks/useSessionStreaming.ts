@@ -11,11 +11,22 @@ import type {
   ClaudeStatusPayload,
   ServerMessageOf,
 } from '@shared/websocket/messages';
+import {
+  asGeneratedImageBlock,
+  type GeneratedImageBlock,
+} from '@shared/providers/generatedImage';
 import type { WebSocketContextValue } from '../contexts/WebSocketContext';
 
 export type StreamingDisplayMessage =
   | { type: 'assistant'; content: string; timestamp: string }
   | { type: 'thinking'; content: string; timestamp: string }
+  | {
+      type: 'image';
+      fileName: string;
+      width?: number | undefined;
+      height?: number | undefined;
+      timestamp: string;
+    }
   | {
       type: 'tool';
       isToolUse: true;
@@ -73,7 +84,7 @@ interface SdkBlockToolUse {
   id: string;
   input: unknown;
 }
-type SdkContentBlock = SdkBlockText | SdkBlockThinking | SdkBlockToolUse;
+type SdkContentBlock = SdkBlockText | SdkBlockThinking | SdkBlockToolUse | GeneratedImageBlock;
 
 interface SdkAssistantMessage {
   type: 'assistant';
@@ -131,6 +142,17 @@ function transformStreamingMessage(
             content: block.thinking,
             timestamp,
           });
+        } else if (block.type === 'generated_image') {
+          const image = asGeneratedImageBlock(block);
+          if (image) {
+            messages.push({
+              type: 'image',
+              fileName: image.file_name,
+              width: image.width,
+              height: image.height,
+              timestamp,
+            });
+          }
         } else if (block.type === 'tool_use') {
           messages.push({
             type: 'tool',

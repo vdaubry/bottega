@@ -20,7 +20,9 @@ const DEFAULT_CODEX_CONFIG_ROOT = path.join(
   'users',
 );
 const AUTH_FILE_NAME = 'auth.json';
+const CONFIG_FILE_NAME = 'config.toml';
 const CODEX_SUBDIR = 'codex';
+const CHATGPT_LOGIN_REQUIREMENT = 'forced_login_method = "chatgpt"';
 
 // OpenAI / Codex CLI auth keys that override per-user CODEX_HOME if
 // inherited from the parent process. Stripped from every SDK + login
@@ -71,6 +73,47 @@ export function resolveCodexAuthJsonPath(userId: number | string | undefined): s
   return path.join(resolveCodexHomeDir(userId), AUTH_FILE_NAME);
 }
 
+export function resolveCodexConfigPath(userId: number | string | undefined): string {
+  return path.join(resolveCodexHomeDir(userId), CONFIG_FILE_NAME);
+}
+
+function requireChatGptLogin(config: string): string {
+  const newline = config.includes('\r\n') ? '\r\n' : '\n';
+  const lines = config.split(/\r?\n/);
+  const firstTableIndex = lines.findIndex((line) => /^\s*\[/.test(line));
+  const rootEnd = firstTableIndex === -1 ? lines.length : firstTableIndex;
+
+  for (let index = 0; index < rootEnd; index += 1) {
+    if (/^\s*forced_login_method\s*=/.test(lines[index]!)) {
+      lines[index] = CHATGPT_LOGIN_REQUIREMENT;
+      return lines.join(newline);
+    }
+  }
+
+  if (config.length === 0) return `${CHATGPT_LOGIN_REQUIREMENT}${newline}`;
+  return `${CHATGPT_LOGIN_REQUIREMENT}${newline}${newline}${config}`;
+}
+
+/**
+ * Pin the Codex CLI to ChatGPT OAuth without disturbing the rest of a
+ * user's config.toml. The setting must live before the first TOML table
+ * so it is applied at the document root.
+ */
+function enforceChatGptLoginConfig(codexHome: string): void {
+  const configPath = path.join(codexHome, CONFIG_FILE_NAME);
+  let current = '';
+  try {
+    current = fs.readFileSync(configPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const next = requireChatGptLogin(current);
+  if (next === current) return;
+  fs.writeFileSync(configPath, next, { mode: 0o600 });
+  fs.chmodSync(configPath, 0o600);
+}
+
 /**
  * Create the per-user CODEX_HOME (mode 0700) if it doesn't exist. The
  * parent users/{userId}/ dir is shared with Claude credentials and
@@ -106,6 +149,7 @@ export function ensureCodexHomeDir(
     }
     throw error;
   }
+  enforceChatGptLoginConfig(codexHome);
   return { codexHome };
 }
 
@@ -152,13 +196,33 @@ export interface CodexAuthPayload {
     refresh_token?: string;
     [key: string]: unknown;
   };
-  OPENAI_API_KEY?: string;
+  OPENAI_API_KEY?: unknown;
   [key: string]: unknown;
 }
 
 export interface ReadCodexAuthResult {
   payload: CodexAuthPayload;
   authPath: string;
+}
+
+function validateOAuthPayload(
+  userId: number | string | undefined,
+  payload: CodexAuthPayload,
+): void {
+  if (payload.OPENAI_API_KEY !== undefined && payload.OPENAI_API_KEY !== null) {
+    throw new CodexCredentialsError(
+      `Codex API key authentication is disabled for user ${userId}. Sign in with ChatGPT instead.`,
+    );
+  }
+
+  const hasOauth =
+    typeof payload.tokens?.access_token === 'string' ||
+    typeof payload.tokens?.id_token === 'string';
+  if (!hasOauth) {
+    throw new CodexCredentialsError(
+      `Codex auth.json for user ${userId} must contain ChatGPT OAuth tokens`,
+    );
+  }
 }
 
 export function readCodexAuth(
@@ -175,15 +239,7 @@ export function readCodexAuth(
       `Codex auth.json for user ${userId} is not valid JSON: ${(err as Error).message}`,
     );
   }
-  const hasOauth =
-    typeof payload.tokens?.access_token === 'string' ||
-    typeof payload.tokens?.id_token === 'string';
-  const hasApiKey = typeof payload.OPENAI_API_KEY === 'string';
-  if (!hasOauth && !hasApiKey) {
-    throw new CodexCredentialsError(
-      `Codex auth.json for user ${userId} carries neither OAuth tokens nor OPENAI_API_KEY`,
-    );
-  }
+  validateOAuthPayload(userId, payload);
   return { payload, authPath };
 }
 
@@ -196,6 +252,7 @@ export function writeCodexAuth(
       `Refusing to persist non-object Codex auth.json for user ${userId}`,
     );
   }
+  validateOAuthPayload(userId, payload as CodexAuthPayload);
   ensureCodexHomeDir(userId);
   const authPath = resolveCodexAuthJsonPath(userId);
   fs.writeFileSync(authPath, JSON.stringify(payload), { mode: 0o600 });
@@ -238,7 +295,7 @@ export interface CodexAuthStatus {
   status: 'authenticated' | 'missing';
   authPath: string;
   /** Login method that resolved the credential. */
-  method?: 'oauth' | 'api_key';
+  method?: 'oauth';
   tokenFingerprint?: string;
   email?: string;
   reason?: string;
@@ -260,15 +317,6 @@ export async function getCodexAuthStatus(
         ...(tryDecodeIdTokenEmail(payload.tokens.id_token) !== undefined
           ? { email: tryDecodeIdTokenEmail(payload.tokens.id_token)! }
           : {}),
-      };
-    }
-    if (typeof payload.OPENAI_API_KEY === 'string') {
-      return {
-        authenticated: true,
-        status: 'authenticated',
-        authPath,
-        method: 'api_key',
-        tokenFingerprint: fingerprint(payload.OPENAI_API_KEY),
       };
     }
     return {
@@ -319,6 +367,7 @@ export function buildCodexSdkEnv(
     PATH: process.env['PATH'],
   };
   removeInheritedCodexAuthEnv(env);
-  env['CODEX_HOME'] = resolveCodexHomeDir(userId);
+  const { codexHome } = ensureCodexHomeDir(userId);
+  env['CODEX_HOME'] = codexHome;
   return env as CodexSdkEnv;
 }

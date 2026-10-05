@@ -180,3 +180,29 @@ describe('AgentPromptsTab', () => {
     });
   });
 });
+
+// A prompt may carry an operator-facing description (the Sensitive areas
+// template ships empty, so the description is all the editor has to say).
+describe('AgentPromptsTab — prompt description', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.settings.listPrompts).mockReturnValue(fakeRes(200, samplePrompts));
+  });
+
+  it('renders the description under the label when the prompt carries one', async () => {
+    vi.mocked(api.settings.getPrompt).mockReturnValue(
+      fakeRes(200, { ...sampleDetail, description: 'Leave empty to disable the guardrail.' }),
+    );
+    render(<AgentPromptsTab />);
+    expect(await screen.findByTestId('prompt-description')).toHaveTextContent(
+      'Leave empty to disable the guardrail.',
+    );
+  });
+
+  it('renders nothing extra when the prompt has no description', async () => {
+    vi.mocked(api.settings.getPrompt).mockReturnValue(fakeRes(200, sampleDetail));
+    render(<AgentPromptsTab />);
+    await screen.findByTestId('prompt-editor');
+    expect(screen.queryByTestId('prompt-description')).toBeNull();
+  });
+});

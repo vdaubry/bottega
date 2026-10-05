@@ -1,10 +1,7 @@
 // Tiny helpers for "does this provider support feature X?" call sites.
 //
-// Phase 4 introduces these so capability checks at gate sites read
-// cleanly. Today every conversation runs through Anthropic and every
-// flag is `true`, so these are effectively no-ops; once the
-// orchestrator's per-agent provider dispatch lands, the checks gate
-// Claude-only code paths when a Codex turn is active.
+// Capability checks at gate sites read cleanly and remain independent of the
+// concrete provider name.
 
 import type {
   Provider,

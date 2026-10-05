@@ -169,7 +169,7 @@ function AskUserQuestionCard({
               />
             </svg>
             <span className="text-sm font-medium text-blue-800 dark:text-blue-300">
-              Claude has {questions.length}{' '}
+              The agent has {questions.length}{' '}
               {questions.length === 1 ? 'question' : 'questions'} for you
             </span>
           </div>

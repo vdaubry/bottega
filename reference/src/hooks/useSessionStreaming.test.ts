@@ -88,6 +88,57 @@ describe('useSessionStreaming dual-emit dedup', () => {
     });
   });
 
+  it('shows a generated image once, as an image row, while the turn is still streaming', () => {
+    const ws = makeWsHarness();
+    const { result } = renderHook(() =>
+      useSessionStreaming({
+        selectedSession: { id: sessionId },
+        sendMessage: ws.sendMessage,
+        subscribe: ws.subscribe,
+        unsubscribe: ws.unsubscribe,
+        onDisconnect: ws.onDisconnect,
+      }),
+    );
+
+    const payload = {
+      type: 'assistant',
+      session_id: sessionId,
+      uuid: 'generated_image:exec-1.png',
+      message: {
+        id: 'generated_image:exec-1.png',
+        content: [
+          {
+            type: 'generated_image',
+            file_name: 'exec-1.png',
+            media_type: 'image/png',
+            width: 1536,
+            height: 1024,
+          },
+        ],
+      },
+    };
+
+    act(() => {
+      ws.emit('ai-response', {
+        type: 'ai-response',
+        data: payload,
+        provider: 'openai',
+      } as unknown as ServerToClientMessage);
+      ws.emit('claude-response', {
+        type: 'claude-response',
+        data: payload,
+      } as unknown as ServerToClientMessage);
+    });
+
+    expect(result.current.streamingMessages).toHaveLength(1);
+    expect(result.current.streamingMessages[0]).toMatchObject({
+      type: 'image',
+      fileName: 'exec-1.png',
+      width: 1536,
+      height: 1024,
+    });
+  });
+
   it('keeps a single assistant message when ai-response arrives first', () => {
     const ws = makeWsHarness();
     const { result } = renderHook(() =>

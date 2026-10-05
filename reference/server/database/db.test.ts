@@ -462,13 +462,20 @@ describe('Database Layer - Phase 1', () => {
         expect(deleted).toBe(false);
       });
 
-      it('should cascade delete conversations when task is deleted', () => {
+      it('deleting the task cascades the ownership LINK; the base row is removed by the delete service', () => {
+        // Explicit-delete semantics (architecture-v2 step 5): the base
+        // conversations table carries no owner FK, so a raw task delete
+        // orphans the link only. `deleteTaskCompletely` removes the base
+        // rows itself (covered in taskService tests).
         const task = tasksDb.create(testProjectId, 'My Task');
         const conversation = conversationsDb.create(task.id);
 
         tasksDb.delete(task.id);
 
-        expect(conversationsDb.getById(conversation.id)).toBeUndefined();
+        expect(conversationsDb.getByTask(task.id)).toHaveLength(0);
+        const orphan = conversationsDb.getById(conversation.id)!;
+        expect(orphan.task_id).toBeNull();
+        expect(orphan.owner_kind).toBe('task');
       });
     });
   });
@@ -562,6 +569,96 @@ describe('Database Layer - Phase 1', () => {
         expect(deleted).toBe(false);
       });
     });
+
+    describe('setAtlasEnabled', () => {
+      it('defaults to 0 and flips to 1', () => {
+        const created = conversationsDb.create(testTaskId);
+        expect(conversationsDb.getById(created.id)!.atlas_enabled).toBe(0);
+
+        const updated = conversationsDb.setAtlasEnabled(created.id);
+
+        expect(updated).toBe(true);
+        expect(conversationsDb.getById(created.id)!.atlas_enabled).toBe(1);
+      });
+
+      it('returns false for a non-existent conversation', () => {
+        expect(conversationsDb.setAtlasEnabled(999)).toBe(false);
+      });
+    });
+  });
+
+  describe('taskArtifactsDb', () => {
+    let taskArtifactsDb: TestDatabase['taskArtifactsDb'];
+    let testTaskId: number;
+
+    beforeEach(() => {
+      taskArtifactsDb = testDb.taskArtifactsDb;
+      const project = projectsDb.create(testUserId, 'Artifact Project', '/path/project');
+      const task = tasksDb.create(project.id, 'Artifact Task');
+      testTaskId = task.id;
+    });
+
+    it('returns undefined when a task has no artifact of the kind', () => {
+      expect(taskArtifactsDb.get(testTaskId, 'plan')).toBeUndefined();
+    });
+
+    it('replaces the same (task, kind) on upsert (last write wins)', () => {
+      taskArtifactsDb.upsert(testTaskId, {
+        kind: 'flowchart',
+        title: 'First',
+        html: '<!doctype html><html>v1</html>',
+      });
+
+      const first = taskArtifactsDb.get(testTaskId, 'flowchart');
+      expect(first!.title).toBe('First');
+      expect(first!.html).toBe('<!doctype html><html>v1</html>');
+
+      taskArtifactsDb.upsert(testTaskId, {
+        kind: 'flowchart',
+        title: null,
+        html: '<!doctype html><html>v2</html>',
+      });
+
+      const second = taskArtifactsDb.get(testTaskId, 'flowchart');
+      expect(second!.title).toBeNull();
+      expect(second!.html).toBe('<!doctype html><html>v2</html>');
+    });
+
+    it('lets distinct kinds coexist on one task', () => {
+      taskArtifactsDb.upsert(testTaskId, { kind: 'plan', title: 'P', html: '<html>p</html>' });
+      taskArtifactsDb.upsert(testTaskId, { kind: 'flowchart', title: 'F', html: '<html>f</html>' });
+      taskArtifactsDb.upsert(testTaskId, {
+        kind: 'architecture',
+        title: 'A',
+        html: '<html>a</html>',
+      });
+
+      expect(taskArtifactsDb.get(testTaskId, 'plan')!.html).toBe('<html>p</html>');
+      expect(taskArtifactsDb.get(testTaskId, 'flowchart')!.html).toBe('<html>f</html>');
+      expect(taskArtifactsDb.get(testTaskId, 'architecture')!.html).toBe('<html>a</html>');
+    });
+
+    it('list returns metadata only (no html), ordered by kind', () => {
+      taskArtifactsDb.upsert(testTaskId, { kind: 'plan', title: 'P', html: '<html>p</html>' });
+      taskArtifactsDb.upsert(testTaskId, { kind: 'flowchart', title: 'F', html: '<html>f</html>' });
+
+      const rows = taskArtifactsDb.list(testTaskId);
+      expect(rows.map((r) => r.kind)).toEqual(['flowchart', 'plan']);
+      expect(rows.map((r) => r.title)).toEqual(['F', 'P']);
+      // The metadata projection must not carry the html blob.
+      expect(rows.every((r) => !('html' in r))).toBe(true);
+    });
+
+    it('cascade-deletes every kind with the task', () => {
+      taskArtifactsDb.upsert(testTaskId, { kind: 'plan', title: null, html: '<html></html>' });
+      taskArtifactsDb.upsert(testTaskId, { kind: 'flowchart', title: null, html: '<html></html>' });
+
+      tasksDb.delete(testTaskId);
+
+      expect(taskArtifactsDb.get(testTaskId, 'plan')).toBeUndefined();
+      expect(taskArtifactsDb.get(testTaskId, 'flowchart')).toBeUndefined();
+      expect(taskArtifactsDb.list(testTaskId)).toEqual([]);
+    });
   });
 
   describe('Foreign Key Constraints', () => {
@@ -572,7 +669,7 @@ describe('Database Layer - Phase 1', () => {
   });
 
   describe('Cascade Delete Behavior', () => {
-    it('should cascade delete from project to tasks to conversations', () => {
+    it('cascades project -> tasks -> conversation LINKS', () => {
       const project = projectsDb.create(testUserId, 'Project', '/path/project');
       const task = tasksDb.create(project.id, 'Task');
       const conversation = conversationsDb.create(task.id);
@@ -580,10 +677,13 @@ describe('Database Layer - Phase 1', () => {
       // Delete the project
       projectsDb.delete(project.id, testUserId);
 
-      // All related entities should be deleted
+      // The project and its tasks cascade; the base conversation row is
+      // orphaned (its ownership link cascaded) until the delete service
+      // removes it — explicit-delete semantics, architecture-v2 step 5.
       expect(projectsDb.getById(project.id, testUserId)).toBeUndefined();
       expect(tasksDb.getById(task.id)).toBeUndefined();
-      expect(conversationsDb.getById(conversation.id)).toBeUndefined();
+      expect(conversationsDb.getByTask(task.id)).toHaveLength(0);
+      expect(conversationsDb.getById(conversation.id)!.task_id).toBeNull();
     });
   });
 

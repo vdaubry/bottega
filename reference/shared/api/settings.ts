@@ -16,6 +16,9 @@ export interface PromptListItem {
   name: string;
   label: string;
   kind: PromptKind;
+  // Operator-facing explanation shown under the label in the editor. Only a
+  // few prompts carry one (a template whose default is empty needs it).
+  description?: string;
   isCustomized: boolean;
 }
 
@@ -25,6 +28,7 @@ export interface GetPromptResponse {
   name: string;
   label: string;
   kind: PromptKind;
+  description?: string;
   content: string;
   defaultContent: string;
   variables: string[];
@@ -93,7 +97,7 @@ export interface SlashCommand {
   path: string;
   relativePath: string;
   description: string;
-  namespace: 'project' | 'user';
+  namespace: 'builtin' | 'project' | 'user';
   metadata: SlashCommandFrontmatter;
 }
 

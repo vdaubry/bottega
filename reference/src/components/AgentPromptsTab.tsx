@@ -221,6 +221,11 @@ function AgentPromptsTab() {
             <div className="flex flex-wrap items-start justify-between gap-3 pb-3 border-b border-border">
               <div className="min-w-0">
                 <h3 className="text-base font-semibold text-foreground">{detail.label}</h3>
+                {detail.description && (
+                  <p className="mt-1 text-xs text-muted-foreground" data-testid="prompt-description">
+                    {detail.description}
+                  </p>
+                )}
                 <div className="mt-1 text-xs text-muted-foreground">
                   {detail.kind === 'template' ? (
                     <span>Free-form markdown template — read as-is by the agent, no variable substitution.</span>

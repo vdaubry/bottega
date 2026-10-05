@@ -68,7 +68,10 @@ function TaskRow({
   // Determine task status from context's live task tracking
   const hasConversations =
     (task.conversation_count ?? 0) > 0 || !!task.has_conversations;
-  const isLive = task.is_live || isTaskLive(task.id);
+  // A completed task can never show the live dot, even if a stale streaming
+  // session momentarily slips through /api/streaming-sessions (Bug #1 guard).
+  const isLive =
+    (task.is_live || isTaskLive(task.id)) && task.status !== 'completed';
 
   const handleDelete = async (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();

@@ -21,6 +21,7 @@
 export type ConversationId = number;
 export type TaskId = number;
 export type AgentRunId = number;
+export type EpicId = number;
 export type ClaudeSessionId = string;
 
 export type AgentType =
@@ -30,6 +31,23 @@ export type AgentType =
   | 'refinement'
   | 'pr'
   | 'yolo';
+
+// The epic pipeline's agent types. Stored in the same `task_agent_runs` table
+// as the task types, hence carried by the same `agent-run-updated` message —
+// but kept a separate union so task-only consumers stay exhaustive.
+export type EpicAgentType =
+  | 'epic-architecture'
+  | 'epic-specification'
+  | 'epic-stories'
+  | 'epic-spec-review'
+  | 'epic-orchestrator'
+  | 'epic-pr-review'
+  | 'epic-delivery'
+  | 'epic-qa-scenarios'
+  | 'epic-qa-execution'
+  | 'epic-qa-fix';
+
+export type AnyAgentType = AgentType | EpicAgentType;
 
 export type AgentRunStatus =
   | 'pending'
@@ -44,9 +62,12 @@ export type PermissionMode =
   | 'plan'
   | 'bypassPermissions';
 
+// Exactly one of `task_id` / `epic_id` is set — a conversation belongs to a
+// task or to an epic (see the DB CHECK on `conversations`).
 export interface ConversationSummary {
   id: ConversationId;
-  task_id: TaskId;
+  task_id: TaskId | null;
+  epic_id?: EpicId | null;
   claude_conversation_id: ClaudeSessionId | null;
   created_at: string;
   name?: string;
@@ -55,8 +76,27 @@ export interface ConversationSummary {
 export interface AgentRunSummary {
   id: AgentRunId;
   status: AgentRunStatus;
-  agent_type: AgentType;
+  agent_type: AnyAgentType;
   conversation_id: ConversationId | null;
+}
+
+// What changes about an epic between runs: its container status and the stage
+// flags. Carried by `epic-updated`, which the `mark_stage_complete` MCP tool
+// emits when an agent signs a stage off (0/1 mirrors the SQLite columns).
+export interface EpicSummary {
+  id: EpicId;
+  status: string;
+  architecture_complete: 0 | 1;
+  specs_complete: 0 | 1;
+  stories_complete: 0 | 1;
+  review_complete: 0 | 1;
+  qa_complete: 0 | 1;
+  // Orchestration state (Phase 7). Carried on the same message because every
+  // producer of one is a producer of the other: starting, pausing, blocking and
+  // finishing orchestration all change the row the epic page renders.
+  orchestration_active: 0 | 1;
+  orchestration_blocked: 0 | 1;
+  orchestration_blocked_reason: string | null;
 }
 
 export interface ClaudeStatusPayload {
@@ -119,6 +159,44 @@ export type ClientToServerMessage =
   | {
       type: 'unsubscribe-conversation';
       conversationId: ConversationId;
+    }
+  // ---- Explore (code-atlas) channel ----
+  //
+  // The Explore view subscribes per task to receive agent-driven UI commands
+  // (atlas-open-file / atlas-highlight / atlas-render-artifact). Each command
+  // carries a `requestId`; the view applies it and answers with `atlas-ack`
+  // so the MCP tool result reflects what the user actually saw (mirrors the
+  // CodeAtlas UiBridge ack protocol).
+  | {
+      type: 'subscribe-atlas';
+      taskId: TaskId;
+    }
+  | {
+      type: 'unsubscribe-atlas';
+      taskId: TaskId;
+    }
+  | {
+      // `error` set ⇒ the command failed client-side. `detail` carries a short
+      // JSON ack payload (e.g. `{ ok: true }` for atlas-render-artifact).
+      type: 'atlas-ack';
+      taskId: TaskId;
+      requestId: string;
+      error?: string;
+      detail?: string;
+    }
+  // ---- Epic channel ----
+  //
+  // Epic pages subscribe per epic for the same class of events the task
+  // channel carries for tasks: agent-run status, conversation lifecycle,
+  // streaming start/end. Epic *transcripts* still flow on the conversation
+  // channel — an epic conversation is a normal conversation.
+  | {
+      type: 'subscribe-epic';
+      epicId: EpicId;
+    }
+  | {
+      type: 'unsubscribe-epic';
+      epicId: EpicId;
     };
 
 // ---- Server → Client messages ----
@@ -129,6 +207,8 @@ export type ClientToServerMessage =
 
 import type { SDKMessage } from '../sdk/transcript.js';
 import type { Provider } from '../providers/types.js';
+import type { TaskWorktreeState } from '../types/db.js';
+import type { ArtifactKind, HighlightColor, HighlightRange } from '../types/atlas.js';
 
 export type ServerToClientMessage =
   // ---- Streaming pipeline ----
@@ -181,11 +261,13 @@ export type ServerToClientMessage =
       conversationId: ConversationId;
       claudeSessionId?: ClaudeSessionId;
       taskId?: TaskId;
+      epicId?: EpicId;
     }
   | {
       type: 'streaming-ended';
       conversationId: ConversationId;
       taskId?: TaskId;
+      epicId?: EpicId;
     }
   // ---- Conversation lifecycle ----
   | {
@@ -193,27 +275,50 @@ export type ServerToClientMessage =
       conversationId: ConversationId;
       claudeSessionId: ClaudeSessionId;
     }
+  // Emitted on the owning channel: `taskId` for task conversations, `epicId`
+  // for epic ones (the broadcaster splices its own key in).
   | {
       type: 'conversation-added';
       conversation: ConversationSummary;
-      taskId: TaskId;
+      taskId?: TaskId;
+      epicId?: EpicId;
     }
   | {
       type: 'conversation-name-updated';
       conversationId: ConversationId;
-      taskId: TaskId;
+      taskId?: TaskId;
+      epicId?: EpicId;
       name: string;
     }
-  // ---- Agent runs (task-scoped) ----
+  // ---- Agent runs (task- or epic-scoped) ----
   | {
       type: 'agent-run-updated';
       agentRun: AgentRunSummary;
-      taskId: TaskId;
+      taskId?: TaskId;
+      epicId?: EpicId;
     }
   | {
       type: 'task-blocked';
       taskId: TaskId;
       reason: string;
+    }
+  // The task's background worktree setup moved: started (a retry), finished,
+  // or failed. Conversations can start only once it says 'ready'.
+  | {
+      type: 'task-worktree-updated';
+      taskId: TaskId;
+      worktreeState: TaskWorktreeState;
+      worktreeError: string | null;
+    }
+  // ---- Epics ----
+  //
+  // The epic's own row changed (a stage was signed off). Emitted on the epic
+  // channel by the `mark_stage_complete` MCP tool; the epic page refreshes on
+  // it the way a task page refreshes on `agent-run-updated`.
+  | {
+      type: 'epic-updated';
+      epicId: EpicId;
+      epic: EpicSummary;
     }
   // ---- Context usage ----
   //
@@ -229,6 +334,7 @@ export type ServerToClientMessage =
   | {
       type: 'awaiting-user-answer';
       conversationId: ConversationId;
+      questionId?: string;
       toolUseId: string | null;
       questions: unknown[];
     }
@@ -262,6 +368,58 @@ export type ServerToClientMessage =
       type: 'conversation-unsubscribed';
       conversationId: ConversationId;
       success: true;
+    }
+  | {
+      type: 'atlas-subscribed';
+      taskId: TaskId;
+      success: true;
+    }
+  | {
+      type: 'atlas-unsubscribed';
+      taskId: TaskId;
+      success: true;
+    }
+  | {
+      type: 'epic-subscribed';
+      epicId: EpicId;
+      success: true;
+    }
+  | {
+      type: 'epic-unsubscribed';
+      epicId: EpicId;
+      success: true;
+    }
+  // ---- Explore (code-atlas) UI commands ----
+  //
+  // Pushed by the in-process code-atlas MCP tools to atlas subscribers of a
+  // task. File content travels with the event (≤2MB, already validated by the
+  // tool) so the view never re-fetches what the agent just referenced.
+  | {
+      type: 'atlas-open-file';
+      taskId: TaskId;
+      requestId: string;
+      path: string;
+      content: string;
+      line?: number;
+    }
+  | {
+      type: 'atlas-highlight';
+      taskId: TaskId;
+      requestId: string;
+      path: string;
+      content: string;
+      ranges: HighlightRange[];
+      color: HighlightColor;
+    }
+  | {
+      // A freshly generated self-contained HTML artifact. The view assigns
+      // `html` to a sandboxed iframe's srcdoc and acks once it has mounted.
+      type: 'atlas-render-artifact';
+      taskId: TaskId;
+      requestId: string;
+      kind: ArtifactKind;
+      title?: string;
+      html: string;
     }
   // ---- Session status ----
   | {
@@ -336,4 +494,19 @@ export type BroadcastToTaskSubscribersFn = (
 export type BroadcastToConversationSubscribersFn = (
   conversationId: ConversationId,
   message: ServerToClientMessage,
+) => void;
+
+// What `broadcastToEpicSubscribers(epicId, message)` accepts: any
+// server-to-client message with the `epicId` discriminant stripped (the helper
+// splices it in itself, mirroring the task-channel broadcaster). Used by
+// `agent-run-updated`, `conversation-added`, `conversation-name-updated` and
+// the epic half of the dual-emitted streaming events.
+export type EpicScopedBroadcastPayload = DistributiveOmit<
+  ServerToClientMessage,
+  'epicId'
+>;
+
+export type BroadcastToEpicSubscribersFn = (
+  epicId: EpicId,
+  message: EpicScopedBroadcastPayload,
 ) => void;

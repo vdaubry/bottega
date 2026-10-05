@@ -9,10 +9,13 @@ import { useState, useEffect, type FormEvent } from 'react';
 import { X } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
+import SensitiveAreasField from './SensitiveAreasField';
 
 export interface ProjectFormSubmitData {
   name: string;
   repoFolderPath: string;
+  // Present only when the user typed a list (trimmed).
+  sensitiveAreas?: string;
 }
 
 export interface ProjectFormSubmitResult {
@@ -35,12 +38,14 @@ function ProjectForm({
 }: ProjectFormProps) {
   const [name, setName] = useState('');
   const [repoFolderPath, setRepoFolderPath] = useState('');
+  const [sensitiveAreas, setSensitiveAreas] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isOpen) {
       setName('');
       setRepoFolderPath('');
+      setSensitiveAreas('');
       setError(null);
     }
   }, [isOpen]);
@@ -60,9 +65,11 @@ function ProjectForm({
     }
 
     try {
+      const list = sensitiveAreas.trim();
       const result = await onSubmit({
         name: name.trim(),
         repoFolderPath: repoFolderPath.trim(),
+        ...(list ? { sensitiveAreas: list } : {}),
       });
 
       if (!result.success) {
@@ -139,6 +146,13 @@ function ProjectForm({
                 placeholder="/path/to/your/project"
               />
             </div>
+
+            {/* Sensitive areas — the non-technical planning guardrail (optional) */}
+            <SensitiveAreasField
+              value={sensitiveAreas}
+              onChange={setSensitiveAreas}
+              disabled={isSubmitting}
+            />
 
             {/* Actions */}
             <div className="flex gap-2 pt-4">

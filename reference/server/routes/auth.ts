@@ -2,7 +2,7 @@ import express, { type Request, type Response } from 'express';
 import bcrypt from 'bcrypt';
 import rateLimit from 'express-rate-limit';
 import { userDb, db } from '../database/db.js';
-import { generateToken, authenticateToken } from '../middleware/auth.js';
+import { generateToken, authenticateToken, REFRESHED_TOKEN_HEADER } from '../middleware/auth.js';
 import { validateBody } from '../middleware/validate.js';
 import type { ApiError } from '../../shared/api/_common.js';
 import type {
@@ -205,6 +205,10 @@ router.post(
     } catch (error) {
       console.error('Logout token-version bump failed:', error);
     }
+    // authenticateToken attached a rolling-refresh JWT; the client would
+    // store it right after dropping its token, resurrecting a (now dead)
+    // credential in localStorage.
+    res.removeHeader(REFRESHED_TOKEN_HEADER);
     res.json({ success: true, message: 'Logged out successfully' });
   },
 );

@@ -7,8 +7,8 @@ describe('featureGuards', () => {
     expect(hasCapability('anthropic', 'supportsAskUserQuestion')).toBe(true);
   });
 
-  it('hasCapability returns false for openai + supportsAskUserQuestion', () => {
-    expect(hasCapability('openai', 'supportsAskUserQuestion')).toBe(false);
+  it('hasCapability returns true for openai + supportsAskUserQuestion', () => {
+    expect(hasCapability('openai', 'supportsAskUserQuestion')).toBe(true);
   });
 
   it('withCapability runs the callback when supported and returns its value', () => {
@@ -27,8 +27,8 @@ describe('featureGuards', () => {
   });
 
   it('assertCapability throws on the unsupported branch', () => {
-    expect(() => assertCapability('openai', 'supportsAskUserQuestion')).toThrow(
-      /Provider 'openai' does not support capability 'supportsAskUserQuestion'/,
+    expect(() => assertCapability('openai', 'supportsImages')).toThrow(
+      /Provider 'openai' does not support capability 'supportsImages'/,
     );
   });
 

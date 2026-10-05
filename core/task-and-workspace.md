@@ -73,10 +73,16 @@ flips `pending → in_progress` on the first agent activity (see
 - **Created at task creation** when the project path is a git repo; if worktree
   creation fails, the task row is rolled back (see the create handler in
   [`reference/server/routes/tasks.ts`](../reference/server/routes/tasks.ts)).
-- **Create-time conveniences** so an agent can build and test immediately:
-  symlink the repo's `.env*` files into the worktree, create gitignored dirs,
-  and copy `node_modules` / `.venv` in the background. See `createWorktree` in
-  [`reference/server/services/worktree.ts`](../reference/server/services/worktree.ts).
+- **Provisioning belongs to the project, not Bottega.** A worktree contains
+  only what git tracks; everything else an agent needs to build and test —
+  `.env` files, installed dependencies, runtime directories — is put there by
+  the project's own `post-checkout` hook, which git runs synchronously inside
+  `git worktree add`. Bottega adds nothing: a repo without a hook yields a
+  bare checkout (surfaced as a warning in project settings). See
+  `createWorktree` in
+  [`reference/server/services/worktree.ts`](../reference/server/services/worktree.ts)
+  and
+  [`reference/docs/agents/worktree-provisioning.md`](../reference/docs/agents/worktree-provisioning.md).
 - **Effective working directory:** an agent runs with `cwd` = the worktree
   project path if the worktree exists, else the repo path (with
   `subproject_path` appended for monorepos). This resolution is done in

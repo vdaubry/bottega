@@ -920,3 +920,18 @@
     -webkit-text-fill-color: hsl(var(--muted-foreground)) !important;
   }
 }
+
+/* Explore (code-atlas) view — agent highlight line decorations (colors from
+   CodeAtlas styles.css). */
+.cm-atlas-hl-yellow {
+  background-color: rgba(224, 175, 104, 0.18);
+}
+.cm-atlas-hl-green {
+  background-color: rgba(158, 206, 106, 0.18);
+}
+.cm-atlas-hl-red {
+  background-color: rgba(247, 118, 142, 0.18);
+}
+.cm-atlas-hl-blue {
+  background-color: rgba(122, 162, 247, 0.18);
+}

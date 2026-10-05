@@ -29,12 +29,19 @@ vi.mock('../database/db.js', () => ({
   userDb: {
     getUserById: mockGetUserById
   },
-  agentRunsDb: {
-    getByTask: mockGetByTask
-  },
   appSettingsDb: {
     getValue: mockGetAppSetting
   }
+}));
+
+vi.mock('../database/tasks.js', () => ({
+  tasksDb: {
+    getById: mockGetById,
+    getWithProject: mockGetWithProject,
+  },
+  taskAgentRunsDb: {
+    getByTask: mockGetByTask,
+  },
 }));
 
 // Mock worktree service
@@ -44,12 +51,17 @@ vi.mock('./worktree.js', () => ({
 
 // Mock agentRunner (dynamic import)
 vi.mock('./agentRunner.js', () => ({
-  startAgentRun: mockStartAgentRun
+  startAgentRun: mockStartAgentRun,
+  getRunningAgentForTask: (taskId: number) =>
+    (mockGetByTask(taskId) as Array<{ status: string }> | undefined)?.find(
+      (run) => run.status === 'running',
+    ) ?? null,
 }));
 
 import {
   validateGitHubWebhookSignature,
   parseTaskIdFromBranch,
+  parseEpicIdFromBranch,
   hasTriggerMention,
   getConfiguredTrigger,
   triggerPrAgentFromComment,
@@ -119,6 +131,14 @@ describe('Webhook Service', () => {
       expect(parseTaskIdFromBranch('task/999-some-long-slug-name')).toBe(999);
     });
 
+    it('never reads an epic feature branch as a ticket branch', () => {
+      // `epic/{id}-{slug}` shares the id-dash-slug shape; the anchor on
+      // `^task/` is what keeps a PR against an epic branch out of the ticket
+      // webhook path.
+      expect(parseTaskIdFromBranch('epic/8-nimbus-pricing')).toBe(null);
+      expect(parseTaskIdFromBranch('epic/123-x')).toBe(null);
+    });
+
     it('should return null for non-matching branch names', () => {
       expect(parseTaskIdFromBranch('main')).toBe(null);
       expect(parseTaskIdFromBranch('feature/add-login')).toBe(null);
@@ -131,6 +151,51 @@ describe('Webhook Service', () => {
       expect(parseTaskIdFromBranch(null)).toBe(null);
       expect(parseTaskIdFromBranch(undefined)).toBe(null);
       expect(parseTaskIdFromBranch('')).toBe(null);
+    });
+  });
+
+  describe('parseEpicIdFromBranch', () => {
+    it('extracts the epic id from its feature branch', () => {
+      expect(parseEpicIdFromBranch('epic/8-nimbus-pricing')).toBe(8);
+      expect(parseEpicIdFromBranch('epic/1-x')).toBe(1);
+      expect(parseEpicIdFromBranch('epic/999-some-long-slug-name')).toBe(999);
+    });
+
+    it('never reads a ticket branch as an epic branch', () => {
+      expect(parseEpicIdFromBranch('task/123-add-feature')).toBe(null);
+      expect(parseEpicIdFromBranch('task/8-x')).toBe(null);
+    });
+
+    it('returns null for non-matching branch names', () => {
+      expect(parseEpicIdFromBranch('main')).toBe(null);
+      expect(parseEpicIdFromBranch('feature/add-login')).toBe(null);
+      expect(parseEpicIdFromBranch('epic-123-missing-slash')).toBe(null);
+      expect(parseEpicIdFromBranch('epic/')).toBe(null);
+      expect(parseEpicIdFromBranch('epic/abc-not-a-number')).toBe(null);
+    });
+
+    it('returns null for null or undefined input', () => {
+      expect(parseEpicIdFromBranch(null)).toBe(null);
+      expect(parseEpicIdFromBranch(undefined)).toBe(null);
+      expect(parseEpicIdFromBranch('')).toBe(null);
+    });
+
+    // The route tries task first, then epic. Both anchored means a branch
+    // resolves to exactly one owner or to neither — never to both, which is
+    // what lets the dispatch be a plain if/else.
+    it('is disjoint from parseTaskIdFromBranch on every branch shape', () => {
+      for (const branch of [
+        'task/123-add-feature',
+        'epic/8-nimbus-pricing',
+        'main',
+        'feature/epic/8-nope',
+        'release/task/1-nope',
+      ]) {
+        const owners = [parseTaskIdFromBranch(branch), parseEpicIdFromBranch(branch)].filter(
+          (id) => id !== null,
+        );
+        expect(owners.length, `${branch} must resolve to at most one owner`).toBeLessThanOrEqual(1);
+      }
     });
   });
 
@@ -167,8 +232,8 @@ describe('Webhook Service', () => {
 
     it('respects a custom trigger argument over the configured default', () => {
       vi.mocked(mockGetAppSetting).mockReturnValue('bottega');
-      expect(hasTriggerMention('@acme please fix', 'acme')).toBe(true);
-      expect(hasTriggerMention('@bottega please fix', 'acme')).toBe(false);
+      expect(hasTriggerMention('@jarvis please fix', 'jarvis')).toBe(true);
+      expect(hasTriggerMention('@bottega please fix', 'jarvis')).toBe(false);
     });
 
     it('returns false when the trigger is absent', () => {
@@ -221,7 +286,7 @@ describe('Webhook Service', () => {
     it('should trigger PR agent successfully', async () => {
       const result = await triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega please fix this',
+        commentBody: '@jarvis please fix this',
         commentAuthor: 'octocat',
         prUrl: 'https://github.com/org/repo/pull/1',
         fileContext: null,
@@ -233,7 +298,7 @@ describe('Webhook Service', () => {
       expect(result.agentRunId).toBe(1);
       expect(mockStartAgentRun).toHaveBeenCalledWith(123, 'pr', expect.objectContaining({
         webhookContext: {
-          commentBody: '@bottega please fix this',
+          commentBody: '@jarvis please fix this',
           commentAuthor: 'octocat',
           prUrl: 'https://github.com/org/repo/pull/1',
           fileContext: null,
@@ -253,7 +318,7 @@ describe('Webhook Service', () => {
 
       const result = await triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega refactor this',
+        commentBody: '@jarvis refactor this',
         commentAuthor: 'reviewer',
         prUrl: 'https://github.com/org/repo/pull/1',
         fileContext,
@@ -264,7 +329,7 @@ describe('Webhook Service', () => {
       expect(result.conversationId).toBe(100);
       expect(mockStartAgentRun).toHaveBeenCalledWith(123, 'pr', expect.objectContaining({
         webhookContext: {
-          commentBody: '@bottega refactor this',
+          commentBody: '@jarvis refactor this',
           commentAuthor: 'reviewer',
           prUrl: 'https://github.com/org/repo/pull/1',
           fileContext,
@@ -278,7 +343,7 @@ describe('Webhook Service', () => {
 
       await expect(triggerPrAgentFromComment({
         taskId: 999,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
@@ -291,7 +356,7 @@ describe('Webhook Service', () => {
 
       await expect(triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
@@ -304,7 +369,7 @@ describe('Webhook Service', () => {
 
       await expect(triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
@@ -319,29 +384,28 @@ describe('Webhook Service', () => {
 
       await expect(triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
         broadcastToTaskSubscribers: null as never
-      } as never)).rejects.toThrow('PR agent already running for task 123');
+      } as never)).rejects.toThrow('Task 123 is already running');
     });
 
-    it('should not throw if non-PR agent is running', async () => {
+    it('throws for ANY running agent — the old PR-only check was the guard bypass', async () => {
+      // The task-local invariant applies to every agent type, not only PR.
       vi.mocked(mockGetByTask).mockReturnValue([
         { id: 1, agent_type: 'implementation', status: 'running' }
       ]);
 
-      const result = await triggerPrAgentFromComment({
+      await expect(triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
         broadcastToTaskSubscribers: null as never
-      } as never);
-
-      expect(result.conversationId).toBe(100);
+      } as never)).rejects.toThrow('Task 123 is already running');
     });
 
     it('should throw if the task has no owning user', async () => {
@@ -349,7 +413,7 @@ describe('Webhook Service', () => {
 
       await expect(triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
@@ -362,7 +426,7 @@ describe('Webhook Service', () => {
 
       await expect(triggerPrAgentFromComment({
         taskId: 123,
-        commentBody: '@bottega fix',
+        commentBody: '@jarvis fix',
         commentAuthor: 'user',
         prUrl: 'https://github.com/org/repo/pull/1',
         broadcastToConversationSubscribers: null as never,
@@ -522,16 +586,16 @@ describe('Webhook Service', () => {
       ]);
 
       await expect(triggerPrAgentFromReview(defaultReviewOptions as never))
-        .rejects.toThrow('PR agent already running for task 123');
+        .rejects.toThrow('Task 123 is already running');
     });
 
-    it('should not throw if non-PR agent is running', async () => {
+    it('throws for ANY running agent — the old PR-only check was the guard bypass', async () => {
       vi.mocked(mockGetByTask).mockReturnValue([
         { id: 1, agent_type: 'implementation', status: 'running' }
       ]);
 
-      const result = await triggerPrAgentFromReview(defaultReviewOptions);
-      expect(result.conversationId).toBe(200);
+      await expect(triggerPrAgentFromReview(defaultReviewOptions as never))
+        .rejects.toThrow('Task 123 is already running');
     });
 
     it('should throw if the task has no owning user', async () => {

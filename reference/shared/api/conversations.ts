@@ -8,6 +8,7 @@ import type {
   SDKMessage,
   SDKControlGetContextUsageResponse,
 } from '../sdk/transcript';
+import type { PostMessageBody } from '../schemas/conversations';
 import { expectType } from './_common';
 
 // ---- Conversation list / get ---------------------------------------------
@@ -46,8 +47,11 @@ export interface CreateConversationRequest {
   permissionMode?: string | undefined;
   // Which backend runs the conversation. Always explicit — stamped on the row.
   provider: Provider;
-  // Provider-specific model id (e.g. 'opus', 'gpt-5.5', 'opencode/kimi-k2.6').
+  // Provider-specific model id (e.g. 'opus', 'gpt-6.1-sol', 'opencode/kimi-k2.7-code').
   model: string;
+  // Explore-initiated conversation — attaches the in-process code-atlas MCP
+  // server. Anthropic-only (zod-refined server-side).
+  atlas?: boolean | undefined;
 }
 
 export type CreateConversationResponse = ConversationRow;
@@ -107,6 +111,48 @@ export interface PaginatedMessagesResponse {
 export type GetConversationMessagesResponse =
   | PaginatedMessagesResponse
   | SDKMessage[];
+
+// ---- Nested conversation detail (task-scoped) ----------------------------
+//
+// `GET /api/tasks/:taskId/conversations/:conversationId` — the conversation row
+// plus its paginated message history. Mirrors the shape returned by
+// `conversationContentStore.getSessionMessages` (always the paginated envelope
+// here, never the bare-array form the legacy `?limit`-omitted route returns).
+
+export interface GetTaskConversationResponse {
+  conversation: ConversationRow;
+  messages: SDKMessage[];
+  total: number;
+  hasMore: boolean;
+}
+
+// ---- Post message (task-scoped resume) -----------------------------------
+//
+// `POST /api/tasks/:taskId/conversations/:conversationId/messages` — bridges to
+// the WS `claude-command` resume path. Asynchronous: the turn is fired
+// fire-and-forget and the assistant's reply streams over WebSocket + persists
+// to SQLite, so the caller polls the detail endpoint from `messages_before`.
+
+// Request body — re-export of the zod-inferred type (the schema is the
+// authoritative contract).
+export type PostMessageRequest = PostMessageBody;
+
+export interface PostMessageResponse {
+  status: 'accepted';
+  task_id: number;
+  conversation_id: number;
+  // The message count at accept time — the offset a poller reads new
+  // messages from on the detail endpoint.
+  messages_before: number;
+}
+
+// Returned `409` when a turn is already streaming for this conversation
+// (mirrors the WS `conversation-busy` rejection).
+export interface ConversationBusyResponse {
+  error: string;
+  code: 'CONVERSATION_BUSY';
+  conversation_id: number;
+}
 
 // ---- Type-level smoke checks ---------------------------------------------
 

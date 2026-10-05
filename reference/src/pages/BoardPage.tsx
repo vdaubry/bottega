@@ -7,11 +7,11 @@
 
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import BoardView from '../components/Dashboard/BoardView';
+import BoardView, { type BoardTab } from '../components/Dashboard/BoardView';
 import { useTaskContext } from '../contexts/TaskContext';
 import type { ProjectRow } from '../../shared/types/db';
 
-function BoardPage() {
+function BoardPage({ tab = 'tasks' }: { tab?: BoardTab }) {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const {
@@ -69,7 +69,7 @@ function BoardPage() {
     );
   }
 
-  return <BoardView project={project} />;
+  return <BoardView project={project} tab={tab} />;
 }
 
 export default BoardPage;

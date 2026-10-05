@@ -1,9 +1,10 @@
 import express, { type Request, type Response } from 'express';
 import {
-  switchWorktree,
+  switchServedTarget,
   getActiveWorktree,
   verifySymlink,
   updateWebServerConfig,
+  type ServeTarget,
 } from '../services/webServerManager.js';
 import type { ApiError } from '../../shared/api/_common.js';
 
@@ -19,8 +20,21 @@ interface UpdateWebServerConfigBody {
   appUrl?: string | null;
 }
 
+/**
+ * `{taskId}` serves a ticket worktree, `{epicId}` an epic's delivery worktree,
+ * neither (or both null) resets to the main checkout. Passing both is a 400 —
+ * the symlink points at exactly one thing.
+ */
 interface SwitchWorktreeBody {
   taskId?: number | string | null;
+  epicId?: number | string | null;
+}
+
+/** Parse an optional id from the body; `undefined` = not supplied. */
+function parseOptionalId(raw: number | string | null | undefined): number | null | undefined {
+  if (raw === null || raw === undefined) return null;
+  const parsed = parseInt(String(raw), 10);
+  return isNaN(parsed) ? undefined : parsed;
 }
 
 router.get(
@@ -102,17 +116,30 @@ router.post(
         return res.status(400).json({ error: 'Invalid project ID' } satisfies ApiError);
       }
 
-      const { taskId } = req.body;
+      const { taskId, epicId } = req.body;
 
-      let parsedTaskId: number | null = null;
-      if (taskId !== null && taskId !== undefined) {
-        parsedTaskId = parseInt(String(taskId), 10);
-        if (isNaN(parsedTaskId)) {
-          return res.status(400).json({ error: 'Invalid task ID' } satisfies ApiError);
-        }
+      const parsedTaskId = parseOptionalId(taskId);
+      if (parsedTaskId === undefined) {
+        return res.status(400).json({ error: 'Invalid task ID' } satisfies ApiError);
+      }
+      const parsedEpicId = parseOptionalId(epicId);
+      if (parsedEpicId === undefined) {
+        return res.status(400).json({ error: 'Invalid epic ID' } satisfies ApiError);
+      }
+      if (parsedTaskId !== null && parsedEpicId !== null) {
+        return res
+          .status(400)
+          .json({ error: 'Serve a task or an epic, not both' } satisfies ApiError);
       }
 
-      const result = await switchWorktree(projectId, parsedTaskId, userId);
+      const target: ServeTarget =
+        parsedTaskId !== null
+          ? { kind: 'task', taskId: parsedTaskId }
+          : parsedEpicId !== null
+            ? { kind: 'epic', epicId: parsedEpicId }
+            : { kind: 'main' };
+
+      const result = await switchServedTarget(projectId, target, userId);
 
       if (!result.success) {
         return res

@@ -103,11 +103,26 @@ describe('TaskRow Component', () => {
       expect(screen.getByText('LIVE')).toBeInTheDocument();
     });
 
-    it('should prioritize LIVE over status badges', () => {
+    it('should never show LIVE for a completed task, even when flagged live (is_live)', () => {
+      // Bug #1 guard: a completed task can never show the live dot, even if a
+      // stale streaming session momentarily slips through. It falls back to the
+      // Completed badge instead.
       render(<TaskRow {...defaultProps} task={{ ...mockTask, status: 'completed', is_live: true }} />);
 
-      expect(screen.getByText('LIVE')).toBeInTheDocument();
-      expect(screen.queryByText('Completed')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('live-badge')).not.toBeInTheDocument();
+      expect(screen.queryByText('LIVE')).not.toBeInTheDocument();
+      expect(screen.getByText('Completed')).toBeInTheDocument();
+    });
+
+    it('should never show LIVE for a completed task, even when isTaskLive returns true', () => {
+      vi.mocked(useTaskContext).mockReturnValue({
+        isTaskLive: vi.fn(() => true),
+      } as unknown as TaskContextValue);
+
+      render(<TaskRow {...defaultProps} task={{ ...mockTask, status: 'completed' }} />);
+
+      expect(screen.queryByTestId('live-badge')).not.toBeInTheDocument();
+      expect(screen.getByText('Completed')).toBeInTheDocument();
     });
   });
 

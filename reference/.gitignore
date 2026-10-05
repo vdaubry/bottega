@@ -16,6 +16,11 @@ dist-ssr/
 build/
 out/
 
+# Vite/vitest cache. Deliberately here and not the default node_modules/.vite —
+# node_modules is symlinked across worktrees, so the default is a cache shared
+# by every checkout (see the comment in vite.config.ts).
+.vite-cache/
+
 # Environment variables
 .env
 .env.local
@@ -116,6 +121,12 @@ temp/
 *.db
 *.sqlite
 *.sqlite3 
+*.db.owner
+# SQLite's WAL sidecars — journal_mode=wal, so every run that opens the DB
+# (the test suite included) drops these beside it. Untracked and unignored, they
+# showed up as unpublished work at the PR stage's new clean-worktree gate.
+*.db-shm
+*.db-wal
 
 logs
 dev-debug.log
@@ -133,7 +144,12 @@ dev-debug.log
 /playwright-report
 .playwright-mcp/
 
-# Personal, machine-specific Claude instructions (dev-box URLs, deploy layout,
+# Instance-specific deploy config — each operator keeps their own copies
+# of these on the server (typically under ~/.bottega-deploy/).
+scripts/deploy/deploy.sh
+scripts/deploy/bottega.service
+
+# Personal, machine-specific Claude instructions (instance URLs, deploy layout,
 # manual-test fixtures, auth tokens). Loads alongside CLAUDE.md but is never
 # committed — see CLAUDE.local.md.example for the template.
 CLAUDE.local.md

@@ -1,6 +1,11 @@
 import fs from 'fs';
 import path from 'path';
-import { getWorktreeProjectPath, worktreeExists } from './worktree.js';
+import {
+  getWorktreeProjectPath,
+  worktreeExists,
+  worktreeProvisioningMode,
+  type WorktreeProvisioning,
+} from './worktree.js';
 import { projectsDb, tasksDb } from '../database/db.js';
 import { getProject } from './projectService.js';
 import { runCommand } from './shell.js';
@@ -12,6 +17,51 @@ import {
   ValidationError,
 } from './validators.js';
 import type { ProjectRow, WebServerConfig } from '../database/db.js';
+
+/**
+ * What the project's serving symlink points at.
+ *
+ * `main` is the project's own checkout; `task` is a ticket worktree; `epic` is
+ * an epic's delivery worktree — the feature branch, i.e. the whole epic so far,
+ * which is exactly what you want to click through before merging its final
+ * pull request.
+ */
+export type ServeTarget =
+  | { kind: 'main' }
+  | { kind: 'task'; taskId: number }
+  | { kind: 'epic'; epicId: number };
+
+/**
+ * How the epic layer answers "where is epic N's worktree, and may this project
+ * serve it". Registered at boot by `initEpics()`, exactly like the conversation
+ * runtime's owner adapters: this module is shared infrastructure and may not
+ * import the epic layer (architecture-v2 rule 1), but it still needs the epic
+ * domain's answer to a question only that domain can answer.
+ */
+export interface EpicServeResolver {
+  /**
+   * Validate that the epic belongs to the project, ensure its delivery worktree
+   * exists, and return that worktree's root plus a display name. Throws with a
+   * user-facing message when the epic is not servable.
+   */
+  resolveEpicServeTarget(
+    epicId: number,
+    projectId: number,
+  ): Promise<{ worktreePath: string; name: string }>;
+  /**
+   * Display name of an epic already being served, or null when the row is gone.
+   * Read-only and side-effect free — unlike the resolver above it never creates
+   * a worktree, because this answers "what is on screen", not "serve this".
+   */
+  epicName(epicId: number): string | null;
+}
+
+let epicServeResolver: EpicServeResolver | null = null;
+
+/** Wire the epic domain in. Idempotent; called from `initEpics()`. */
+export function registerEpicServeResolver(resolver: EpicServeResolver): void {
+  epicServeResolver = resolver;
+}
 
 /**
  * Get the target path that the symlink should point to
@@ -31,6 +81,63 @@ function getTargetPath(
     return repoPath;
   }
   return getWorktreeProjectPath(repoPath, taskId, subprojectPath ?? null);
+}
+
+// Repo-relative path to the optional per-project switch hook. When this file
+// exists and is executable at the new symlink target, switchWorktree delegates
+// to it instead of running its own `systemctl stop/start`. The script owns
+// build + restart for whatever stack the project uses (e.g. Django needs
+// tailwind+collectstatic+migrate before the unit restart).
+const SWITCH_SCRIPT_RELPATH = '.bottega/switch.sh';
+
+// Hard cap on captured stderr surfaced in the API warning. The script can dump
+// a lot (uv sync, collectstatic) on failure; we keep the response bounded so
+// the UI banner stays usable.
+const MAX_SCRIPT_STDERR_BYTES = 4096;
+
+function truncateForWarning(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}… (truncated, ${s.length} bytes total)`;
+}
+
+// Runs <target>/.bottega/switch.sh, with the new symlink target as cwd and
+// BOTTEGA_* env vars set. Returns ok on zero exit, or a pre-formatted warning
+// string on any failure (non-zero exit, timeout, signal).
+async function runSwitchScript(
+  scriptPath: string,
+  targetPath: string,
+  projectId: number,
+  taskId: number | null,
+  epicId: number | null,
+): Promise<{ ok: true } | { ok: false; warning: string }> {
+  try {
+    const { stdout, stderr } = await runCommand(scriptPath, [], {
+      cwd: targetPath,
+      timeout: 30_000,
+      env: {
+        ...process.env,
+        BOTTEGA_TARGET_PATH: targetPath,
+        BOTTEGA_PROJECT_ID: String(projectId),
+        // Exactly one of these is non-empty for a worktree switch; both are
+        // empty for a reset to the main checkout. `BOTTEGA_TASK_ID` keeps its
+        // existing meaning, so hooks written before epics could be served
+        // continue to work unchanged.
+        BOTTEGA_TASK_ID: taskId === null ? '' : String(taskId),
+        BOTTEGA_EPIC_ID: epicId === null ? '' : String(epicId),
+      },
+    });
+    if (stdout) console.log(`[switch.sh stdout] ${stdout}`);
+    if (stderr) console.log(`[switch.sh stderr] ${stderr}`);
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stderr = (error as { stderr?: string }).stderr ?? '';
+    const truncated = truncateForWarning(stderr, MAX_SCRIPT_STDERR_BYTES);
+    const warning = truncated
+      ? `Symlink updated but switch script failed: ${message}. Script stderr:\n${truncated}`
+      : `Symlink updated but switch script failed: ${message}.`;
+    return { ok: false, warning };
+  }
 }
 
 // Best-effort: stop any process currently bound to the service's PORT.
@@ -62,17 +169,27 @@ export interface SwitchWorktreeResult {
   success: boolean;
   error?: string;
   activeTaskId?: number | null;
+  activeEpicId?: number | null;
   warning?: string;
 }
 
 /**
- * Switch the serving symlink to a specific worktree (or main repo)
+ * Switch the serving symlink to a ticket worktree, an epic's delivery worktree,
+ * or back to the main checkout.
+ *
+ * Everything after "resolve the target path" is identical for all three, which
+ * is the whole point: an epic preview is not a second mechanism, it is the same
+ * one pointed somewhere else. Only the resolution differs — and the epic branch
+ * of it is delegated to the epic layer through `EpicServeResolver`, because
+ * this module may not import that domain.
  */
-export async function switchWorktree(
+export async function switchServedTarget(
   projectId: number,
-  taskId: number | null | undefined,
+  target: ServeTarget,
   userId: number,
 ): Promise<SwitchWorktreeResult> {
+  const taskId = target.kind === 'task' ? target.taskId : null;
+  const epicId = target.kind === 'epic' ? target.epicId : null;
   try {
     // Get project with user ownership verification
     const project = getProject(projectId, userId);
@@ -109,9 +226,10 @@ export async function switchWorktree(
       throw e;
     }
 
-    // Validate task ownership if switching to a worktree
-    if (taskId !== null && taskId !== undefined) {
-      const task = tasksDb.getWithProject(taskId);
+    // Validate ownership and resolve where the symlink should point.
+    let targetPath: string;
+    if (target.kind === 'task') {
+      const task = tasksDb.getWithProject(target.taskId);
       if (!task) {
         return { success: false, error: 'Task not found' };
       }
@@ -119,7 +237,7 @@ export async function switchWorktree(
         return { success: false, error: 'Task does not belong to this project' };
       }
       // Verify worktree exists
-      const exists = await worktreeExists(project.repo_folder_path, taskId);
+      const exists = await worktreeExists(project.repo_folder_path, target.taskId);
       if (!exists) {
         return {
           success: false,
@@ -127,9 +245,24 @@ export async function switchWorktree(
             'Worktree does not exist for this task. The task may not have been created with worktree support.',
         };
       }
+      targetPath = getTargetPath(project.repo_folder_path, target.taskId, project.subproject_path);
+    } else if (target.kind === 'epic') {
+      if (!epicServeResolver) {
+        return { success: false, error: 'Epic serving is unavailable on this server' };
+      }
+      try {
+        // Validates the epic against the project AND creates its delivery
+        // worktree if this is the first time it is needed.
+        const resolved = await epicServeResolver.resolveEpicServeTarget(target.epicId, projectId);
+        targetPath = project.subproject_path
+          ? path.join(resolved.worktreePath, project.subproject_path)
+          : resolved.worktreePath;
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    } else {
+      targetPath = getTargetPath(project.repo_folder_path, null, project.subproject_path);
     }
-
-    const targetPath = getTargetPath(project.repo_folder_path, taskId, project.subproject_path);
 
     // Verify target path exists
     try {
@@ -138,39 +271,11 @@ export async function switchWorktree(
       return { success: false, error: `Target path does not exist: ${targetPath}` };
     }
 
-    // For worktree switches, verify any dependency folder that exists in the main repo
-    // has finished copying into the worktree.
-    if (taskId !== null && taskId !== undefined) {
-      const dependencyDirs = ['node_modules', '.venv'];
-      const mainProjectPath = getTargetPath(project.repo_folder_path, null, project.subproject_path);
-      const requiredDirs: string[] = [];
-      for (const dir of dependencyDirs) {
-        const existsInMain = await fs.promises
-          .access(path.join(mainProjectPath, dir))
-          .then(() => true)
-          .catch(() => false);
-        if (existsInMain) requiredDirs.push(dir);
-      }
-      for (const dir of requiredDirs) {
-        const existsInWorktree = await fs.promises
-          .access(path.join(targetPath, dir))
-          .then(() => true)
-          .catch(() => false);
-        if (!existsInWorktree) {
-          return {
-            success: false,
-            error: `Dependencies are not ready yet (${dir} still being copied). Please try again shortly.`,
-          };
-        }
-      }
-    }
-
-    // Ensure tmp/pids exists in the target path (Rails/Puma needs it for server.pid)
-    try {
-      await fs.promises.mkdir(path.join(targetPath, 'tmp', 'pids'), { recursive: true });
-    } catch {
-      // Non-fatal: directory may already exist or path may not need it
-    }
+    // No provisioning and no readiness gate here: the project's own
+    // `post-checkout` hook ran synchronously inside `git worktree add`, so a
+    // worktree that exists is as runnable as it will ever be. If it cannot
+    // boot, that is the project's hook to fix, not Bottega's to paper over
+    // (docs/agents/worktree-provisioning.md).
 
     // Update symlink atomically using `ln -sfn`. execFile means targetPath
     // and symlinkPath are argv elements; shell metacharacters are inert.
@@ -179,6 +284,37 @@ export async function switchWorktree(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { success: false, error: `Failed to update symlink: ${message}` };
+    }
+
+    // If the new target ships .bottega/switch.sh and it's executable, delegate
+    // the entire build+restart sequence to it and skip systemctl entirely. The
+    // script lives in the project repo, so it travels with the branch and can
+    // express stack-specific steps (tailwind build, collectstatic, migrate,
+    // multi-unit `systemctl restart <target>`) without Bottega needing per-
+    // project knowledge.
+    const scriptPath = path.join(targetPath, SWITCH_SCRIPT_RELPATH);
+    let useScript = false;
+    try {
+      await fs.promises.access(scriptPath, fs.constants.X_OK);
+      useScript = true;
+    } catch {
+      // ENOENT (no script) or EACCES (present but not +x) — fall back silently
+      // to the legacy systemctl path below. A user who forgets `chmod +x` will
+      // see "no change" rather than a confusing error.
+    }
+
+    if (useScript) {
+      const scriptResult = await runSwitchScript(scriptPath, targetPath, projectId, taskId, epicId);
+      projectsDb.updateActiveWorktree(projectId, userId, taskId, epicId);
+      if (!scriptResult.ok) {
+        return {
+          success: true,
+          activeTaskId: taskId,
+          activeEpicId: epicId,
+          warning: scriptResult.warning,
+        };
+      }
+      return { success: true, activeTaskId: taskId, activeEpicId: epicId };
     }
 
     // Restart the systemd user service
@@ -213,17 +349,18 @@ export async function switchWorktree(
     } catch (restartError) {
       const message = restartError instanceof Error ? restartError.message : String(restartError);
       console.error(`Warning: Service restart failed for ${serviceName}:`, message);
-      projectsDb.updateActiveWorktree(projectId, userId, taskId ?? null);
+      projectsDb.updateActiveWorktree(projectId, userId, taskId, epicId);
       return {
         success: true,
-        activeTaskId: taskId ?? null,
+        activeTaskId: taskId,
+        activeEpicId: epicId,
         warning: `Symlink updated but service restart failed: ${message}. You may need to restart the service manually.`,
       };
     }
 
-    projectsDb.updateActiveWorktree(projectId, userId, taskId ?? null);
+    projectsDb.updateActiveWorktree(projectId, userId, taskId, epicId);
 
-    return { success: true, activeTaskId: taskId ?? null };
+    return { success: true, activeTaskId: taskId, activeEpicId: epicId };
   } catch (error) {
     console.error('Error switching worktree:', error);
     const message = error instanceof Error ? error.message : String(error);
@@ -234,11 +371,43 @@ export async function switchWorktree(
 export interface ActiveWorktreeResult {
   success: boolean;
   activeTaskId?: number | null;
+  activeEpicId?: number | null;
+  /**
+   * What to call whatever is being served — a ticket title or an epic name —
+   * or null for the main checkout. Resolved here rather than in the client so
+   * every surface says the same thing without having to hold both lists.
+   */
+  activeName?: string | null;
+  /**
+   * Who provisions this project's worktrees: its own `post-checkout` hook, or
+   * nobody (`none` — worktrees are bare checkouts). Surfaced because "why is
+   * my worktree missing its dependencies" is otherwise invisible.
+   */
+  worktreeProvisioning?: WorktreeProvisioning;
   serveSymlinkPath?: string | null;
   systemdServiceName?: string | null;
   appUrl?: string | null;
   isConfigured?: boolean;
   error?: string;
+}
+
+/**
+ * Name of whatever is being served, for the "Serving: …" indicator. Falls back
+ * to `#id` when the row exists but has no title, and to null when nothing is
+ * being served (the main checkout) or the row has been deleted.
+ */
+function resolveActiveName(
+  taskId: number | null,
+  epicId: number | null,
+): string | null {
+  if (taskId !== null) {
+    const task = tasksDb.getById(taskId);
+    return task ? task.title || `Task #${taskId}` : `Task #${taskId}`;
+  }
+  if (epicId !== null) {
+    return epicServeResolver?.epicName(epicId) ?? `Epic #${epicId}`;
+  }
+  return null;
 }
 
 /**
@@ -259,6 +428,14 @@ export async function getActiveWorktree(
     return {
       success: true,
       activeTaskId: project.active_worktree_task_id,
+      // `?? null` because the column arrived by ALTER: a row read from a
+      // pre-migration snapshot has it undefined, and the contract says null.
+      activeEpicId: project.active_worktree_epic_id ?? null,
+      worktreeProvisioning: await worktreeProvisioningMode(project.repo_folder_path),
+      activeName: resolveActiveName(
+        project.active_worktree_task_id,
+        project.active_worktree_epic_id,
+      ),
       serveSymlinkPath: project.serve_symlink_path,
       systemdServiceName: project.systemd_service_name,
       appUrl: project.app_url,

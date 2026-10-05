@@ -8,9 +8,12 @@ vi.mock('../database/db.js', () => ({
   userDb: {
     completeOnboarding: vi.fn(),
   },
-  agentRunsDb: {
-    getByConversationId: vi.fn(),
-  },
+}));
+
+// The linked run is resolved through the owner-adapter registry now.
+const mockLinkedRun = vi.hoisted(() => vi.fn());
+vi.mock('./conversation/ownerAdapters.js', () => ({
+  ownerAdapterFor: vi.fn(() => ({ linkedRun: mockLinkedRun })),
 }));
 
 vi.mock('./credentials/registry.js', () => ({
@@ -27,7 +30,7 @@ import {
   resolveResumeModelEffort,
   MissingUserAgentSettingsError,
 } from './agentModelSettings.js';
-import { userAgentModelSettingsDb, userDb, agentRunsDb } from '../database/db.js';
+import { userAgentModelSettingsDb, userDb } from '../database/db.js';
 import { getCredentialStore } from './credentials/registry.js';
 import { listOpenCodeModels } from './providers/opencode/index.js';
 import {
@@ -96,11 +99,31 @@ describe('loadAgentModelSettings (per-user)', () => {
 
   it('returns a fully-populated map for a valid blob', () => {
     vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(
-      fullBlob({ provider: 'openai', model: 'gpt-5.5', effort: 'high' }),
+      fullBlob({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' }),
     );
     const result = loadAgentModelSettings(USER);
-    expect(result.planification).toEqual({ provider: 'openai', model: 'gpt-5.5', effort: 'high' });
-    expect(result.yolo).toEqual({ provider: 'openai', model: 'gpt-5.5', effort: 'high' });
+    expect(result.planification).toEqual({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
+    expect(result.yolo).toEqual({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
+  });
+
+  it('returns a schema entry (the new model key)', () => {
+    // The `schema` key is included in AGENT_TYPES_WITH_SETTINGS, so fullBlob
+    // writes it and the loader requires/returns it.
+    vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(
+      fullBlob({ provider: 'anthropic', model: 'opus', effort: 'high' }),
+    );
+    const result = loadAgentModelSettings(USER);
+    expect(result.schema).toEqual({ provider: 'anthropic', model: 'opus', effort: 'high' });
+  });
+
+  it('throws when only the schema entry is missing (no silent default)', () => {
+    const out: Record<string, AgentModelSetting> = {};
+    for (const a of AGENT_TYPES_WITH_SETTINGS) {
+      if (a === 'schema') continue;
+      out[a] = { provider: 'anthropic', model: 'opus', effort: 'high' };
+    }
+    vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(JSON.stringify(out));
+    expect(() => loadAgentModelSettings(USER)).toThrow(MissingUserAgentSettingsError);
   });
 
   it('coerces a legacy entry without a provider to anthropic (D6)', () => {
@@ -143,12 +166,14 @@ describe('ensureUserAgentModelSettings', () => {
     expect(userDb.completeOnboarding).toHaveBeenCalledWith(USER);
   });
 
-  it('seeds openai→gpt-5.5 when only OpenAI is connected', async () => {
+  it('seeds openai→gpt-6.1-sol when only OpenAI is connected, but keeps schema on Anthropic', async () => {
     vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(null);
     connectProviders('openai');
     await ensureUserAgentModelSettings(USER);
     const saved = JSON.parse(vi.mocked(userAgentModelSettingsDb.set).mock.calls[0]![1]);
-    expect(saved.review).toEqual({ provider: 'openai', model: 'gpt-5.5', effort: 'high' });
+    expect(saved.review).toEqual({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' });
+    // schema is Anthropic-only regardless of the agents' chosen provider.
+    expect(saved.schema.provider).toBe('anthropic');
   });
 
   it('prefers anthropic over opencode when both are connected', async () => {
@@ -163,12 +188,12 @@ describe('ensureUserAgentModelSettings', () => {
     vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(null);
     connectProviders('opencode');
     vi.mocked(listOpenCodeModels).mockResolvedValue([
-      { id: 'opencode/kimi-k2', bareModelId: 'kimi-k2', name: 'Kimi', status: 'active', contextWindow: null },
+      { id: 'opencode/kimi-k2.7-code', bareModelId: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', status: 'active', contextWindow: 262144 },
     ]);
     const result = await ensureUserAgentModelSettings(USER);
     expect(result).toBe(true);
     const saved = JSON.parse(vi.mocked(userAgentModelSettingsDb.set).mock.calls[0]![1]);
-    expect(saved.planification).toEqual({ provider: 'opencode', model: 'opencode/kimi-k2', effort: null });
+    expect(saved.planification).toEqual({ provider: 'opencode', model: 'opencode/kimi-k2.7-code', effort: null });
   });
 
   it('declines to seed opencode when its catalog is empty (no guessed id)', async () => {
@@ -184,23 +209,26 @@ describe('ensureUserAgentModelSettings', () => {
 describe('resolveResumeModelEffort', () => {
   const convo = {
     id: 1,
+    owner_kind: 'task',
+    task_id: 5,
+    epic_id: null,
     provider: 'anthropic' as Provider,
     model: 'opus',
     effort: 'high' as string | null,
-  };
+  } as never;
 
   it('keeps the stored model when no userId (programmatic resume)', () => {
     expect(resolveResumeModelEffort(convo, undefined)).toEqual({ model: 'opus', effort: 'high' });
-    expect(agentRunsDb.getByConversationId).not.toHaveBeenCalled();
+    expect(mockLinkedRun).not.toHaveBeenCalled();
   });
 
   it('keeps the stored model for a manual conversation (no agent run)', () => {
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue(undefined);
+    mockLinkedRun.mockReturnValue(null);
     expect(resolveResumeModelEffort(convo, USER)).toEqual({ model: 'opus', effort: 'high' });
   });
 
   it("overrides model+effort from the resuming user's setting (same provider)", () => {
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue({ agent_type: 'planification' } as never);
+    mockLinkedRun.mockReturnValue({ agent_type: 'planification' });
     vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(
       fullBlob({ provider: 'anthropic', model: 'sonnet', effort: 'max' }),
     );
@@ -208,15 +236,15 @@ describe('resolveResumeModelEffort', () => {
   });
 
   it('keeps the stored model when the user setting targets a different provider', () => {
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue({ agent_type: 'planification' } as never);
+    mockLinkedRun.mockReturnValue({ agent_type: 'planification' });
     vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(
-      fullBlob({ provider: 'openai', model: 'gpt-5.5', effort: 'high' }),
+      fullBlob({ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' }),
     );
     expect(resolveResumeModelEffort(convo, USER)).toEqual({ model: 'opus', effort: 'high' });
   });
 
   it('keeps the stored model when the resuming user is unseeded', () => {
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue({ agent_type: 'planification' } as never);
+    mockLinkedRun.mockReturnValue({ agent_type: 'planification' });
     vi.mocked(userAgentModelSettingsDb.getRaw).mockReturnValue(null);
     expect(resolveResumeModelEffort(convo, USER)).toEqual({ model: 'opus', effort: 'high' });
   });

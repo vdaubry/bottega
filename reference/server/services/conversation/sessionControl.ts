@@ -8,20 +8,15 @@ import {
 import { cleanupTempFiles } from './media.js';
 import { hasProjectAccess } from '../projectService.js';
 import { getProvider } from '../providers/registry.js';
-import { conversationsDb, tasksDb, agentRunsDb } from '../../database/db.js';
-import type { Provider } from '@shared/providers/types';
+import { conversationsDb } from '../../database/conversations.js';
+import { ownerAdapterFor } from './ownerAdapters.js';
 
 /**
  * Abort an active session — the user clicked Stop.
  *
- * This is the *only* runtime path that marks an agent run as `'failed'`
- * (the other writer is the server-restart orphan recovery in `server/index.ts`).
- * We write the DB row synchronously *before* the abort lands, so the
- * streaming loop's completion handler will see `status='failed'` when it
- * eventually runs and skip the chain. Everything downstream — chaining,
- * notifications — derives from the DB status, not from a separate
- * in-memory flag. That keeps "what failed" deterministic instead of
- * derived from an `isError` boolean threaded through the streaming loop.
+ * The owner records the user's intent before the abort lands. Tasks retain
+ * their terminal `failed` Stop behavior; epic runs become `blocked`, which
+ * makes their completion hook inert until a message resumes the same run.
  *
  * Returns false if the session id is unknown.
  */
@@ -35,15 +30,25 @@ export async function abortSession(sessionId: string): Promise<boolean> {
   try {
     console.log(`[ConversationAdapter] Aborting session: ${sessionId}`);
 
-    // Mark the linked agent run 'failed' BEFORE the abort fires. The
-    // streaming loop's completion handler reads the row to decide whether
-    // to chain — a 'failed' row stops the loop, a 'running' row (no agent
-    // run linked, e.g. a manual chat) is the no-op case.
-    const linkedAgentRun = agentRunsDb.getByConversationId(session.conversationId);
-    if (linkedAgentRun && linkedAgentRun.status === 'running') {
-      agentRunsDb.updateStatus(linkedAgentRun.id, 'failed');
-      console.log(
-        `[ConversationAdapter] Marked agent run ${linkedAgentRun.id} (${linkedAgentRun.agent_type}) failed on user abort`,
+    // Persist the explicit interruption BEFORE the abort fires. Completion
+    // behavior is owner-specific and derives from this durable run state.
+    try {
+      const abortedConversation = conversationsDb.getById(session.conversationId);
+      const interruptedRun = abortedConversation
+        ? await ownerAdapterFor(abortedConversation).interruptLinkedRun(session.conversationId)
+        : null;
+      if (interruptedRun) {
+        console.log(
+          `[ConversationAdapter] Interrupted agent run ${interruptedRun.id} ` +
+            `(${interruptedRun.agent_type}) on user abort`,
+        );
+      }
+    } catch (interruptError) {
+      // Best-effort, like the provider abort below: a missing row or adapter
+      // must not block the local abort.
+      console.warn(
+        `[ConversationAdapter] failed to persist the interruption of ${sessionId}:`,
+        interruptError,
       );
     }
 
@@ -70,7 +75,7 @@ export async function abortSession(sessionId: string): Promise<boolean> {
 
     try {
       const conversation = conversationsDb.getById(session.conversationId);
-      const providerName = (conversation?.provider as Provider | undefined) ?? 'anthropic';
+      const providerName = conversation?.provider ?? 'anthropic';
       // `sessionId` is the activeSessions key, which equals the provider
       // session id for every provider (claude session id / codex thread id /
       // opencode session id). Hand it straight to abortTurn.
@@ -87,7 +92,11 @@ export async function abortSession(sessionId: string): Promise<boolean> {
     session.status = 'aborted';
     await cleanupTempFiles(session.tempImagePaths, session.tempDir);
     activeSessions.delete(sessionId);
-    activeStreamingSessions.delete(sessionId);
+    // Keep the conversation-busy entry until the aborted streaming loop runs
+    // its normal completion lifecycle. Releasing it here would let a resume
+    // start before the old completion hook has observed the durable blocked
+    // run, allowing that stale hook to complete the newly resumed turn.
+    // `handleStreamingComplete` owns this deletion.
     return true;
   } catch (error) {
     console.error(`[ConversationAdapter] Error aborting session ${sessionId}:`, error);
@@ -107,6 +116,7 @@ export function getActiveSessions(): string[] {
 export interface ActiveStreamingDescriptor {
   sessionId: string;
   taskId?: number | null | undefined;
+  epicId?: number | null | undefined;
   conversationId: number;
 }
 
@@ -119,6 +129,55 @@ export function getActiveStreamingByConversation(
     }
   }
   return null;
+}
+
+/**
+ * Find the conversation id of an in-flight Explore artifact generation for a
+ * task, or null. A generation is an `atlas_enabled` conversation that is
+ * currently streaming (held in `activeStreamingSessions`). The
+ * generate-artifact route uses this to stay idempotent: a task has at most one
+ * ongoing generation, so re-opening the Explore view (a fresh mount) — or
+ * double-clicking Generate — while the ~5-min plan turn is still running binds
+ * to the running generation instead of spawning a duplicate. The in-memory map
+ * is the right source: it empties on `streaming-ended`, so a finished or
+ * server-restart-orphaned generation correctly reads as "none ongoing".
+ */
+export function getOngoingAtlasGenerationConversationId(taskId: number): number | null {
+  for (const data of activeStreamingSessions.values()) {
+    if (data.taskId !== taskId) continue;
+    const conversation = conversationsDb.getById(data.conversationId);
+    if (conversation?.atlas_enabled) return data.conversationId;
+  }
+  return null;
+}
+
+/**
+ * Reconcile liveness when a task is marked `completed`. Deletes every
+ * `activeStreamingSessions` entry for the task and returns the
+ * {sessionId, conversationId} pairs that were removed so the caller can
+ * re-emit a task-channel `streaming-ended` for each (the frontend drops the
+ * task from `liveTaskIds` on that event).
+ *
+ * The realistic trigger is a *leaked* session — a lost `streaming-ended` that
+ * only a server restart would otherwise clear. We deliberately touch only the
+ * in-memory map here: no abort controller is flipped and no `task_agent_runs`
+ * row is mutated, so a genuinely in-flight turn keeps running and its eventual
+ * `handleStreamingComplete` re-broadcasts `streaming-ended` idempotently.
+ *
+ * Deleting from a `Map` while iterating its `.entries()` is safe — the
+ * iterator tolerates deletion of the current entry.
+ */
+export function clearStreamingSessionsForTask(
+  taskId: number,
+): Array<{ sessionId: string; conversationId: number }> {
+  const cleared: Array<{ sessionId: string; conversationId: number }> = [];
+  for (const [sessionId, data] of activeStreamingSessions.entries()) {
+    if (data.taskId === taskId) {
+      cleared.push({ sessionId, conversationId: data.conversationId });
+      activeStreamingSessions.delete(sessionId);
+    }
+  }
+  return cleared;
 }
 
 /**
@@ -143,9 +202,8 @@ export function getAllActiveStreamingSessions(
       projectId = active.projectId;
     } else {
       const conv = conversationsDb.findByClaudeSessionId(sessionId);
-      if (conv?.task_id) {
-        const task = tasksDb.getById(conv.task_id);
-        if (task) projectId = task.project_id;
+      if (conv) {
+        projectId = ownerAdapterFor(conv).resolveOwner(conv)?.projectId ?? null;
       }
     }
     if (projectId === null) continue;
@@ -153,6 +211,7 @@ export function getAllActiveStreamingSessions(
     sessions.push({
       sessionId,
       taskId: data.taskId,
+      epicId: data.epicId,
       conversationId: data.conversationId,
     });
   }

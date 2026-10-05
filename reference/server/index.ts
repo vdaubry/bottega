@@ -47,18 +47,21 @@ try {
 console.log('PORT from env:', process.env.PORT);
 
 import express, { type Request, type Response } from 'express';
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer } from 'ws';
 import http from 'http';
 import cors from 'cors';
 import { promises as fsPromises } from 'fs';
 
 import { getAllActiveStreamingSessions } from './services/conversationAdapter.js';
 import {
-  dispatchClientMessage,
-  cleanupClientSubscriptions,
   makeBroadcastToTaskSubscribers,
   makeBroadcastToConversationSubscribers,
+  makeBroadcastToAtlasSubscribers,
+  makeGetAtlasSubscriberCount,
+  makeBroadcastToEpicSubscribers,
 } from './websocket/dispatch.js';
+import { initAtlasBridge } from './services/atlas/bridge.js';
+import { makeConnectionHandler, type HeartbeatWebSocket } from './websocket/connection.js';
 import authRoutes from './routes/auth.js';
 import accountRoutes from './routes/account.js';
 import claudeAuthRoutes from './routes/claudeAuth.js';
@@ -67,33 +70,38 @@ import openCodeAuthRoutes from './routes/openCodeAuth.js';
 import commandsRoutes from './routes/commands.js';
 import projectsRoutes from './routes/projects.js';
 import tasksRoutes from './routes/tasks.js';
+import atlasRoutes from './routes/atlas.js';
 import conversationsRoutes from './routes/conversations.js';
 import agentRunsRoutes from './routes/agent-runs.js';
+import epicsRoutes from './routes/epics.js';
 import webServerRoutes from './routes/webServer.js';
 import adminRoutes from './routes/admin.js';
 import webhooksRoutes from './routes/webhooks.js';
 import settingsRoutes from './routes/settings.js';
 import appSettingsRoutes from './routes/appSettings.js';
 import userAgentModelSettingsRoutes from './routes/userAgentModelSettings.js';
-import { initializeDatabase, agentRunsDb } from './database/db.js';
+import { initializeDatabase } from './database/db.js';
+import { databasePath } from './database/connection.js';
+import { claimDatabaseOwnership, releaseDatabaseOwnership } from './database/ownership.js';
+import { initEpics, resumeOrchestrationAfterRestart } from './services/epics/index.js';
+import { initTasks } from './services/tasks/adapter.js';
+import { onTaskEvent } from './services/tasks/events.js';
+import {
+  abortAllWorktreeSetups,
+  failInterruptedWorktreeSetups,
+} from './services/tasks/worktreeSetup.js';
+import { reconcileTaskLandings } from './services/tasks/index.js';
+import { sweepAllOwnerOrphans } from './services/conversation/ownerAdapters.js';
 import { getProject } from './services/projectService.js';
 import { transcribeAudio } from './services/transcription.js';
 import {
   authenticateToken,
   requireAdmin,
-  authenticateWebSocket,
   ensureJwtSecret,
   REFRESHED_TOKEN_HEADER,
 } from './middleware/auth.js';
-import type { WebSocketUser } from './middleware/auth.js';
-
-interface AugmentedIncomingMessage extends http.IncomingMessage {
-  user?: WebSocketUser;
-}
-
-interface HeartbeatWebSocket extends WebSocket {
-  isAlive?: boolean;
-}
+import { verifyClient } from './websocket/verifyClient.js';
+import { installProcessGuards } from './processGuards.js';
 
 interface FileTreeItem {
   name: string;
@@ -109,35 +117,12 @@ interface FileTreeItem {
 const app = express();
 const server = http.createServer(app);
 
-function getSafeRequestPath(rawUrl: string | undefined): string {
-  try {
-    return new URL(rawUrl ?? '', 'http://localhost').pathname;
-  } catch {
-    return '[invalid-url]';
-  }
-}
-
-// Single WebSocket server that handles both paths
-const wss = new WebSocketServer({
-  server,
-  verifyClient: (info: { req: AugmentedIncomingMessage }) => {
-    console.log('WebSocket connection attempt to:', getSafeRequestPath(info.req.url));
-
-    const url = new URL(info.req.url ?? '', 'http://localhost');
-    const token =
-      url.searchParams.get('token') || info.req.headers.authorization?.split(' ')[1];
-
-    const user = authenticateWebSocket(token);
-    if (!user) {
-      console.log('[WARN] WebSocket authentication failed');
-      return false;
-    }
-
-    info.req.user = user;
-    console.log('[OK] WebSocket authenticated for user:', user.username);
-    return true;
-  },
-});
+// Single WebSocket server that handles both paths. Authentication happens in
+// `verifyClient` (websocket/verifyClient.ts), which also owns the one failure
+// that used to escape from here: a locked database throwing out of the
+// synchronous credential lookup, in a hook `ws` runs straight off the HTTP
+// server's `upgrade` event where nothing else could catch it.
+const wss = new WebSocketServer({ server, verifyClient });
 
 // WebSocket heartbeat to detect stale connections
 const HEARTBEAT_INTERVAL = 30000;
@@ -162,9 +147,43 @@ const broadcastToTaskSubscribers = makeBroadcastToTaskSubscribers(wss);
 const broadcastToConversationSubscribers =
   makeBroadcastToConversationSubscribers(wss);
 
+// Explore (code-atlas) channel: the MCP tools push UI commands through the
+// bridge, which fans out to atlas subscribers and waits for their acks.
+initAtlasBridge({
+  broadcast: makeBroadcastToAtlasSubscribers(wss),
+  getSubscriberCount: makeGetAtlasSubscriberCount(wss),
+});
+
+// Epic channel: epic-scoped lifecycle events (agent runs, conversations,
+// streaming badges) for open epic pages — the epic's equivalent of the task
+// channel.
+const broadcastToEpicSubscribers = makeBroadcastToEpicSubscribers(wss);
+
 app.locals.wss = wss;
 app.locals.broadcastToTaskSubscribers = broadcastToTaskSubscribers;
 app.locals.broadcastToConversationSubscribers = broadcastToConversationSubscribers;
+app.locals.broadcastToEpicSubscribers = broadcastToEpicSubscribers;
+
+// Wire the epic domain up: its event bridge starts conversation turns from
+// places that have no request to read `app.locals` off — a completion hook,
+// the boot reconciliation below — so it gets the same three closures through
+// a registry; and its TaskEvents subscription is what makes it react to
+// ticket turns at all.
+initTasks();
+// A task's worktree is set up in the background after creation; its outcome
+// reaches open task pages and boards over the task channel.
+onTaskEvent('worktree-state-changed', ({ taskId, state, error }) => {
+  broadcastToTaskSubscribers(taskId, {
+    type: 'task-worktree-updated',
+    worktreeState: state,
+    worktreeError: error,
+  });
+});
+initEpics({
+  broadcastFn: broadcastToConversationSubscribers,
+  broadcastToTaskSubscribersFn: broadcastToTaskSubscribers,
+  broadcastToEpicSubscribersFn: broadcastToEpicSubscribers,
+});
 
 // Expose the sliding-refresh JWT header so browser fetch() callers can read it.
 app.use(cors({ exposedHeaders: [REFRESHED_TOKEN_HEADER] }));
@@ -196,8 +215,10 @@ app.use('/api/commands', authenticateToken, commandsRoutes);
 
 app.use('/api/projects', authenticateToken, projectsRoutes);
 app.use('/api', authenticateToken, tasksRoutes);
+app.use('/api', authenticateToken, atlasRoutes);
 app.use('/api', authenticateToken, conversationsRoutes);
 app.use('/api', authenticateToken, agentRunsRoutes);
+app.use('/api', authenticateToken, epicsRoutes);
 app.use('/api', authenticateToken, webServerRoutes);
 app.use('/api/settings', authenticateToken, settingsRoutes);
 app.use('/api/user-agent-model-settings', authenticateToken, userAgentModelSettingsRoutes);
@@ -236,72 +257,18 @@ app.get('/api/projects/:id/files', authenticateToken, async (req: Request, res: 
   }
 });
 
-wss.on('connection', (ws: WebSocket, request: AugmentedIncomingMessage) => {
-  const url = request.url;
-  console.log('[INFO] Client connected to:', getSafeRequestPath(url));
-
-  const urlObj = new URL(url ?? '', 'http://localhost');
-  const pathname = urlObj.pathname;
-
-  if (pathname === '/ws') {
-    handleChatConnection(ws, request);
-  } else {
-    console.log('[WARN] Unknown WebSocket path:', pathname);
-    ws.close();
-  }
-});
-
-function handleChatConnection(ws: WebSocket, request: AugmentedIncomingMessage): void {
-  console.log('[INFO] Chat WebSocket connected');
-
-  const hws = ws as HeartbeatWebSocket;
-  hws.isAlive = true;
-  ws.on('pong', () => {
-    hws.isAlive = true;
-  });
-
-  const userId = request?.user?.id;
-  const ctx = {
-    ws,
+// Everything that happens on an accepted socket — the 'error' guard, the
+// path routing, the chat message loop — lives in websocket/connection.ts so
+// it can run against a real WebSocketServer under test.
+wss.on(
+  'connection',
+  makeConnectionHandler({
     wss,
-    userId,
     broadcastToTaskSubscribersFn: broadcastToTaskSubscribers,
     broadcastToConversationSubscribersFn: broadcastToConversationSubscribers,
-  };
-
-  ws.on('message', async (message: Buffer | ArrayBuffer | Buffer[]) => {
-    let data: unknown;
-    try {
-      const text = Array.isArray(message)
-        ? Buffer.concat(message).toString('utf8')
-        : Buffer.from(message as ArrayBuffer).toString('utf8');
-      data = JSON.parse(text);
-    } catch (error) {
-      const errMessage = error instanceof Error ? error.message : JSON.stringify(error);
-      console.error('[ERROR] Chat WebSocket parse error:', errMessage);
-      ws.send(JSON.stringify({ type: 'error', error: errMessage }));
-      return;
-    }
-
-    if (typeof (data as { type?: unknown })?.type !== 'string') {
-      // Malformed/unknown payload — silently drop, matching prior behavior.
-      return;
-    }
-
-    try {
-      await dispatchClientMessage(ctx, data as Parameters<typeof dispatchClientMessage>[1]);
-    } catch (error) {
-      const errMessage = error instanceof Error ? error.message : String(error);
-      console.error('[ERROR] Chat WebSocket dispatch error:', errMessage);
-      ws.send(JSON.stringify({ type: 'error', error: errMessage }));
-    }
-  });
-
-  ws.on('close', () => {
-    console.log('🔌 Chat client disconnected');
-    cleanupClientSubscriptions(ws);
-  });
-}
+    broadcastToEpicSubscribersFn: broadcastToEpicSubscribers,
+  }),
+);
 
 app.post('/api/transcribe', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -419,13 +386,43 @@ async function startServer(): Promise<void> {
 
     await initializeDatabase();
 
-    const orphanedRuns = agentRunsDb.getByStatus('running');
-    if (orphanedRuns.length > 0) {
-      for (const run of orphanedRuns) {
-        agentRunsDb.updateStatus(run.id, 'failed');
-      }
-      console.log(
-        `[RECOVERY] Marked ${orphanedRuns.length} orphaned agent run(s) as failed: ${orphanedRuns.map((r) => `#${r.id} (${r.agent_type} for task ${r.task_id})`).join(', ')}`,
+    // Crash recovery, and only for the server that owns this database. Each
+    // action below assumes the mid-flight state it finds is wreckage this
+    // process left behind on its way down. That holds for a restart; it does
+    // not hold for a second server sharing the file (a worktree dev server
+    // whose `server/database/bottega.db` symlinks to the live one), where the
+    // same actions would fail runs another server is actively streaming,
+    // remove its worktrees, and wake its orchestrators.
+    const ownership = claimDatabaseOwnership(databasePath);
+    if (ownership.owned) {
+      // Each owner domain sweeps its own orphans: runs left 'running' by the
+      // restart are failed (task and epic tables alike).
+      sweepAllOwnerOrphans();
+
+      // Worktree setups that were running died with the previous process:
+      // mark them failed so those tasks offer Retry instead of staying stuck.
+      failInterruptedWorktreeSetups();
+
+      // Repair the one cross-system crash window before epic sequencing reads
+      // task status: a persisted merge request whose PR reached MERGED while the
+      // process was dying. Large worktree cleanups continue in the background;
+      // only the authoritative GitHub -> SQLite reconciliation is startup work.
+      await reconcileTaskLandings();
+
+      // Epics under orchestration self-heal across restarts (see
+      // services/epics/index.ts for why).
+      resumeOrchestrationAfterRestart();
+    } else {
+      const owner = ownership.heldBy;
+      console.warn(
+        `${c.warn('[WARN]')} Another server owns ${ownership.databasePath}` +
+          (owner ? ` (pid ${owner.pid}, started ${owner.startedAt}, at ${owner.install})` : '') +
+          ' — skipping crash recovery: no orphan sweep, no landing reconciliation, ' +
+          'no orchestrator resume. Its in-flight runs are not yours to fail.',
+      );
+      console.warn(
+        `${c.warn('[WARN]')} This server still shares that database. ` +
+          'Set DATABASE_PATH to a copy to work in isolation.',
       );
     }
 
@@ -453,20 +450,30 @@ async function startServer(): Promise<void> {
   }
 }
 
-process.on('SIGTERM', () => {
-  console.log('[Server] SIGTERM received, shutting down gracefully...');
+// Hand the database back on the way out, so the next boot recovers instead of
+// reading our stale pid. No-ops unless we hold the lock — a dev server exiting
+// must not release the live service's claim.
+function shutdown(signal: string): void {
+  console.log(`[Server] ${signal} received, shutting down gracefully...`);
+  // Stop running worktree setups (their hooks lead their own process groups,
+  // so nothing else would). The next owner's boot marks those tasks failed.
+  abortAllWorktreeSetups();
+  releaseDatabaseOwnership(databasePath);
   server.close(() => {
     console.log('[Server] HTTP server closed');
     process.exit(0);
   });
-});
+}
 
-process.on('SIGINT', () => {
-  console.log('[Server] SIGINT received, shutting down gracefully...');
-  server.close(() => {
-    console.log('[Server] HTTP server closed');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// The last-resort `uncaughtException` / `unhandledRejection` handlers. There
+// were none: the one lock timeout an authenticated request hit on 2026-09-04
+// took the whole server down. The policy — keep serving through a SQLITE_BUSY
+// that nothing caught, exit on anything else exactly as Node would — and the
+// reasoning behind it are in processGuards.ts.
+installProcessGuards();
 
 void startServer();

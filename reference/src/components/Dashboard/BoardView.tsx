@@ -9,7 +9,8 @@
  *
  * Features:
  * - Responsive layout: horizontal scroll-snap on mobile, 4-column grid on desktop
- * - Header with breadcrumb navigation and "New Task" button
+ * - Header with breadcrumb navigation and "Ask" / "Epic" / "Add" buttons
+ *   (labels kept short so the header fits on mobile)
  * - Loads task documentation and conversation counts
  */
 
@@ -24,6 +25,7 @@ import {
   X,
   Loader2,
   MessageCircleQuestion,
+  Telescope,
 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { cn } from '../../lib/utils';
@@ -31,9 +33,12 @@ import { useTaskContext } from '../../contexts/TaskContext';
 import { useClaudeAuth } from '../../contexts/ClaudeAuthContext';
 import { api } from '../../utils/api';
 import { useTasksLiveSubscriptions } from '../../hooks/useTasksLiveSubscriptions';
+import { useWorktreeGuard } from '../../hooks/useWorktreeGuard';
 import BoardColumn from './BoardColumn';
+import EpicsPanel from '../epic/EpicsPanel';
 import TaskForm from '../TaskForm';
 import AskQuestionModal, { type AskQuestionPayload } from '../AskQuestionModal';
+import { waitForTaskWorktree } from '../../utils/waitForTaskWorktree';
 import type { ProjectRow, TaskRow, TaskStatus } from '../../../shared/types/db';
 import type { CreateTaskRequest } from '../../../shared/api/tasks';
 import type { WebServerStatusSuccess } from '../../../shared/api/projects';
@@ -49,16 +54,25 @@ interface ActionResult {
   error?: string;
 }
 
+export type BoardTab = 'tasks' | 'epics';
+
 export interface BoardViewProps {
   className?: string;
   project: ProjectRow | null;
+  /**
+   * Which surface the board shows. Driven by the URL (`/projects/:id` vs
+   * `/projects/:id/epics`) rather than local state, so the tab is linkable and
+   * the browser's back button moves between them.
+   */
+  tab?: BoardTab;
 }
 
 type TasksByStatus = Record<TaskStatus, TaskRow[]>;
 
-function BoardView({ className, project }: BoardViewProps) {
+function BoardView({ className, project, tab = 'tasks' }: BoardViewProps) {
   const navigate = useNavigate();
   const { requireClaudeAuth } = useClaudeAuth();
+  const { guardWith, guardModal } = useWorktreeGuard();
   const {
     tasks,
     isLoadingTasks,
@@ -74,6 +88,7 @@ function BoardView({ className, project }: BoardViewProps) {
   // Ask Question modal state
   const [showAskQuestion, setShowAskQuestion] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
+  const [askStatus, setAskStatus] = useState<string | null>(null);
 
   // Subscribe to task-channel events for every task currently displayed on
   // the board so the per-card Live indicator keeps updating between REST
@@ -97,12 +112,12 @@ function BoardView({ className, project }: BoardViewProps) {
 
     setIsSwitchingServer(true);
     try {
-      const response = await api.projects.switchWebServer(project.id, null);
+      const response = await api.projects.switchWebServer(project.id, null, null);
       if (response.ok) {
         const data = await response.json();
         if (data.success) {
           setWebServerStatus((prev) =>
-            prev ? { ...prev, activeTaskId: null } : prev
+            prev ? { ...prev, activeTaskId: null, activeEpicId: null, activeName: null } : prev
           );
         }
       }
@@ -235,7 +250,9 @@ function BoardView({ className, project }: BoardViewProps) {
     [navigate, project]
   );
 
-  // Handle task delete click
+  // Handle task delete click. The confirm covers "did you mean to delete this
+  // task"; the guard covers "there is work in its worktree you have not saved",
+  // which the confirm cannot know about.
   const handleTaskDelete = useCallback(
     async (task: TaskRow) => {
       if (
@@ -245,9 +262,20 @@ function BoardView({ className, project }: BoardViewProps) {
       ) {
         return;
       }
-      await deleteTask(task.id);
+      await guardWith<void>({
+        taskId: task.id,
+        intent: 'delete',
+        run: async (force) => {
+          const result = await deleteTask(task.id, force);
+          if (result.conflict) return { kind: 'conflict', conflict: result.conflict };
+          if (!result.success) {
+            return { kind: 'error', error: result.error || 'Failed to delete task' };
+          }
+          return { kind: 'ok', data: undefined };
+        },
+      });
     },
-    [deleteTask]
+    [deleteTask, guardWith]
   );
 
   // Handle task creation
@@ -294,6 +322,23 @@ function BoardView({ className, project }: BoardViewProps) {
         }
         const newTask = createResult.task;
 
+        // The worktree is set up in the background, and no conversation can
+        // start before it is ready: wait for it here, saying so.
+        if (newTask.worktree_state === 'provisioning') {
+          setAskStatus(
+            'Setting up the worktree — the project setup can take a few minutes. ' +
+              'Your question is sent as soon as it is ready.',
+          );
+          const state = await waitForTaskWorktree(newTask.id);
+          if (state !== 'ready') {
+            // The task page shows why (or that it is still setting up), with
+            // Retry / Delete. The question was not sent.
+            setShowAskQuestion(false);
+            navigate(`/projects/${project.id}/tasks/${newTask.id}`);
+            return { success: true };
+          }
+        }
+
         // Fire status update in parallel — cosmetic, don't block on failure
         api.tasks.update(newTask.id, { status: 'in_progress' }).catch((err) => {
           console.error('Failed to set task status to in_progress:', err);
@@ -329,6 +374,7 @@ function BoardView({ className, project }: BoardViewProps) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       } finally {
         setIsAsking(false);
+        setAskStatus(null);
       }
     },
     [project, requireClaudeAuth, createTask, navigate]
@@ -374,17 +420,12 @@ function BoardView({ className, project }: BoardViewProps) {
           {webServerStatus?.isConfigured && (
             <div className="hidden md:flex items-center gap-2 text-xs text-muted-foreground bg-muted/50 px-2.5 py-1 rounded-full">
               <Server className="w-3.5 h-3.5" />
-              <span>
-                Serving:{' '}
-                {webServerStatus.activeTaskId
-                  ? (() => {
-                      const activeTask = tasks.find((t) => t.id === webServerStatus.activeTaskId);
-                      return activeTask?.title || `Task #${webServerStatus.activeTaskId}`;
-                    })()
-                  : 'Main'}
-              </span>
+              {/* The name is resolved server-side, so this reads the same for a
+                  ticket worktree and for an epic's — and the Epics tab, which
+                  never loads the task list, can still say what is served. */}
+              <span>Serving: {webServerStatus.activeName ?? 'Main'}</span>
               {/* Reset to main button - only show when serving a worktree */}
-              {webServerStatus.activeTaskId && (
+              {(webServerStatus.activeTaskId || webServerStatus.activeEpicId) && (
                 <button
                   onClick={handleResetServer}
                   disabled={isSwitchingServer}
@@ -401,7 +442,7 @@ function BoardView({ className, project }: BoardViewProps) {
             </div>
           )}
 
-          {/* Right: Edit + New Task buttons */}
+          {/* Right: Edit + Ask / Epic / Add buttons */}
           <div className="flex items-center gap-2">
             <Button
               variant="ghost"
@@ -420,18 +461,63 @@ function BoardView({ className, project }: BoardViewProps) {
               title="Ask a quick question without creating a full task workflow"
             >
               <MessageCircleQuestion className="w-4 h-4 mr-1.5" />
-              Ask Question
+              Ask
             </Button>
-            <Button
-              variant="default"
-              size="sm"
-              onClick={() => setShowTaskForm(true)}
-              className="flex-shrink-0"
-            >
-              <Plus className="w-4 h-4 mr-1.5" />
-              New Task
-            </Button>
+            {tab === 'tasks' ? (
+              <Button
+                variant="default"
+                size="sm"
+                onClick={() => setShowTaskForm(true)}
+                className="flex-shrink-0"
+                title="Create a new task"
+              >
+                <Plus className="w-4 h-4 mr-1.5" />
+                Add
+              </Button>
+            ) : (
+              <Button
+                variant="default"
+                size="sm"
+                onClick={() => navigate(`/projects/${project.id}/epics/new`)}
+                className="flex-shrink-0"
+                title="Create a new epic"
+              >
+                <Plus className="w-4 h-4 mr-1.5" />
+                Add
+              </Button>
+            )}
           </div>
+        </div>
+
+        {/* Tasks | Epics — one project surface, two views of it */}
+        <div className="mt-3 flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => navigate(`/projects/${project.id}`)}
+            aria-current={tab === 'tasks' ? 'page' : undefined}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-sm transition-colors',
+              tab === 'tasks'
+                ? 'bg-muted font-medium text-foreground'
+                : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            Tasks
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate(`/projects/${project.id}/epics`)}
+            aria-current={tab === 'epics' ? 'page' : undefined}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-sm transition-colors',
+              tab === 'epics'
+                ? 'bg-muted font-medium text-foreground'
+                : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <Telescope className="w-3.5 h-3.5" />
+            Epics
+          </button>
         </div>
 
         {/* Project path */}
@@ -440,7 +526,16 @@ function BoardView({ className, project }: BoardViewProps) {
         </p>
       </div>
 
-      {/* Board columns */}
+      {tab === 'epics' ? (
+        <div className="flex-1 overflow-y-auto">
+          <EpicsPanel
+            projectId={project.id}
+            onOpenEpic={(epicId) => navigate(`/projects/${project.id}/epics/${epicId}`)}
+            onNewEpic={() => navigate(`/projects/${project.id}/epics/new`)}
+          />
+        </div>
+      ) : (
+      /* Board columns */
       <div
         className={cn(
           // Mobile: horizontal scroll-snap
@@ -496,9 +591,10 @@ function BoardView({ className, project }: BoardViewProps) {
           onTaskDelete={handleTaskDelete}
         />
       </div>
+      )}
 
       {/* Loading overlay for tasks */}
-      {(isLoadingTasks || isLoadingTaskData) && (
+      {tab === 'tasks' && (isLoadingTasks || isLoadingTaskData) && (
         <div className="absolute inset-0 bg-background/50 flex items-center justify-center pointer-events-none">
           <div className="flex items-center gap-2 text-muted-foreground">
             <div className="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
@@ -523,7 +619,10 @@ function BoardView({ className, project }: BoardViewProps) {
         onSubmit={handleAskQuestion}
         projectName={project?.name}
         isSubmitting={isAsking}
+        statusText={askStatus}
       />
+
+      {guardModal}
     </div>
   );
 }

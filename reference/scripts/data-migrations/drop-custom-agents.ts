@@ -42,6 +42,20 @@ function columnNames(db: DatabaseType, table: string): string[] {
 
 function main(): void {
   const db = new Database(DB_PATH);
+
+  // Guard (architecture-v2 step 5): this script's `conversations` rebuild
+  // predates even the epic era — on a post-split database (owner-less
+  // conversations + link tables) it would destroy the new shape. Any DB that
+  // still needs the custom-agents cleanup is by definition pre-split.
+  if (tableExists(db, 'epic_agent_runs')) {
+    console.log(
+      'This database already has the architecture-v2 split schema; the custom-agents ' +
+        'cleanup does not apply. Nothing to do.',
+    );
+    db.close();
+    return;
+  }
+
   db.pragma('foreign_keys = OFF');
 
   const countOf = (sql: string): number =>

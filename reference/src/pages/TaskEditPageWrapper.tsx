@@ -23,6 +23,7 @@ import { Input } from '../components/ui/input';
 import { MicButton } from '../components/MicButton';
 import AgentAttachments from '../components/AgentAttachments';
 import { useTaskContext } from '../contexts/TaskContext';
+import { useWorktreeGuard } from '../hooks/useWorktreeGuard';
 import { api } from '../utils/api';
 import { cn } from '../lib/utils';
 import type { ProjectRow, TaskRow, TaskStatus } from '../../shared/types/db';
@@ -73,6 +74,7 @@ function TaskEditPageWrapper() {
     saveTaskDoc,
     isLoadingProjects,
   } = useTaskContext();
+  const { guardWith, guardModal } = useWorktreeGuard();
 
   const [project, setProject] = useState<ProjectRow | null>(null);
   const [task, setTask] = useState<TaskRow | null>(null);
@@ -249,14 +251,29 @@ function TaskEditPageWrapper() {
     setError(null);
 
     try {
-      const result = await deleteTask(task.id);
+      // Deleting the task deletes its worktree; the guard intercepts the 409 and
+      // offers to commit & push instead of losing what is in there.
+      const outcome = await guardWith<void>({
+        taskId: task.id,
+        intent: 'delete',
+        run: async (force) => {
+          const result = await deleteTask(task.id, force);
+          if (result.conflict) return { kind: 'conflict', conflict: result.conflict };
+          if (!result.success) {
+            return { kind: 'error', error: result.error || 'Failed to delete task' };
+          }
+          return { kind: 'ok', data: undefined };
+        },
+      });
 
-      if (result.success) {
+      if (outcome.status === 'ok') {
         navigate(`/projects/${projectId}`);
-      } else {
-        setError(result.error || 'Failed to delete task');
-        setShowDeleteConfirm(false);
+        return;
       }
+      if (outcome.status === 'error') {
+        setError(outcome.error);
+      }
+      setShowDeleteConfirm(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to delete task';
       setError(message);
@@ -264,7 +281,7 @@ function TaskEditPageWrapper() {
     } finally {
       setIsDeleting(false);
     }
-  }, [task, deleteTask, navigate, projectId]);
+  }, [task, deleteTask, navigate, projectId, guardWith]);
 
   const handleCancel = useCallback(() => {
     navigate(`/projects/${projectId}/tasks/${taskId}`);
@@ -566,6 +583,8 @@ function TaskEditPageWrapper() {
           <kbd className="px-1.5 py-0.5 bg-muted rounded">Esc</kbd> Cancel
         </span>
       </div>
+
+      {guardModal}
     </div>
   );
 }

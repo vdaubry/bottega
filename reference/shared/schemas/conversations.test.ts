@@ -20,12 +20,12 @@ describe('CreateConversationBodySchema', () => {
       CreateConversationBodySchema.safeParse({ provider: 'anthropic', model: 'opus' }).success,
     ).toBe(true);
     expect(
-      CreateConversationBodySchema.safeParse({ provider: 'openai', model: 'gpt-5.5' }).success,
+      CreateConversationBodySchema.safeParse({ provider: 'openai', model: 'gpt-6.1-sol' }).success,
     ).toBe(true);
     expect(
       CreateConversationBodySchema.safeParse({
         provider: 'opencode',
-        model: 'opencode/kimi-k2.6',
+        model: 'opencode/kimi-k2.7-code',
       }).success,
     ).toBe(true);
   });
@@ -41,16 +41,16 @@ describe('CreateConversationBodySchema', () => {
     expect(
       CreateConversationBodySchema.safeParse({
         provider: 'anthropic',
-        model: 'opencode/kimi-k2.6',
+        model: 'opencode/kimi-k2.7-code',
       }).success,
     ).toBe(false);
     // openai model under anthropic
     expect(
-      CreateConversationBodySchema.safeParse({ provider: 'anthropic', model: 'gpt-5.5' }).success,
+      CreateConversationBodySchema.safeParse({ provider: 'anthropic', model: 'gpt-6.1-sol' }).success,
     ).toBe(false);
     // opencode requires the 'opencode/' prefix
     expect(
-      CreateConversationBodySchema.safeParse({ provider: 'opencode', model: 'kimi-k2.6' }).success,
+      CreateConversationBodySchema.safeParse({ provider: 'opencode', model: 'kimi-k2.7-code' }).success,
     ).toBe(false);
   });
 
@@ -59,5 +59,30 @@ describe('CreateConversationBodySchema', () => {
     expect(CreateConversationBodySchema.safeParse({ model: 'opus' }).success).toBe(false);
     // model omitted → rejected too.
     expect(CreateConversationBodySchema.safeParse({ provider: 'anthropic' }).success).toBe(false);
+  });
+
+  it('allows atlas only on the anthropic provider', () => {
+    expect(
+      CreateConversationBodySchema.safeParse({ provider: 'anthropic', model: 'opus', atlas: true })
+        .success,
+    ).toBe(true);
+    // atlas: false / omitted is fine on any provider.
+    expect(
+      CreateConversationBodySchema.safeParse({ provider: 'openai', model: 'gpt-6.1-sol', atlas: false })
+        .success,
+    ).toBe(true);
+    // atlas: true on a non-SDK provider is rejected — the in-process MCP
+    // server only attaches to Claude Agent SDK sessions.
+    expect(
+      CreateConversationBodySchema.safeParse({ provider: 'openai', model: 'gpt-6.1-sol', atlas: true })
+        .success,
+    ).toBe(false);
+    expect(
+      CreateConversationBodySchema.safeParse({
+        provider: 'opencode',
+        model: 'opencode/kimi-k2.7-code',
+        atlas: true,
+      }).success,
+    ).toBe(false);
   });
 });

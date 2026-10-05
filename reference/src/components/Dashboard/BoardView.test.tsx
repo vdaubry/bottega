@@ -36,6 +36,12 @@ vi.mock('../../utils/api', () => ({
   },
 }));
 
+// The epics tab's content has its own test; here it only has to be
+// distinguishable from the kanban columns.
+vi.mock('../epic/EpicsPanel', () => ({
+  default: () => <div data-testid="epics-panel" />,
+}));
+
 // Mock BoardColumn component
 vi.mock('./BoardColumn', () => ({
   default: ({
@@ -92,6 +98,10 @@ vi.mock('../TaskForm', () => ({
   ),
 }));
 
+vi.mock('../../utils/waitForTaskWorktree', () => ({
+  waitForTaskWorktree: vi.fn(),
+}));
+
 // Mock AskQuestionModal component
 vi.mock('../AskQuestionModal', () => ({
   default: ({ isOpen, onClose, onSubmit, projectName, isSubmitting }: ModalProps) => (
@@ -130,6 +140,12 @@ vi.mock('lucide-react', () => ({
   X: () => <span data-testid="icon-x" />,
   Loader2: () => <span data-testid="icon-loader2" />,
   MessageCircleQuestion: () => <span data-testid="icon-question" />,
+  Telescope: () => <span data-testid="icon-telescope" />,
+  // Used by the unsaved-work modal the delete guard renders.
+  AlertTriangle: () => <span data-testid="icon-alert-triangle" />,
+  Upload: () => <span data-testid="icon-upload" />,
+  Trash2: () => <span data-testid="icon-trash2" />,
+  ChevronRight: () => <span data-testid="icon-chevron-right" />,
 }));
 
 // Helper to render with Router
@@ -258,11 +274,46 @@ describe('BoardView Component', () => {
     });
   });
 
-  describe('New Task Button', () => {
-    it('should render New Task button', () => {
+  describe('Tasks | Epics tabs', () => {
+    it('offers both tabs and marks the active one', () => {
       renderWithRouter(<BoardView project={mockProject} />);
 
-      expect(screen.getByText('New Task')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Tasks' })).toHaveAttribute('aria-current', 'page');
+      expect(screen.getByRole('button', { name: /Epics/ })).not.toHaveAttribute('aria-current');
+    });
+
+    it('shows the kanban columns and the Add task button on the tasks tab', () => {
+      renderWithRouter(<BoardView project={mockProject} />);
+
+      expect(screen.getByTestId('board-column-pending')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Add' })).toHaveAttribute('title', 'Create a new task');
+      expect(screen.queryByTestId('epics-panel')).not.toBeInTheDocument();
+    });
+
+    it('replaces the columns with the epics panel on the epics tab', () => {
+      renderWithRouter(<BoardView project={mockProject} tab="epics" />);
+
+      expect(screen.getByTestId('epics-panel')).toBeInTheDocument();
+      expect(screen.queryByTestId('board-column-pending')).not.toBeInTheDocument();
+      // The primary action follows the tab.
+      expect(screen.getByRole('button', { name: 'Add' })).toHaveAttribute('title', 'Create a new epic');
+      expect(screen.getByRole('button', { name: /Epics/ })).toHaveAttribute('aria-current', 'page');
+    });
+
+    it('never opens the task modal from the epics tab', () => {
+      renderWithRouter(<BoardView project={mockProject} tab="epics" />);
+
+      fireEvent.click(screen.getByText('Add'));
+
+      expect(screen.queryByTestId('task-form-modal')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('Add Task Button', () => {
+    it('should render Add button', () => {
+      renderWithRouter(<BoardView project={mockProject} />);
+
+      expect(screen.getByText('Add')).toBeInTheDocument();
     });
 
     it('should open task form modal when clicked', () => {
@@ -270,7 +321,7 @@ describe('BoardView Component', () => {
 
       expect(screen.queryByTestId('task-form-modal')).not.toBeInTheDocument();
 
-      fireEvent.click(screen.getByText('New Task'));
+      fireEvent.click(screen.getByText('Add'));
 
       expect(screen.getByTestId('task-form-modal')).toBeInTheDocument();
     });
@@ -278,7 +329,7 @@ describe('BoardView Component', () => {
     it('should pass project name to task form', () => {
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('New Task'));
+      fireEvent.click(screen.getByText('Add'));
 
       expect(screen.getByTestId('project-name').textContent).toBe('Test Project');
     });
@@ -286,7 +337,7 @@ describe('BoardView Component', () => {
     it('should close task form modal when close is clicked', () => {
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('New Task'));
+      fireEvent.click(screen.getByText('Add'));
       expect(screen.getByTestId('task-form-modal')).toBeInTheDocument();
 
       fireEvent.click(screen.getByTestId('close-modal'));
@@ -304,7 +355,7 @@ describe('BoardView Component', () => {
 
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('New Task'));
+      fireEvent.click(screen.getByText('Add'));
       fireEvent.click(screen.getByTestId('submit-task'));
 
       await waitFor(() => {
@@ -321,7 +372,7 @@ describe('BoardView Component', () => {
 
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('New Task'));
+      fireEvent.click(screen.getByText('Add'));
       fireEvent.click(screen.getByTestId('submit-task'));
 
       await waitFor(() => {
@@ -330,11 +381,11 @@ describe('BoardView Component', () => {
     });
   });
 
-  describe('Ask Question Button', () => {
-    it('should render Ask Question button', () => {
+  describe('Ask Button', () => {
+    it('should render Ask button', () => {
       renderWithRouter(<BoardView project={mockProject} />);
 
-      expect(screen.getByText('Ask Question')).toBeInTheDocument();
+      expect(screen.getByText('Ask')).toBeInTheDocument();
     });
 
     it('should open AskQuestionModal when clicked', () => {
@@ -342,7 +393,7 @@ describe('BoardView Component', () => {
 
       expect(screen.queryByTestId('ask-question-modal')).not.toBeInTheDocument();
 
-      fireEvent.click(screen.getByText('Ask Question'));
+      fireEvent.click(screen.getByText('Ask'));
 
       expect(screen.getByTestId('ask-question-modal')).toBeInTheDocument();
       expect(screen.getByTestId('ask-project-name').textContent).toBe('Test Project');
@@ -351,7 +402,7 @@ describe('BoardView Component', () => {
     it('should close the modal when close is clicked', () => {
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('Ask Question'));
+      fireEvent.click(screen.getByText('Ask'));
       expect(screen.getByTestId('ask-question-modal')).toBeInTheDocument();
 
       fireEvent.click(screen.getByTestId('close-ask-modal'));
@@ -370,7 +421,7 @@ describe('BoardView Component', () => {
 
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('Ask Question'));
+      fireEvent.click(screen.getByText('Ask'));
       fireEvent.click(screen.getByTestId('submit-ask'));
 
       await waitFor(() => {
@@ -393,6 +444,52 @@ describe('BoardView Component', () => {
       });
     });
 
+    // The worktree is set up in the background and no conversation can start
+    // before it is ready, so the question waits for it.
+    it('waits for the worktree setup before sending the question', async () => {
+      const { waitForTaskWorktree } = await import('../../utils/waitForTaskWorktree');
+      let finishSetup!: (state: 'ready') => void;
+      vi.mocked(waitForTaskWorktree).mockReturnValue(
+        new Promise((resolve) => {
+          finishSetup = resolve;
+        }),
+      );
+      const createTask = vi.fn().mockResolvedValue({
+        success: true,
+        task: { id: 42, project_id: 'p1', title: 'Q title', status: 'pending', worktree_state: 'provisioning' },
+      });
+      vi.mocked(useTaskContext).mockReturnValue({ ...defaultContextValue, createTask });
+
+      renderWithRouter(<BoardView project={mockProject} />);
+      fireEvent.click(screen.getByText('Ask'));
+      fireEvent.click(screen.getByTestId('submit-ask'));
+
+      await waitFor(() => expect(waitForTaskWorktree).toHaveBeenCalledWith(42));
+      expect(api.conversations.createWithMessage).not.toHaveBeenCalled();
+
+      finishSetup('ready');
+      await waitFor(() => expect(api.conversations.createWithMessage).toHaveBeenCalled());
+    });
+
+    it('does not send the question when the setup failed, and leaves for the task page', async () => {
+      const { waitForTaskWorktree } = await import('../../utils/waitForTaskWorktree');
+      vi.mocked(waitForTaskWorktree).mockResolvedValue('failed');
+      const createTask = vi.fn().mockResolvedValue({
+        success: true,
+        task: { id: 42, project_id: 'p1', title: 'Q title', status: 'pending', worktree_state: 'provisioning' },
+      });
+      vi.mocked(useTaskContext).mockReturnValue({ ...defaultContextValue, createTask });
+
+      renderWithRouter(<BoardView project={mockProject} />);
+      fireEvent.click(screen.getByText('Ask'));
+      fireEvent.click(screen.getByTestId('submit-ask'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('ask-question-modal')).not.toBeInTheDocument();
+      });
+      expect(api.conversations.createWithMessage).not.toHaveBeenCalled();
+    });
+
     it('should return error when task creation fails', async () => {
       const createTask = vi.fn().mockResolvedValue({
         success: false,
@@ -405,7 +502,7 @@ describe('BoardView Component', () => {
 
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('Ask Question'));
+      fireEvent.click(screen.getByText('Ask'));
       fireEvent.click(screen.getByTestId('submit-ask'));
 
       await waitFor(() => {
@@ -431,7 +528,7 @@ describe('BoardView Component', () => {
 
       renderWithRouter(<BoardView project={mockProject} />);
 
-      fireEvent.click(screen.getByText('Ask Question'));
+      fireEvent.click(screen.getByText('Ask'));
       fireEvent.click(screen.getByTestId('submit-ask'));
 
       await waitFor(() => {
@@ -480,8 +577,45 @@ describe('BoardView Component', () => {
       fireEvent.click(screen.getByTestId('delete-t2'));
 
       await waitFor(() => {
-        expect(deleteTask).toHaveBeenCalledWith('t2');
+        // `force: false` first — the guard only escalates after the user picks
+        // "discard" in the unsaved-work modal.
+        expect(deleteTask).toHaveBeenCalledWith('t2', false);
       });
+
+      vi.mocked(window.confirm).mockRestore();
+    });
+
+    it('shows the unsaved-work modal instead of deleting when the worktree has work', async () => {
+      const deleteTask = vi.fn().mockResolvedValue({
+        success: false,
+        conflict: {
+          error: 'worktree-has-unsaved-work',
+          summary: '2 uncommitted files',
+          taskId: 2,
+          branch: 'task/2-thing',
+          dirtyPaths: ['a.ts', 'b.ts'],
+          dirtyFiles: 2,
+          unpushedCommits: 0,
+          prUrl: 'https://github.com/user/repo/pull/9',
+          prNumber: 9,
+        },
+      });
+      vi.mocked(useTaskContext).mockReturnValue({
+        ...defaultContextValue,
+        deleteTask,
+      });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+      renderWithRouter(<BoardView project={mockProject} />);
+
+      fireEvent.click(screen.getByTestId('delete-t2'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Deleting would lose work')).toBeInTheDocument();
+      });
+      // The task is still there — nothing was forced.
+      expect(deleteTask).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('Commit & push to PR #9')).toBeInTheDocument();
 
       vi.mocked(window.confirm).mockRestore();
     });

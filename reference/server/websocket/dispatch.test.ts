@@ -29,6 +29,14 @@ vi.mock('../database/db.js', () => ({
   },
 }));
 
+// dispatch.ts reads the epic table for channel authorization from the epic
+// DB module (it is the epic channel's transport adapter).
+vi.mock('../database/epics.js', () => ({
+  epicsDb: {
+    getById: vi.fn(),
+  },
+}));
+
 vi.mock('../services/projectService.js', () => ({
   hasProjectAccess: vi.fn(),
 }));
@@ -37,16 +45,26 @@ vi.mock('../services/conversation/sessionState.js', () => ({
   activeSessions: new Map(),
 }));
 
+vi.mock('../services/atlas/bridge.js', () => ({
+  resolveAtlasAck: vi.fn(),
+}));
+
 import {
   dispatchClientMessage,
   cleanupClientSubscriptions,
   makeBroadcastToTaskSubscribers,
   makeBroadcastToConversationSubscribers,
+  makeBroadcastToAtlasSubscribers,
+  makeGetAtlasSubscriberCount,
+  makeBroadcastToEpicSubscribers,
   __resetSubscriptionsForTesting,
   __getTaskSubscriptionsForTesting,
   __getConversationSubscriptionsForTesting,
+  __getAtlasSubscriptionsForTesting,
+  __getEpicSubscriptionsForTesting,
   type DispatchContext,
 } from './dispatch.js';
+import { resolveAtlasAck } from '../services/atlas/bridge.js';
 import {
   sendMessage as adapterSendMessage,
   abortSession,
@@ -55,11 +73,10 @@ import {
   getActiveStreamingByConversation,
   resolveAskUserQuestion,
 } from '../services/conversationAdapter.js';
-import {
-  conversationsDb,
-  tasksDb,
-} from '../database/db.js';
+import { conversationsDb, tasksDb } from '../database/db.js';
+import { epicsDb } from '../database/epics.js';
 import { hasProjectAccess } from '../services/projectService.js';
+import { registerOwnerAdapter } from '../services/conversation/ownerAdapters.js';
 import { activeSessions } from '../services/conversation/sessionState.js';
 
 interface FakeWs {
@@ -84,6 +101,7 @@ interface CtxOverrides {
   userId?: number;
   broadcastToTaskSubscribersFn?: DispatchContext['broadcastToTaskSubscribersFn'];
   broadcastToConversationSubscribersFn?: DispatchContext['broadcastToConversationSubscribersFn'];
+  broadcastToEpicSubscribersFn?: DispatchContext['broadcastToEpicSubscribersFn'];
 }
 
 function makeCtx(overrides: CtxOverrides = {}): DispatchContext {
@@ -99,6 +117,7 @@ function makeCtx(overrides: CtxOverrides = {}): DispatchContext {
       overrides.broadcastToTaskSubscribersFn ?? vi.fn(),
     broadcastToConversationSubscribersFn:
       overrides.broadcastToConversationSubscribersFn ?? vi.fn(),
+    broadcastToEpicSubscribersFn: overrides.broadcastToEpicSubscribersFn ?? vi.fn(),
   };
 }
 
@@ -111,9 +130,33 @@ function lastSent(ws: FakeWs): ServerToClientMessage {
 // Set up the standard "auth always succeeds" world for conversation- and
 // task-keyed handlers. Tests that need negative cases override the relevant
 // mock per-test.
+// The owner-adapter registry resolves conversation owners; register fakes
+// over the same mocked tables this suite already drives.
+registerOwnerAdapter({
+  kind: 'task',
+  resolveOwner: (conversation: { task_id: number | null }) => {
+    if (conversation.task_id == null) return null;
+    const task = tasksDb.getById(conversation.task_id) as
+      | { id: number; project_id: number }
+      | undefined;
+    return task ? { taskId: task.id, epicId: null, projectId: task.project_id } : null;
+  },
+} as never);
+registerOwnerAdapter({
+  kind: 'epic',
+  resolveOwner: (conversation: { epic_id: number | null }) => {
+    if (conversation.epic_id == null) return null;
+    const epic = epicsDb.getById(conversation.epic_id) as
+      | { id: number; project_id: number }
+      | undefined;
+    return epic ? { taskId: null, epicId: epic.id, projectId: epic.project_id } : null;
+  },
+} as never);
+
 function seedAuthSuccess(): void {
   vi.mocked(conversationsDb.getById).mockReturnValue({
     id: 99,
+    owner_kind: 'task',
     task_id: 7,
   } as never);
   vi.mocked(tasksDb.getById).mockReturnValue({ id: 7, project_id: 3 } as never);
@@ -200,6 +243,7 @@ describe('dispatchClientMessage', () => {
     it('refuses resume for foreign conversation (not authorized)', async () => {
       vi.mocked(conversationsDb.getById).mockReturnValue({
         id: 99,
+        owner_kind: 'task',
         task_id: 7,
       } as never);
       vi.mocked(tasksDb.getById).mockReturnValue({
@@ -366,6 +410,7 @@ describe('dispatchClientMessage', () => {
     it('rejects when user is not a project member', async () => {
       vi.mocked(conversationsDb.getById).mockReturnValue({
         id: 5,
+        owner_kind: 'task',
         task_id: 9,
       } as never);
       vi.mocked(tasksDb.getById).mockReturnValue({
@@ -392,6 +437,7 @@ describe('dispatchClientMessage', () => {
     it('resolves and replies on success (member or admin)', async () => {
       vi.mocked(conversationsDb.getById).mockReturnValue({
         id: 5,
+        owner_kind: 'task',
         task_id: 9,
       } as never);
       vi.mocked(tasksDb.getById).mockReturnValue({
@@ -507,6 +553,7 @@ describe('dispatchClientMessage', () => {
     it('refuses subscription for foreign conversations', async () => {
       vi.mocked(conversationsDb.getById).mockReturnValue({
         id: 99,
+        owner_kind: 'task',
         task_id: 7,
       } as never);
       vi.mocked(tasksDb.getById).mockReturnValue({
@@ -614,6 +661,198 @@ describe('dispatchClientMessage', () => {
     });
   });
 
+  describe('subscribe-atlas / unsubscribe-atlas', () => {
+    it('adds the taskId to the atlas Set when authorized', async () => {
+      vi.mocked(tasksDb.getById).mockReturnValue({
+        id: 7,
+        project_id: 3,
+      } as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-atlas', taskId: 7 });
+
+      const subs = __getAtlasSubscriptionsForTesting();
+      const wsKey = subs.keys().next().value!;
+      expect(subs.get(wsKey)?.has(7)).toBe(true);
+      // The atlas channel is separate — no task subscription was created.
+      expect(__getTaskSubscriptionsForTesting().size).toBe(0);
+      expect(lastSent(ws)).toMatchObject({
+        type: 'atlas-subscribed',
+        taskId: 7,
+        success: true,
+      });
+    });
+
+    it('refuses subscription for foreign tasks', async () => {
+      vi.mocked(tasksDb.getById).mockReturnValue({
+        id: 7,
+        project_id: 3,
+      } as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(false);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-atlas', taskId: 7 });
+
+      expect(__getAtlasSubscriptionsForTesting().size).toBe(0);
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+
+    it('removes the taskId on unsubscribe-atlas', async () => {
+      vi.mocked(tasksDb.getById).mockReturnValue({
+        id: 7,
+        project_id: 3,
+      } as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-atlas', taskId: 7 });
+      await dispatchClientMessage(ctx, { type: 'unsubscribe-atlas', taskId: 7 });
+
+      const subs = __getAtlasSubscriptionsForTesting();
+      const wsKey = subs.keys().next().value!;
+      expect(subs.get(wsKey)?.has(7)).toBe(false);
+      expect(lastSent(ws)).toMatchObject({
+        type: 'atlas-unsubscribed',
+        taskId: 7,
+        success: true,
+      });
+    });
+  });
+
+  describe('subscribe-epic / unsubscribe-epic', () => {
+    function seedEpic(): void {
+      vi.mocked(epicsDb.getById).mockReturnValue({
+        id: 42,
+        project_id: 3,
+        status: 'active',
+      } as never);
+    }
+
+    it('adds the epicId to the epic Set when authorized and acks', async () => {
+      seedEpic();
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-epic', epicId: 42 });
+
+      const subs = __getEpicSubscriptionsForTesting();
+      const wsKey = subs.keys().next().value!;
+      expect(subs.get(wsKey)?.has(42)).toBe(true);
+      expect(ws.send).toHaveBeenCalledWith(
+        JSON.stringify({ type: 'epic-subscribed', epicId: 42, success: true }),
+      );
+    });
+
+    it('refuses subscription for an epic in a foreign project', async () => {
+      seedEpic();
+      vi.mocked(hasProjectAccess).mockReturnValue(false);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-epic', epicId: 42 });
+
+      expect(__getEpicSubscriptionsForTesting().size).toBe(0);
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+
+    it('refuses subscription for an unknown epic', async () => {
+      vi.mocked(epicsDb.getById).mockReturnValue(undefined);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-epic', epicId: 42 });
+
+      expect(__getEpicSubscriptionsForTesting().size).toBe(0);
+    });
+
+    it('removes the epicId on unsubscribe-epic', async () => {
+      seedEpic();
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+
+      await dispatchClientMessage(ctx, { type: 'subscribe-epic', epicId: 42 });
+      await dispatchClientMessage(ctx, { type: 'unsubscribe-epic', epicId: 42 });
+
+      const subs = __getEpicSubscriptionsForTesting();
+      const wsKey = subs.keys().next().value!;
+      expect(subs.get(wsKey)?.has(42)).toBe(false);
+      expect(lastSent(ws)).toMatchObject({
+        type: 'epic-unsubscribed',
+        epicId: 42,
+        success: true,
+      });
+    });
+  });
+
+  describe('atlas-ack', () => {
+    async function subscribeAtlas(ctx: DispatchContext, taskId: number): Promise<void> {
+      vi.mocked(tasksDb.getById).mockReturnValue({
+        id: taskId,
+        project_id: 3,
+      } as never);
+      vi.mocked(hasProjectAccess).mockReturnValue(true);
+      await dispatchClientMessage(ctx, { type: 'subscribe-atlas', taskId });
+    }
+
+    it('routes acks from atlas-subscribed sockets to the bridge', async () => {
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+      await subscribeAtlas(ctx, 7);
+
+      await dispatchClientMessage(ctx, {
+        type: 'atlas-ack',
+        taskId: 7,
+        requestId: 'req-1',
+        detail: '{"nodeCount":3}',
+      });
+
+      expect(resolveAtlasAck).toHaveBeenCalledWith('req-1', {
+        taskId: 7,
+        error: undefined,
+        detail: '{"nodeCount":3}',
+      });
+    });
+
+    it('forwards client-side errors (e.g. mermaid parse failures)', async () => {
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+      await subscribeAtlas(ctx, 7);
+
+      await dispatchClientMessage(ctx, {
+        type: 'atlas-ack',
+        taskId: 7,
+        requestId: 'req-2',
+        error: 'Parse error on line 2',
+      });
+
+      expect(resolveAtlasAck).toHaveBeenCalledWith('req-2', {
+        taskId: 7,
+        error: 'Parse error on line 2',
+        detail: undefined,
+      });
+    });
+
+    it('drops acks from sockets that are not atlas-subscribed to the task', async () => {
+      const ws = makeWs();
+      const ctx = makeCtx({ ws });
+      await subscribeAtlas(ctx, 7);
+
+      await dispatchClientMessage(ctx, {
+        type: 'atlas-ack',
+        taskId: 8, // subscribed to 7, acking 8
+        requestId: 'req-3',
+      });
+
+      expect(resolveAtlasAck).not.toHaveBeenCalled();
+    });
+  });
+
   describe('exhaustiveness', () => {
     it('silently drops messages with an unknown type at runtime', async () => {
       const ws = makeWs();
@@ -630,7 +869,7 @@ describe('dispatchClientMessage', () => {
 });
 
 describe('cleanupClientSubscriptions', () => {
-  it('removes both task and conversation subscriptions for the ws', async () => {
+  it('removes task, conversation, and atlas subscriptions for the ws', async () => {
     seedAuthSuccess();
     const ws = makeWs();
     const ctx = makeCtx({ ws });
@@ -643,11 +882,140 @@ describe('cleanupClientSubscriptions', () => {
       type: 'subscribe-conversation',
       conversationId: 99,
     });
+    await dispatchClientMessage(ctx, {
+      type: 'subscribe-atlas',
+      taskId: 1,
+    });
+
+    vi.mocked(epicsDb.getById).mockReturnValue({
+      id: 42,
+      project_id: 3,
+      status: 'active',
+    } as never);
+    await dispatchClientMessage(ctx, {
+      type: 'subscribe-epic',
+      epicId: 42,
+    });
 
     cleanupClientSubscriptions(ctx.ws);
 
     expect(__getTaskSubscriptionsForTesting().size).toBe(0);
     expect(__getConversationSubscriptionsForTesting().size).toBe(0);
+    expect(__getAtlasSubscriptionsForTesting().size).toBe(0);
+    expect(__getEpicSubscriptionsForTesting().size).toBe(0);
+  });
+});
+
+describe('makeBroadcastToEpicSubscribers', () => {
+  it('delivers epic events only to epic subscribers and splices epicId', async () => {
+    seedAuthSuccess();
+    vi.mocked(epicsDb.getById).mockReturnValue({
+      id: 42,
+      project_id: 3,
+      status: 'active',
+    } as never);
+    const epicWs = makeWs();
+    const taskOnlyWs = makeWs();
+    const wss = { clients: new Set([epicWs, taskOnlyWs]) };
+
+    await dispatchClientMessage(makeCtx({ ws: epicWs, wss }), {
+      type: 'subscribe-epic',
+      epicId: 42,
+    });
+    await dispatchClientMessage(makeCtx({ ws: taskOnlyWs, wss }), {
+      type: 'subscribe-task',
+      taskId: 5,
+    });
+    epicWs.send.mockClear();
+    taskOnlyWs.send.mockClear();
+
+    const broadcast = makeBroadcastToEpicSubscribers(wss as unknown as WebSocketServer);
+    broadcast(42, {
+      type: 'agent-run-updated',
+      agentRun: {
+        id: 7,
+        status: 'completed',
+        agent_type: 'epic-architecture',
+        conversation_id: 11,
+      },
+    });
+
+    expect(epicWs.send).toHaveBeenCalledTimes(1);
+    expect(taskOnlyWs.send).not.toHaveBeenCalled();
+    const payload = JSON.parse(
+      epicWs.send.mock.calls[0]![0] as string,
+    ) as ServerToClientMessage;
+    expect(payload).toMatchObject({
+      type: 'agent-run-updated',
+      epicId: 42,
+      agentRun: { id: 7, agent_type: 'epic-architecture' },
+    });
+  });
+});
+
+describe('makeBroadcastToAtlasSubscribers / makeGetAtlasSubscriberCount', () => {
+  it('delivers UI commands only to atlas subscribers and splices taskId', async () => {
+    seedAuthSuccess();
+    const atlasWs = makeWs();
+    const taskOnlyWs = makeWs();
+    const wss = { clients: new Set([atlasWs, taskOnlyWs]) };
+
+    await dispatchClientMessage(makeCtx({ ws: atlasWs, wss }), {
+      type: 'subscribe-atlas',
+      taskId: 5,
+    });
+    // A plain task-detail watcher must NOT receive file contents.
+    await dispatchClientMessage(makeCtx({ ws: taskOnlyWs, wss }), {
+      type: 'subscribe-task',
+      taskId: 5,
+    });
+    atlasWs.send.mockClear();
+    taskOnlyWs.send.mockClear();
+
+    const broadcast = makeBroadcastToAtlasSubscribers(
+      wss as unknown as WebSocketServer,
+    );
+    broadcast(5, {
+      type: 'atlas-open-file',
+      requestId: 'req-9',
+      path: 'src/index.ts',
+      content: 'hello',
+    });
+
+    expect(atlasWs.send).toHaveBeenCalledTimes(1);
+    expect(taskOnlyWs.send).not.toHaveBeenCalled();
+    const payload = JSON.parse(
+      atlasWs.send.mock.calls[0]![0] as string,
+    ) as ServerToClientMessage;
+    expect(payload).toMatchObject({
+      type: 'atlas-open-file',
+      taskId: 5,
+      requestId: 'req-9',
+      path: 'src/index.ts',
+    });
+  });
+
+  it('counts only OPEN sockets subscribed to the task', async () => {
+    seedAuthSuccess();
+    const ws1 = makeWs();
+    const ws2 = makeWs();
+    const wss = { clients: new Set([ws1, ws2]) };
+
+    await dispatchClientMessage(makeCtx({ ws: ws1, wss }), {
+      type: 'subscribe-atlas',
+      taskId: 5,
+    });
+    await dispatchClientMessage(makeCtx({ ws: ws2, wss }), {
+      type: 'subscribe-atlas',
+      taskId: 5,
+    });
+
+    const count = makeGetAtlasSubscriberCount(wss as unknown as WebSocketServer);
+    expect(count(5)).toBe(2);
+    expect(count(6)).toBe(0);
+
+    ws2.readyState = WS.CLOSING;
+    expect(count(5)).toBe(1);
   });
 });
 
@@ -673,6 +1041,7 @@ describe('makeBroadcastToTaskSubscribers', () => {
       conversation: {
         id: 1,
         task_id: 5,
+        epic_id: null,
         claude_conversation_id: null,
         created_at: '2026-01-01T00:00:00Z',
       },

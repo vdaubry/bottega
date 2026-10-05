@@ -11,7 +11,7 @@ import { sqliteSessionStore } from '../../sqliteSessionStore.js';
 import { mirrorCodexEvent } from './messageMirror.js';
 
 const CTX = {
-  projectFolderPath: '/home/ubuntu/misc/hello_world',
+  projectFolderPath: '/home/dev/projects/hello_world',
   providerSessionId: 'thread-abc',
 };
 
@@ -34,7 +34,7 @@ describe('mirrorCodexEvent', () => {
     expect(sqliteSessionStore.append).toHaveBeenCalledTimes(1);
     const call = vi.mocked(sqliteSessionStore.append).mock.calls[0]!;
     expect(call[0]).toMatchObject({
-      projectKey: '-home-ubuntu-misc-hello-world',
+      projectKey: '-home-dev-projects-hello-world',
       sessionId: 'thread-abc',
       subpath: '',
       provider: 'openai',
@@ -78,5 +78,38 @@ describe('mirrorCodexEvent', () => {
     const blocks = entries[0]!.message?.content;
     expect(blocks?.[0]?.type).toBe('tool_use');
     expect(blocks?.[0]?.name).toBe('Bash');
+  });
+  it('persists a generated image as an assistant entry naming the stored file, not the server path', async () => {
+    const msg: UnifiedMessage = {
+      type: 'assistant_image',
+      id: 'generated_image:exec-1.png',
+      provider: 'openai',
+      providerSessionId: 'thread-abc',
+      raw: null,
+      sourcePath: '/codex-home/generated_images/thread-abc/exec-1.png',
+      fileName: 'exec-1.png',
+      mimeType: 'image/png',
+      width: 1536,
+      height: 1024,
+    };
+    await mirrorCodexEvent(CTX, msg);
+    const entries = vi.mocked(sqliteSessionStore.append).mock.calls[0]![1] as Array<Record<string, unknown>>;
+    expect(entries[0]).toMatchObject({
+      uuid: 'generated_image:exec-1.png',
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'generated_image',
+            file_name: 'exec-1.png',
+            media_type: 'image/png',
+            width: 1536,
+            height: 1024,
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(entries[0])).not.toContain('codex-home');
   });
 });

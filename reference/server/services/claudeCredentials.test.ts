@@ -132,6 +132,17 @@ describe('claudeCredentials', () => {
     expect(env).not.toHaveProperty('CLAUDE_CONFIG_DIR');
   });
 
+  it('disables SDK background tasks on the query env to keep turns single-shot', () => {
+    provisionToken(42, 'sk-ant-oat01-sdk-token');
+
+    const env = buildClaudeSdkEnv(42);
+
+    // SDK 2.1.198's amber sentinel blocks inline sleeps and steers the agent to
+    // run_in_background / Monitor, whose cross-turn notification can never be
+    // delivered in Bottega's per-turn model. This flag restores inline waits.
+    expect(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe('1');
+  });
+
   it('builds spawn env with the per-user OAuth token and strips inherited auth vars', () => {
     provisionToken(42, 'sk-ant-oat01-spawn-token');
     process.env.ANTHROPIC_API_KEY = 'global-api-key';
@@ -143,6 +154,9 @@ describe('claudeCredentials', () => {
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-spawn-token');
     expect(env).not.toHaveProperty('ANTHROPIC_API_KEY');
     expect(env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+    // The background-task kill-switch is scoped to the SDK query env only — it
+    // must not spill into the spawn (PTY login) env.
+    expect(env).not.toHaveProperty('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS');
   });
 
   it('prepares a private per-user Claude config directory for the login subprocess', () => {
@@ -164,6 +178,8 @@ describe('claudeCredentials', () => {
     expect(env).not.toHaveProperty('ANTHROPIC_API_KEY');
     expect(env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
     expect(env).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN');
+    // The background-task kill-switch is scoped to the SDK query env only.
+    expect(env).not.toHaveProperty('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS');
   });
 
   it('forces a wide terminal so the CLI does not hard-wrap the OAuth URL', () => {

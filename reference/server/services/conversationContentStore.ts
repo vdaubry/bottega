@@ -13,9 +13,10 @@
  */
 
 import { sqliteSessionStore, SqliteSessionStore } from './sqliteSessionStore.js';
+import { deleteConversationImages } from './conversationImages.js';
 import type { ThinkingAccumulator } from './conversation/thinkingPatcher.js';
 
-interface TranscriptEntry {
+export interface TranscriptEntry {
   uuid?: string;
   type?: string;
   timestamp?: string | number;
@@ -35,6 +36,7 @@ interface TranscriptEntry {
 }
 
 interface ConversationLike {
+  id?: number;
   claude_conversation_id?: string | null;
   session_path?: string | null;
 }
@@ -66,7 +68,7 @@ export interface TokenUsage {
  * @anthropic-ai/claude-agent-sdk: `path.replace(/[^a-zA-Z0-9]/g, '-')`),
  * which collapses underscores, hyphens-of-other-codepoints, and any other
  * separator to `-`. Earlier versions of this helper only replaced `/` and
- * `.`, so paths containing `_` (e.g. `/home/ubuntu/misc/hello_world`) were
+ * `.`, so paths containing `_` (e.g. `/home/dev/projects/hello_world`) were
  * keyed differently on read vs write — messages appeared to vanish.
  */
 export function resolveProjectKey(projectFolderPath: string | null | undefined): string {
@@ -75,17 +77,19 @@ export function resolveProjectKey(projectFolderPath: string | null | undefined):
 }
 
 /**
- * Remove every message row and summary belonging to a conversation. Called
- * from delete routes so the messages table doesn't keep orphaned rows after a
- * task / conversation is gone. Prefers the conversation's `session_path` (the
- * cwd we passed the SDK at session start, which may be a worktree path); falls
- * back to the project's repo folder when older rows have a null session_path.
+ * Remove every message row and summary belonging to a conversation, and the
+ * generated images its transcript points at. Called from delete routes so
+ * neither the messages table nor the image store keeps orphans after a task /
+ * conversation is gone. Prefers the conversation's `session_path` (the cwd we
+ * passed the SDK at session start, which may be a worktree path); falls back
+ * to the project's repo folder when older rows have a null session_path.
  */
 export async function purgeConversationMessages(
   conversation: ConversationLike | null | undefined,
   fallbackRepoPath: string | null | undefined,
   store: SqliteSessionStore = sqliteSessionStore,
 ): Promise<void> {
+  if (conversation?.id != null) await deleteConversationImages(conversation.id);
   if (!conversation?.claude_conversation_id) return;
   const pathForKey = conversation.session_path || fallbackRepoPath;
   if (!pathForKey) return;
@@ -134,13 +138,33 @@ export class ConversationContentStore {
     this.store = store;
   }
 
+  /**
+   * One transcript, or null when it was never written. `subpath` selects a
+   * subagent transcript (`listSubagentTranscripts` enumerates them); the
+   * default empty subpath is the main conversation.
+   */
   async loadEntries(
     claudeSessionId: string | null | undefined,
     projectFolderPath: string | null | undefined,
+    subpath: string | null = null,
   ): Promise<TranscriptEntry[] | null> {
     if (!claudeSessionId || !projectFolderPath) return null;
     const projectKey = resolveProjectKey(projectFolderPath);
-    return this.store.load({ projectKey, sessionId: claudeSessionId });
+    return this.store.load({ projectKey, sessionId: claudeSessionId, subpath });
+  }
+
+  /**
+   * The subagent transcripts a session spawned, as subpath keys. The main
+   * transcript records a subagent as one `Task` tool call with a summarized
+   * result; the full turn it ran lives here.
+   */
+  async listSubagentTranscripts(
+    claudeSessionId: string | null | undefined,
+    projectFolderPath: string | null | undefined,
+  ): Promise<string[]> {
+    if (!claudeSessionId || !projectFolderPath) return [];
+    const projectKey = resolveProjectKey(projectFolderPath);
+    return this.store.listSubkeys({ projectKey, sessionId: claudeSessionId });
   }
 
   paginateEntries(

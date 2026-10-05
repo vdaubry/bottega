@@ -121,6 +121,120 @@ export default tseslint.config(
     },
   },
 
+  // ---------------------------------------------------------------------------
+  // Architecture-v2 boundary (docs/epics/architecture-v2.md): the task domain
+  // is complete and epic-agnostic; the epic domain is a layer on top that
+  // acts through the task facade; the conversation runtime imports neither
+  // domain. CI-enforced so the rules outlive the document.
+  // ---------------------------------------------------------------------------
+
+  // Rule 1 — nothing outside the epic layer imports it. Allowed importers:
+  // the epic zone itself, its two REST adapters (routes/epics.ts, and
+  // routes/webhooks.ts for the inbound GitHub half — a comment on the epic's
+  // final pull request starts its delivery agent), its WS channel adapter
+  // (websocket/dispatch.ts), the boot entrypoint (index.ts wires initEpics),
+  // the v0 data-conversion migration, and tests.
+  {
+    files: ['server/**/*.ts'],
+    ignores: [
+      'server/services/epics/**',
+      'server/routes/epics.ts',
+      'server/routes/webhooks.ts',
+      'server/websocket/dispatch.ts',
+      'server/index.ts',
+      'server/database/epics.ts',
+      'server/database/epicConversion.ts',
+      '**/*.test.ts',
+      'server/test/**',
+    ],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/services/epics/**', '**/epics/orchestrator/**'],
+              message:
+                'The epic layer may only be imported by server/services/epics/**, its REST/WS adapters and the boot entrypoint (architecture-v2 rule 1).',
+            },
+            {
+              group: ['**/database/epics', '**/database/epics.js'],
+              message:
+                'Only the epic layer may read the epic tables (architecture-v2 rule 1).',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
+  // Rule 2 — the epic layer acts on tasks only through the task facade
+  // (server/services/tasks/index.ts) and the task domain's own service files
+  // it re-exports. Direct table access and task-internal modules are out.
+  {
+    files: ['server/services/epics/**/*.ts'],
+    ignores: ['**/*.test.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/database/tasks', '**/database/tasks.js'],
+              message:
+                'The epic layer may not read the task tables — go through the task facade (services/tasks/index.ts).',
+            },
+            {
+              // `tasks/events` is deliberately NOT here: the event stream is
+              // the task domain's published contract (rule 3), exactly what
+              // the epic layer subscribes to.
+              group: [
+                '**/taskService', '**/taskService.js',
+                '**/tasks/baseBranch', '**/tasks/baseBranch.js',
+                '**/tasks/adapter', '**/tasks/adapter.js',
+                '**/tasks/worktreeSetup', '**/tasks/worktreeSetup.js',
+                '**/agentRunner', '**/agentRunner.js',
+              ],
+              message:
+                'Task-internal module — import the task facade (services/tasks/index.ts) instead (architecture-v2 rule 2).',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
+  // Rule 3 — the conversation runtime imports neither domain; ownership
+  // questions go through the owner-adapter registry.
+  {
+    files: ['server/services/conversation/**/*.ts'],
+    ignores: ['**/*.test.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: [
+                '**/services/epics/**', '**/epics/orchestrator/**',
+                '**/database/epics', '**/database/epics.js',
+                '**/database/tasks', '**/database/tasks.js',
+                '**/tasks/index', '**/tasks/index.js',
+                '**/tasks/baseBranch', '**/tasks/baseBranch.js',
+                '**/tasks/events', '**/tasks/events.js',
+                '**/tasks/adapter', '**/tasks/adapter.js',
+                '**/tasks/worktreeSetup', '**/tasks/worktreeSetup.js',
+                '**/taskService', '**/taskService.js',
+              ],
+              message:
+                'The conversation runtime imports neither domain — dispatch through the owner-adapter registry (architecture-v2 rule 3).',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
   // Repo-root config files (vite, vitest, tailwind, eslint itself) run under
   // Node.
   {

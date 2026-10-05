@@ -16,6 +16,7 @@ import type { ProjectRow, TaskRow } from '../../shared/types/db';
 interface ProjectSubmitPayload {
   name: string;
   repoFolderPath: string;
+  sensitiveAreas?: string;
 }
 
 interface ActionResult {
@@ -59,10 +60,11 @@ function DashboardPage() {
   const handleProjectSubmit = async ({
     name,
     repoFolderPath,
+    sensitiveAreas,
   }: ProjectSubmitPayload): Promise<ActionResult> => {
     setIsCreatingProject(true);
     try {
-      const result = await createProject(name, repoFolderPath);
+      const result = await createProject(name, repoFolderPath, sensitiveAreas);
       if (result.success) {
         setShowProjectForm(false);
       }

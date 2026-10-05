@@ -1,15 +1,24 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-const { mockRunCommand, mockAccess, mockReadlink, mockRealpath, mockMkdir, mockKill } = vi.hoisted(
-  () => ({
-    mockRunCommand: vi.fn(),
-    mockAccess: vi.fn(),
-    mockReadlink: vi.fn(),
-    mockRealpath: vi.fn(),
-    mockMkdir: vi.fn(),
-    mockKill: vi.fn(),
-  }),
-);
+const {
+  mockRunCommand,
+  mockAccess,
+  mockReadlink,
+  mockRealpath,
+  mockMkdir,
+  mockKill,
+  mockProvisioningMode,
+} = vi.hoisted(() => ({
+  mockRunCommand: vi.fn(),
+  mockAccess: vi.fn(),
+  mockReadlink: vi.fn(),
+  mockRealpath: vi.fn(),
+  mockMkdir: vi.fn(),
+  mockKill: vi.fn(),
+  // Only `getActiveWorktree` consults the mode (for the settings banner);
+  // switching behaves identically with or without a hook.
+  mockProvisioningMode: vi.fn().mockResolvedValue('none'),
+}));
 
 vi.mock('./shell.js', () => ({
   runCommand: mockRunCommand,
@@ -23,6 +32,7 @@ vi.mock('fs', () => ({
       realpath: mockRealpath,
       mkdir: mockMkdir,
     },
+    constants: { X_OK: 1, R_OK: 4, W_OK: 2, F_OK: 0 },
   },
   promises: {
     access: mockAccess,
@@ -30,6 +40,7 @@ vi.mock('fs', () => ({
     realpath: mockRealpath,
     mkdir: mockMkdir,
   },
+  constants: { X_OK: 1, R_OK: 4, W_OK: 2, F_OK: 0 },
 }));
 
 vi.mock('../database/db.js', () => ({
@@ -39,6 +50,9 @@ vi.mock('../database/db.js', () => ({
   },
   tasksDb: {
     getWithProject: vi.fn(),
+    // `getActiveWorktree` resolves the served ticket's title for the
+    // "Serving: …" indicator.
+    getById: vi.fn(),
   },
 }));
 
@@ -47,6 +61,7 @@ vi.mock('./projectService.js', () => ({
 }));
 
 vi.mock('./worktree.js', () => ({
+  worktreeProvisioningMode: mockProvisioningMode,
   getWorktreePath: vi.fn((repoPath, taskId) => `${repoPath}-worktrees/task-${taskId}`),
   getWorktreeProjectPath: vi.fn((repoPath, taskId, subprojectPath) => {
     const worktreePath = `${repoPath}-worktrees/task-${taskId}`;
@@ -56,12 +71,13 @@ vi.mock('./worktree.js', () => ({
 }));
 
 import {
-  switchWorktree,
+  switchServedTarget,
   getActiveWorktree,
   verifySymlink,
   updateWebServerConfig,
 } from './webServerManager.js';
 import { projectsDb, tasksDb } from '../database/db.js';
+import { registerEpicServeResolver, type EpicServeResolver } from './webServerManager.js';
 import { getProject } from './projectService.js';
 import { worktreeExists } from './worktree.js';
 
@@ -107,11 +123,26 @@ describe('WebServerManager Service', () => {
     }) as never);
   });
 
-  describe('switchWorktree', () => {
+  describe('switchServedTarget', () => {
+    // Resolves every fs.access EXCEPT the .bottega/switch.sh probe. Tests that
+    // exercise the legacy systemctl path use this so the new hook branch is
+    // skipped. Tests that exercise the hook branch use mockResolvedValue
+    // directly.
+    function mockAccessAllowAllExceptSwitchScript(): void {
+      mockAccess.mockImplementation((p: unknown) => {
+        if (typeof p === 'string' && p.endsWith('/.bottega/switch.sh')) {
+          const err = new Error('ENOENT') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          return Promise.reject(err);
+        }
+        return Promise.resolve(undefined);
+      });
+    }
+
     it('should return error when project not found', async () => {
       vi.mocked(getProject).mockReturnValue(undefined);
 
-      const result = await switchWorktree(999, null, testUserId);
+      const result = await switchServedTarget(999, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Project not found');
@@ -123,7 +154,7 @@ describe('WebServerManager Service', () => {
         serve_symlink_path: null,
       } as never);
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Symlink path not configured');
@@ -135,7 +166,7 @@ describe('WebServerManager Service', () => {
         systemd_service_name: null,
       } as never);
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Systemd service name not configured');
@@ -147,7 +178,7 @@ describe('WebServerManager Service', () => {
         systemd_service_name: 'evil; rm -rf /',
       } as never);
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/Invalid systemd service/i);
@@ -159,7 +190,7 @@ describe('WebServerManager Service', () => {
         serve_symlink_path: 'relative/path',
       } as never);
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/Invalid absolute symlink/i);
@@ -169,7 +200,7 @@ describe('WebServerManager Service', () => {
       vi.mocked(getProject).mockReturnValue(mockProject as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue(undefined);
 
-      const result = await switchWorktree(testProjectId, testTaskId, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'task', taskId: testTaskId }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Task not found');
@@ -182,7 +213,7 @@ describe('WebServerManager Service', () => {
         project_id: 999,
       } as never);
 
-      const result = await switchWorktree(testProjectId, testTaskId, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'task', taskId: testTaskId }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Task does not belong to this project');
@@ -193,7 +224,7 @@ describe('WebServerManager Service', () => {
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTask as never);
       vi.mocked(worktreeExists).mockResolvedValue(false);
 
-      const result = await switchWorktree(testProjectId, testTaskId, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'task', taskId: testTaskId }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Worktree does not exist');
@@ -205,55 +236,41 @@ describe('WebServerManager Service', () => {
       vi.mocked(worktreeExists).mockResolvedValue(true);
       vi.mocked(mockAccess).mockRejectedValue(new Error('ENOENT'));
 
-      const result = await switchWorktree(testProjectId, testTaskId, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'task', taskId: testTaskId }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Target path does not exist');
     });
 
-    it('should return error when node_modules exists in main but not yet copied to worktree', async () => {
+    // Provisioning happened (or didn't) inside `git worktree add`, via the
+    // project's own post-checkout hook. Serving must not second-guess it: no
+    // dependency-readiness gate, no stack-specific directories.
+    it('serves a worktree as-is — no dependency gate, no stack mkdirs', async () => {
       vi.mocked(getProject).mockReturnValue(mockProject as never);
       vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTask as never);
       vi.mocked(worktreeExists).mockResolvedValue(true);
-      mockAccess
-        .mockResolvedValueOnce(undefined)
-        .mockResolvedValueOnce(undefined)
-        .mockRejectedValueOnce(new Error('ENOENT'))
-        .mockRejectedValueOnce(new Error('ENOENT'));
-
-      const result = await switchWorktree(testProjectId, testTaskId, testUserId);
-
-      expect(result.success).toBe(false);
-      expect(result.error).toContain('Dependencies are not ready yet');
-      expect(result.error).toContain('node_modules');
-    });
-
-    it('skips dep gate entirely when main repo has no node_modules or .venv', async () => {
-      vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTask as never);
-      vi.mocked(worktreeExists).mockResolvedValue(true);
-      mockAccess
-        .mockResolvedValueOnce(undefined)
-        .mockRejectedValueOnce(new Error('ENOENT'))
-        .mockRejectedValueOnce(new Error('ENOENT'));
-      mockMkdir.mockResolvedValue(undefined);
+      mockAccessAllowAllExceptSwitchScript();
       withDispatch(async () => ({ stdout: '', stderr: '' }));
       vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
 
-      const result = await switchWorktree(testProjectId, testTaskId, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'task', taskId: testTaskId }, testUserId);
 
       expect(result.success).toBe(true);
       expect(result.activeTaskId).toBe(testTaskId);
+      // Exactly two probes: the target path, then .bottega/switch.sh — never
+      // the main checkout's node_modules/.venv.
+      expect(mockAccess).toHaveBeenCalledTimes(2);
+      expect(mockMkdir).not.toHaveBeenCalled();
     });
 
     it('passes systemctl invocations through argv (no shell)', async () => {
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(mockAccess).mockResolvedValue(undefined);
+      mockAccessAllowAllExceptSwitchScript();
       mockMkdir.mockResolvedValue(undefined);
       withDispatch(async () => ({ stdout: '', stderr: '' }));
       vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(true);
       const stopCall = mockRunCommand.mock.calls.find(
@@ -270,7 +287,7 @@ describe('WebServerManager Service', () => {
 
     it('parses PORT from systemctl Environment and signals listening pids without a shell pipeline', async () => {
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(mockAccess).mockResolvedValue(undefined);
+      mockAccessAllowAllExceptSwitchScript();
       mockMkdir.mockResolvedValue(undefined);
       withDispatch(async (cmd, args) => {
         if (cmd === 'systemctl' && args.includes('show')) {
@@ -283,7 +300,7 @@ describe('WebServerManager Service', () => {
       });
       vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
 
-      await switchWorktree(testProjectId, null, testUserId);
+      await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       const lsofCall = mockRunCommand.mock.calls.find((c) => c[0] === 'lsof');
       expect(lsofCall![1]).toEqual(['-ti', ':4321']);
@@ -293,7 +310,7 @@ describe('WebServerManager Service', () => {
 
     it('ignores a malformed PORT value rather than killing arbitrary pids', async () => {
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(mockAccess).mockResolvedValue(undefined);
+      mockAccessAllowAllExceptSwitchScript();
       mockMkdir.mockResolvedValue(undefined);
       withDispatch(async (cmd, args) => {
         if (cmd === 'systemctl' && args.includes('show')) {
@@ -305,7 +322,7 @@ describe('WebServerManager Service', () => {
       });
       vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
 
-      await switchWorktree(testProjectId, null, testUserId);
+      await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(mockRunCommand.mock.calls.find((c) => c[0] === 'lsof')).toBeUndefined();
       expect(mockKill).not.toHaveBeenCalled();
@@ -320,7 +337,7 @@ describe('WebServerManager Service', () => {
         return { stdout: '', stderr: '' };
       });
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Failed to update symlink');
@@ -328,7 +345,7 @@ describe('WebServerManager Service', () => {
 
     it('succeeds with warning when service restart fails', async () => {
       vi.mocked(getProject).mockReturnValue(mockProject as never);
-      vi.mocked(mockAccess).mockResolvedValue(undefined);
+      mockAccessAllowAllExceptSwitchScript();
       mockMkdir.mockResolvedValue(undefined);
       withDispatch(async (cmd, args) => {
         if (cmd === 'ln') return { stdout: '', stderr: '' };
@@ -339,11 +356,209 @@ describe('WebServerManager Service', () => {
       });
       vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
 
-      const result = await switchWorktree(testProjectId, null, testUserId);
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
 
       expect(result.success).toBe(true);
       expect(result.warning).toContain('service restart failed');
       expect(projectsDb.updateActiveWorktree).toHaveBeenCalled();
+    });
+
+    // --- .bottega/switch.sh hook ---
+
+    function findScriptCall(): unknown[] | undefined {
+      return mockRunCommand.mock.calls.find(
+        (c) => typeof c[0] === 'string' && c[0].endsWith('/.bottega/switch.sh'),
+      );
+    }
+
+    it('runs .bottega/switch.sh when present and executable, skipping systemctl', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      // Resolve every fs.access including the script probe → take the hook
+      // branch.
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toBeUndefined();
+      expect(findScriptCall()).toBeDefined();
+      const systemctlCalls = mockRunCommand.mock.calls.filter((c) => c[0] === 'systemctl');
+      expect(systemctlCalls).toEqual([]);
+      expect(projectsDb.updateActiveWorktree).toHaveBeenCalled();
+    });
+
+    it('falls back to systemctl when .bottega/switch.sh is absent', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccessAllowAllExceptSwitchScript();
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(findScriptCall()).toBeUndefined();
+      const startCall = mockRunCommand.mock.calls.find(
+        (c) => c[0] === 'systemctl' && (c[1] as string[]).includes('start'),
+      );
+      expect(startCall).toBeDefined();
+    });
+
+    it('falls back to systemctl when .bottega/switch.sh exists but is not executable', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockImplementation((p: unknown) => {
+        if (typeof p === 'string' && p.endsWith('/.bottega/switch.sh')) {
+          const err = new Error('EACCES') as NodeJS.ErrnoException;
+          err.code = 'EACCES';
+          return Promise.reject(err);
+        }
+        return Promise.resolve(undefined);
+      });
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(findScriptCall()).toBeUndefined();
+      const startCall = mockRunCommand.mock.calls.find(
+        (c) => c[0] === 'systemctl' && (c[1] as string[]).includes('start'),
+      );
+      expect(startCall).toBeDefined();
+    });
+
+    it('passes BOTTEGA_TARGET_PATH / PROJECT_ID / TASK_ID env vars to the script', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      vi.mocked(tasksDb.getWithProject).mockReturnValue(mockTask as never);
+      vi.mocked(worktreeExists).mockResolvedValue(true);
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      await switchServedTarget(testProjectId, { kind: 'task', taskId: testTaskId }, testUserId);
+
+      const opts = findScriptCall()?.[2] as { env?: Record<string, string> } | undefined;
+      expect(opts?.env?.BOTTEGA_TARGET_PATH).toBe('/home/user/myproject-worktrees/task-10');
+      expect(opts?.env?.BOTTEGA_PROJECT_ID).toBe(String(testProjectId));
+      expect(opts?.env?.BOTTEGA_TASK_ID).toBe(String(testTaskId));
+      // PATH (inherited from process.env) must be preserved or the script
+      // wouldn't find uv/systemctl.
+      expect(opts?.env?.PATH).toBeDefined();
+    });
+
+    it('sets BOTTEGA_TASK_ID to empty string when switching back to main repo', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      const opts = findScriptCall()?.[2] as { env?: Record<string, string> } | undefined;
+      expect(opts?.env?.BOTTEGA_TASK_ID).toBe('');
+    });
+
+    it('runs script with cwd = target path and 30s timeout', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async () => ({ stdout: '', stderr: '' }));
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      const opts = findScriptCall()?.[2] as { cwd?: string; timeout?: number } | undefined;
+      expect(opts?.cwd).toBe('/home/user/myproject');
+      expect(opts?.timeout).toBe(30_000);
+    });
+
+    it('returns success+warning when the script exits non-zero, still updates active_worktree_task_id', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async (cmd) => {
+        if (cmd === 'ln') return { stdout: '', stderr: '' };
+        if (typeof cmd === 'string' && cmd.endsWith('/.bottega/switch.sh')) {
+          const err = new Error('Command failed: exit 1') as Error & { stderr: string };
+          err.stderr = 'tailwind: command not found';
+          throw err;
+        }
+        return { stdout: '', stderr: '' };
+      });
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toContain('switch script failed');
+      expect(result.warning).toContain('tailwind: command not found');
+      // Both owner columns are written on every switch — that is what keeps
+      // "at most one is set" true without a CHECK constraint.
+      expect(projectsDb.updateActiveWorktree).toHaveBeenCalledWith(
+        testProjectId,
+        testUserId,
+        null,
+        null,
+      );
+    });
+
+    it('returns success+warning when the script times out', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      withDispatch(async (cmd) => {
+        if (cmd === 'ln') return { stdout: '', stderr: '' };
+        if (typeof cmd === 'string' && cmd.endsWith('/.bottega/switch.sh')) {
+          // execFile timeout shape: error.killed = true, error.signal = SIGTERM
+          const err = new Error('Command timed out') as Error & {
+            killed: boolean;
+            signal: string;
+          };
+          err.killed = true;
+          err.signal = 'SIGTERM';
+          throw err;
+        }
+        return { stdout: '', stderr: '' };
+      });
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toContain('switch script failed');
+      expect(result.warning).toContain('timed out');
+    });
+
+    it('truncates large script stderr in the warning', async () => {
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockResolvedValue(undefined);
+      mockMkdir.mockResolvedValue(undefined);
+      const bigStderr = 'x'.repeat(10_000);
+      withDispatch(async (cmd) => {
+        if (cmd === 'ln') return { stdout: '', stderr: '' };
+        if (typeof cmd === 'string' && cmd.endsWith('/.bottega/switch.sh')) {
+          const err = new Error('Command failed') as Error & { stderr: string };
+          err.stderr = bigStderr;
+          throw err;
+        }
+        return { stdout: '', stderr: '' };
+      });
+      vi.mocked(projectsDb.updateActiveWorktree).mockReturnValue(mockProject as never);
+
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toBeDefined();
+      // 4 KB stderr cap + framing prefix + truncation marker — comfortably
+      // below 5 KB.
+      expect(result.warning!.length).toBeLessThan(5_000);
+      expect(result.warning).toContain('truncated');
     });
   });
 
@@ -361,12 +576,20 @@ describe('WebServerManager Service', () => {
       vi.mocked(getProject).mockReturnValue({
         ...mockProject,
         active_worktree_task_id: testTaskId,
+        active_worktree_epic_id: null,
+      } as never);
+      vi.mocked(tasksDb.getById).mockReturnValue({
+        id: testTaskId,
+        title: 'Add the pricing page',
       } as never);
 
       const result = await getActiveWorktree(testProjectId, testUserId);
 
       expect(result.success).toBe(true);
       expect(result.activeTaskId).toBe(testTaskId);
+      expect(result.activeEpicId).toBeNull();
+      // Resolved server-side so every surface names it the same way.
+      expect(result.activeName).toBe('Add the pricing page');
       expect(result.serveSymlinkPath).toBe('/var/www/myproject');
       expect(result.systemdServiceName).toBe('puma@myproject');
       expect(result.appUrl).toBe('https://myproject.example.com');
@@ -578,4 +801,116 @@ describe('WebServerManager Service', () => {
       expect(processKillSpy).toBeDefined();
     });
   });
+
+  /**
+   * Serving an EPIC. The epic layer answers "where is this epic's worktree"
+   * through a resolver registered at boot, because this module is shared
+   * infrastructure and may not import that domain (architecture-v2 rule 1).
+   */
+  describe('switchServedTarget — epics', () => {
+    const resolveEpicServeTarget = vi.fn();
+    const epicName = vi.fn();
+    const resolver: EpicServeResolver = {
+      resolveEpicServeTarget: (id: number, projectId: number) =>
+        resolveEpicServeTarget(id, projectId) as Promise<{ worktreePath: string; name: string }>,
+      epicName: (id: number) => epicName(id) as string | null,
+    };
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+      mockProvisioningMode.mockResolvedValue('none');
+      registerEpicServeResolver(resolver);
+      vi.mocked(getProject).mockReturnValue(mockProject as never);
+      mockAccess.mockResolvedValue(undefined);
+      withDispatch(() => Promise.resolve({ stdout: '', stderr: '' }));
+      resolveEpicServeTarget.mockResolvedValue({
+        worktreePath: '/repos/myproject-worktrees/epic-8',
+        name: 'Nimbus Pricing',
+      });
+    });
+
+    it('points the symlink at the epic delivery worktree and records the epic', async () => {
+      const result = await switchServedTarget(testProjectId, { kind: 'epic', epicId: 8 }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.activeEpicId).toBe(8);
+      expect(result.activeTaskId).toBeNull();
+      expect(resolveEpicServeTarget).toHaveBeenCalledWith(8, testProjectId);
+      expect(mockRunCommand).toHaveBeenCalledWith('ln', [
+        '-sfn',
+        '/repos/myproject-worktrees/epic-8',
+        '/var/www/myproject',
+      ]);
+      // Both columns written: switching to an epic has to clear the task.
+      expect(projectsDb.updateActiveWorktree).toHaveBeenCalledWith(testProjectId, testUserId, null, 8);
+    });
+
+    // The resolver owns epic-vs-project validation; its message is the user's.
+    it('surfaces the resolver refusal as the switch error', async () => {
+      resolveEpicServeTarget.mockRejectedValue(new Error('Epic does not belong to this project'));
+
+      const result = await switchServedTarget(testProjectId, { kind: 'epic', epicId: 8 }, testUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Epic does not belong to this project');
+      expect(mockRunCommand).not.toHaveBeenCalled();
+    });
+
+    // Provisioning is the project hook's business, settled at `git worktree
+    // add` time. Serving never probes dependency dirs and never makes
+    // stack-specific directories — a worktree that exists is served as-is.
+    it('serves an epic worktree as-is, even with node_modules missing', async () => {
+      mockAccess.mockImplementation((p: string) =>
+        String(p).includes('node_modules')
+          ? Promise.reject(new Error('ENOENT'))
+          : Promise.resolve(undefined),
+      );
+
+      const result = await switchServedTarget(testProjectId, { kind: 'epic', epicId: 8 }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(mockMkdir).not.toHaveBeenCalled();
+    });
+
+    it('resets to the main checkout, clearing both owners', async () => {
+      const result = await switchServedTarget(testProjectId, { kind: 'main' }, testUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.activeTaskId).toBeNull();
+      expect(result.activeEpicId).toBeNull();
+      expect(projectsDb.updateActiveWorktree).toHaveBeenCalledWith(
+        testProjectId,
+        testUserId,
+        null,
+        null,
+      );
+    });
+
+    it('names the served epic for the "Serving:" indicator', async () => {
+      epicName.mockReturnValue('Nimbus Pricing');
+      vi.mocked(getProject).mockReturnValue({
+        ...mockProject,
+        active_worktree_task_id: null,
+        active_worktree_epic_id: 8,
+      } as never);
+
+      const result = await getActiveWorktree(testProjectId, testUserId);
+
+      expect(result.activeEpicId).toBe(8);
+      expect(result.activeName).toBe('Nimbus Pricing');
+    });
+
+    // A deleted epic still leaves the column set until the next switch.
+    it('falls back to #id when the served epic row is gone', async () => {
+      epicName.mockReturnValue(null);
+      vi.mocked(getProject).mockReturnValue({
+        ...mockProject,
+        active_worktree_task_id: null,
+        active_worktree_epic_id: 8,
+      } as never);
+
+      expect((await getActiveWorktree(testProjectId, testUserId)).activeName).toBe('Epic #8');
+    });
+  });
 });
+

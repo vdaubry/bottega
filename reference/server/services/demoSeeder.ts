@@ -160,7 +160,7 @@ export async function seedDemoProject(
   writeTaskDoc(projectId, task.id, TASK_DOC_TEMPLATE);
 
   if (await isGitRepository(targetDir)) {
-    await createWorktree(targetDir, task.id, DEMO_TASK_TITLE, null);
+    await createWorktree(targetDir, task.id, DEMO_TASK_TITLE);
   }
 
   return { projectId, taskId: task.id, repoPath: targetDir, skipped: null };

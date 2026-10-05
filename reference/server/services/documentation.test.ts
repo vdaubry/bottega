@@ -223,6 +223,21 @@ describe('Documentation Service - Phase 2', () => {
       expect(result2).toContain(getTaskDocPath(testProjectId, 2));
       expect(result2).not.toContain(getTaskDocPath(testProjectId, 1));
     });
+
+    it('should mandate foreground test execution and not instruct backgrounding suites', () => {
+      const result = buildContextPrompt(testProjectId, 1);
+
+      // The block still exists...
+      expect(result).toContain('### Test Execution Best Practices');
+      // ...but no longer steers the agent to background tasks / monitors, whose
+      // cross-turn notification can never be delivered in the per-turn model.
+      expect(result).not.toContain('run_in_background: true');
+      expect(result).not.toContain('TaskOutput');
+      expect(result).not.toContain('Monitor');
+      // ...and it does mandate foreground execution with a generous timeout.
+      expect(result).toContain('foreground');
+      expect(result).toContain('timeout: 600000');
+    });
   });
 
   describe('getDevServerPort', () => {

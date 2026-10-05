@@ -27,7 +27,7 @@ Implementation is still in progress. Proceed with the next unchecked item.
 
   (List only the unchecked items from the To-Do List.)
 
-  2. **Stop here.** Do not run unit tests, Playwright tests, or any further review steps. Return control to the implementation agent.
+  2. **Stop here.** Do not run unit tests, manual QA, or any further review steps. Return control to the implementation agent.
 
 - If **all** To-Do items are checked (`[x]`), proceed to Step 2 (full review).
 
@@ -63,36 +63,28 @@ If ANY checked item fails verification → the final status is NEEDS_WORK, regar
 ### 3. Run Unit Tests
 Run the project's unit tests:
 1. **First run targeted tests** for the files you changed/reviewed (check CLAUDE.md for the test command)
-2. **Then run the full test suite** using `run_in_background: true` on the Bash tool (full suites can take 5-15+ minutes)
-3. Wait for the background task to complete using TaskOutput with `block: true`
-4. **Wait for backgrounded tests** before re-launching — do NOT start parallel test runs, they compete for resources. Only re-run after the previous one completes
+2. **Then run the full test suite in the foreground** with a generous `timeout` (up to `timeout: 600000`, i.e. 10 minutes). Do NOT background the suite and do NOT use a monitor/watcher tool to wait for it — backgrounded and monitored tasks are terminated when the turn ends in this environment and never deliver a completion notification, so the suite silently dies and the turn deadlocks
+3. **Do not launch a second suite while one is running** — parallel test runs compete for resources. Only re-run after the previous foreground run has returned
 - Report any failures or issues found
 
-### 4. Manual Testing with Playwright MCP
-Follow the manual testing scenarios from the Testing Strategy section.
+### 4. Manual QA
+Follow every manual QA scenario from the Testing Strategy section with the tool the plan selected. Manual QA is tool-neutral: use Playwright MCP for browser flows, `curl` or an integration session for HTTP/API behavior, Rails runner/console or direct execution plus queue/log/DB inspection for jobs and schedulers, and the real command for CLI/rake/npm tasks. Do not replace a non-browser scenario with Playwright, and do not count automated tests as manual QA.
 
-**CRITICAL: Server Isolation Rules**
-- Your task-specific port is in the Testing Configuration section of your system prompt
-- **NEVER reuse an existing server** - always start your own
-- **NEVER stop servers you didn't start** - they belong to other tasks
+For every scenario:
+1. Apply its deterministic setup and side-effect controls exactly as written.
+2. Execute the changed behavior through the specified runtime path.
+3. Inspect every stated observable result: rendered behavior, HTTP response, command output, persisted state, logs, or queued work.
+4. Run the specified cleanup and confirm disposable data or processes are gone.
+5. Report any failure or unexpected behavior.
 
-Before running Playwright tests:
-1. **Check if your port is free**: `lsof -i:{your_port}`
-   - If occupied: DO NOT kill it (belongs to another task). Use a different port.
-2. **Start YOUR server** from YOUR worktree directory on your assigned port
-   - Figure out the appropriate dev server command for the project's stack (refer to CLAUDE.md for instructions)
-   - Run it in the foreground or use `&` with PID tracking — do NOT use daemon mode
-3. **Verify correct codebase**: Confirm the running process is serving from your worktree path
-4. Run Playwright tests against `http://localhost:{your_port}`
-5. **Stop only YOUR server** when done: `lsof -ti:{your_port} | xargs kill -9 2>/dev/null || true`
+If the plan says manual QA is not needed, independently verify that the task truly has no executable runtime behavior to exercise. Documentation-only, comment-only, or equivalent non-runtime changes can qualify. Backend-only work, a refactor, passing automated tests, or unsuitable Playwright tooling do not qualify by themselves.
 
-Testing steps:
-- **Start video recording FIRST** before any Playwright interactions: call `browser_start_video` with size `{ "width": 1440, "height": 900 }` (do NOT pass a filename — the backend controls the output path)
-- Use Playwright MCP to navigate the UI
-- Verify each scenario works as expected
-- If you see unexpected behavior, verify the server is running from YOUR worktree path
-- Document any failures or unexpected behavior
-- **Stop video recording LAST** after all Playwright tests: call `browser_stop_video`
+**Browser-only isolation and recording rules** — apply these only when a scenario uses Playwright MCP:
+- Your task-specific port is in the Testing Configuration section of your system prompt.
+- **NEVER reuse an existing server** and **NEVER stop a server you did not start**.
+- Check whether the port is free with `lsof -i:{your_port}`. If occupied, use a different port; do not kill the existing process.
+- Start the server from your worktree with the project's documented command, verify that process serves the worktree, run Playwright against `http://localhost:{your_port}`, and stop only that server when finished.
+- Video is best-effort and not a test scenario. If `browser_start_video` exists, call it before browser interactions with size `{ "width": 1440, "height": 900 }` and no filename, then call `browser_stop_video` after the final browser check. If the controls are unavailable, continue without video.
 
 ### Important: Testing Scope Rules
 **ALL testing scenarios in the Testing Strategy are MANDATORY.**
@@ -101,6 +93,8 @@ Testing steps:
 - You MUST NOT skip, declare "out of scope", or rationalize away any test
 - Every scenario must be either: PASS, FAIL, or BLOCKED
 - If you cannot perform a test for ANY reason (missing access, unclear steps, dependencies), mark the task as BLOCKED - do NOT mark the test as "skipped"
+
+> **Video recording is NOT a test scenario and is NOT mandatory.** Its unavailability is never grounds for BLOCKED and never fails a browser scenario; run the actual Playwright checks without it.
 
 ### 5. Evaluate Completion Status
 
@@ -134,6 +128,8 @@ Based on your findings from steps 2-4, determine if the feature is **READY**, **
 
 **Key question:** "Are there uncompleted checklist items that I physically cannot complete?"
 If YES → BLOCKED (even if the code works perfectly)
+
+**Not a blocker:** a missing video recording control. If every checklist item, unit test, and manual QA scenario passed and the only unavailable item was optional browser video, the status is **READY**, not BLOCKED.
 
 ### 6. Update Task Documentation
 Update the task documentation file at `{{taskDocPath}}`:
@@ -170,22 +166,27 @@ Update the task documentation file at `{{taskDocPath}}`:
 #### If READY:
 1. **Run the completion command** to signal the workflow is complete:
 ```bash
-tsx /home/ubuntu/bottega/reference/scripts/complete-workflow.ts {{taskId}}
+tsx {{scriptsDir}}/complete-workflow.ts {{taskId}}
 ```
 This stops the automated agent loop and awaits final user review.
 
 #### If BLOCKED:
-1. **Update the "Review Findings" section** explaining what is blocking progress and what user action is needed
-2. **Run the block command** to pause the workflow:
+Last resort. First check the obstacle is real: a missing tool may just need
+installing, a dead service may answer on a retry, an impossible requirement may
+be a misreading. Fix what you can and carry on.
+
+1. **Update the "Review Findings" section** with what is blocking and what must change
+2. **Run the block command with the reason** — it is the message your supervisor
+   is woken with, and they decide from it whether they can clear it for you:
 ```bash
-tsx /home/ubuntu/bottega/reference/scripts/block-workflow.ts {{taskId}}
+tsx {{scriptsDir}}/block-workflow.ts {{taskId}} "what is blocking, what you tried, what has to change"
 ```
-This stops the automated agent loop until the user resumes it after providing the needed input.
+This stops the automated agent loop until someone resumes it.
 
 ## Important Constraints
 - Do NOT fix any code or specs - only document findings
 - Do NOT implement anything - only review and test
-- You are only allowed to restart processes such as web servers when necessary, especially for playwright tests.
+- Restart processes only when a planned manual QA scenario requires it, and stop only processes you started.
 - **ALWAYS REPLACE (never append to) the Review Findings section**
 - Mark items as unchecked if they need rework
 

@@ -11,6 +11,7 @@ interface PromptListItem {
   name: string;
   label: string;
   kind: string;
+  description?: string;
   isCustomized: boolean;
 }
 
@@ -76,7 +77,7 @@ describe('Settings Routes - /api/settings/prompts', () => {
       expect(res.body.name).toBe('implementation');
       expect(res.body.content).toContain('@agent-Implement');
       expect(res.body.defaultContent).toContain('@agent-Implement');
-      expect(res.body.variables).toEqual(['taskDocPath', 'taskId']);
+      expect(res.body.variables).toEqual(['taskDocPath', 'taskId', 'scriptsDir']);
       expect(res.body.isCustomized).toBe(false);
       expect(res.body.mtime).toBeNull();
     });
@@ -216,6 +217,28 @@ describe('Settings Routes - /api/settings/prompts', () => {
 
     it('returns 404 for unknown prompt', async () => {
       const res = await request(app).delete('/api/settings/prompts/nonsense');
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // The non-technical guardrail: the protocol prompt is editable here; the
+  // list it wraps lives on each project, so no template is listed for it.
+  describe('sensitive-areas guardrail entries', () => {
+    it('lists the protocol prompt with its description and no instance-wide list template', async () => {
+      const res = await request(app).get('/api/settings/prompts');
+      expect(res.status).toBe(200);
+      const protocol = res.body.find((p: PromptListItem) => p.name === 'planification-sensitive-areas');
+      expect(protocol).toBeDefined();
+      expect(protocol.kind).toBe('prompt');
+      expect(protocol.description).toMatch(/project/);
+      expect(res.body.find((p: PromptListItem) => p.name === 'sensitive-areas')).toBeUndefined();
+      // Prompts without a description do not carry the key at all.
+      const impl = res.body.find((p: PromptListItem) => p.name === 'implementation');
+      expect('description' in impl).toBe(false);
+    });
+
+    it('404s the retired sensitive-areas template name', async () => {
+      const res = await request(app).get('/api/settings/prompts/sensitive-areas');
       expect(res.status).toBe(404);
     });
   });

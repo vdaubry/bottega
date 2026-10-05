@@ -15,17 +15,16 @@ vi.mock('../../sqliteSessionStore.js', () => ({
   },
 }));
 
-vi.mock('../../../database/db.js', () => ({
-  agentRunsDb: {
-    getByConversationId: vi.fn(),
-    updateStatus: vi.fn(),
-  },
+vi.mock('../../conversation/agentRunLifecycle.js', () => ({
+  failLinkedAgentRunIfRunning: vi.fn(),
 }));
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { sqliteSessionStore } from '../../sqliteSessionStore.js';
-import { activeSessions } from '../../conversation/sessionState.js';
-import { agentRunsDb } from '../../../database/db.js';
+import {
+  activeSessions,
+} from '../../conversation/sessionState.js';
+import { failLinkedAgentRunIfRunning } from '../../conversation/agentRunLifecycle.js';
 import { AnthropicProvider } from './index.js';
 
 describe('AnthropicProvider', () => {
@@ -98,7 +97,7 @@ describe('AnthropicProvider', () => {
     expect(sdkOptions.resume).toBe('old');
   });
 
-  it("abortTurn marks the linked agent run 'failed' and triggers its abort controller", () => {
+  it('abortTurn is transport-only and triggers its abort controller', () => {
     const ac = new AbortController();
     activeSessions.set('sess-active', {
       instance: {},
@@ -109,23 +108,14 @@ describe('AnthropicProvider', () => {
       tempDir: null,
       conversationId: 1,
       taskId: 1,
+      epicId: null,
       projectId: 1,
       userId: 1,
-    });
-    vi.mocked(agentRunsDb.getByConversationId).mockReturnValue({
-      id: 42,
-      task_id: 1,
-      agent_type: 'review',
-      status: 'running',
-      conversation_id: 1,
-      provider: 'anthropic',
-      created_at: '',
-      completed_at: null,
     });
     const p = new AnthropicProvider();
     expect(p.abortTurn('sess-active')).toBe(true);
     expect(ac.signal.aborted).toBe(true);
-    expect(agentRunsDb.updateStatus).toHaveBeenCalledWith(42, 'failed');
+    expect(failLinkedAgentRunIfRunning).not.toHaveBeenCalled();
   });
 
   it('abortTurn returns false when the session is unknown', () => {

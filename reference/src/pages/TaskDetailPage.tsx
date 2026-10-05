@@ -49,7 +49,9 @@ function TaskDetailPage() {
     isLoadingProjects,
     isLoadingConversations,
     isLoadingTaskDoc,
-    isLoadingAgentRuns
+    isLoadingAgentRuns,
+    retryWorktreeSetup,
+    deleteTask,
   } = useTaskContext();
 
   const [project, setProject] = useState<ProjectRow | null>(null);
@@ -115,6 +117,22 @@ function TaskDetailPage() {
     navigate(`/projects/${projectId}`);
   }, [navigate, projectId]);
 
+  // The failed-setup banner's two ways forward.
+  const handleRetryWorktreeSetup = useCallback(async () => {
+    if (!task) return;
+    const result = await retryWorktreeSetup(task.id);
+    if (!result.success) toast.error(result.error || 'Failed to retry the worktree setup');
+  }, [task, retryWorktreeSetup, toast]);
+
+  const handleDeleteTask = useCallback(() => {
+    if (!task) return;
+    if (!confirm(`Delete task "${task.title || `#${task.id}`}"? This cannot be undone.`)) return;
+    void deleteTask(task.id).then((result) => {
+      if (result.success) navigate(`/projects/${projectId}`);
+      else toast.error(result.error || 'Failed to delete task');
+    });
+  }, [task, deleteTask, navigate, projectId, toast]);
+
   const handleHomeClick = useCallback(() => {
     navigate(`/`);
   }, [navigate]);
@@ -138,6 +156,12 @@ function TaskDetailPage() {
   const handleShowDocumentation = useCallback(() => {
     if (task) {
       navigate(`/projects/${projectId}/tasks/${taskId}/show`);
+    }
+  }, [task, navigate, projectId, taskId]);
+
+  const handleExploreDocumentation = useCallback(() => {
+    if (task) {
+      navigate(`/projects/${projectId}/tasks/${taskId}/ide`);
     }
   }, [task, navigate, projectId, taskId]);
 
@@ -204,8 +228,8 @@ function TaskDetailPage() {
     });
   }, [navigate, projectId, taskId]);
 
-  const handleCIFixConversationCreated = useCallback((conversation: ConversationCreated) => {
-    // Navigate to chat page with the CI fix initial message
+  const handleFixConversationCreated = useCallback((conversation: ConversationCreated) => {
+    // Navigate to chat page with the repair (CI / conflicts) initial message
     const id = conversation.id as number;
     navigate(`/projects/${projectId}/tasks/${taskId}/chat/${id}`, {
       state: { initialMessage: conversation.__initialMessage }
@@ -307,6 +331,7 @@ function TaskDetailPage() {
         onSaveTaskDoc={handleSaveTaskDoc}
         onEditDocumentation={handleEditDocumentation}
         onShowDocumentation={handleShowDocumentation}
+        onExploreDocumentation={handleExploreDocumentation}
         onStatusChange={handleStatusChange}
         onWorkflowCompleteChange={handleWorkflowCompleteChange}
         onResumeWorkflow={handleResumeWorkflow}
@@ -314,7 +339,9 @@ function TaskDetailPage() {
         onResumeConversation={handleResumeConversation}
         onDeleteConversation={deleteConversation}
         onRenameConversation={renameConversation}
-        onCIFixConversationCreated={handleCIFixConversationCreated}
+        onFixConversationCreated={handleFixConversationCreated}
+        onRetryWorktreeSetup={handleRetryWorktreeSetup}
+        onDeleteTask={handleDeleteTask}
         className="h-full"
       />
       <NewConversationModal

@@ -14,6 +14,7 @@
 
 import { sqliteSessionStore } from '../../sqliteSessionStore.js';
 import { resolveProjectKey } from '../../conversationContentStore.js';
+import { generatedImageBlock } from '@shared/providers/generatedImage';
 import type { UnifiedMessage } from '@shared/providers/types';
 
 interface MirrorContext {
@@ -106,6 +107,17 @@ function unifiedToTranscriptEntry(unified: UnifiedMessage): {
           id: unified.id,
           role: 'assistant',
           content: [{ type: 'thinking', thinking: unified.text }],
+        },
+      };
+    case 'assistant_image':
+      return {
+        uuid: unified.id,
+        type: 'assistant',
+        timestamp,
+        message: {
+          id: unified.id,
+          role: 'assistant',
+          content: [generatedImageBlock(unified)],
         },
       };
     case 'result':

@@ -103,16 +103,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
             if (userData.user?.id) {
               loginUserToNative(userData.user.id);
             }
-          } else {
+          } else if (userResponse.status === 401) {
+            // Only a 401 says the credential itself was rejected. Anything
+            // else — a 503 while the database is locked, any 5xx — is the
+            // server's problem for the moment; dropping the token there would
+            // log the user out over a hiccup that a reload fixes.
             localStorage.removeItem('auth-token');
             setToken(null);
             setUser(null);
+          } else {
+            setUser(null);
+            setError(
+              `Could not verify your session (HTTP ${userResponse.status}). Please reload.`,
+            );
           }
         } catch (err) {
           console.error('Token verification failed:', err);
-          localStorage.removeItem('auth-token');
-          setToken(null);
           setUser(null);
+          setError('Could not reach the server to verify your session. Please reload.');
         }
       }
     } catch (err) {
@@ -133,7 +141,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (response.ok) {
         const success = data;
         setToken(success.token);
-        setUser(success.user as unknown as AuthenticatedUser);
+        setUser(success.user);
         localStorage.setItem('auth-token', success.token);
         if (success.user?.id) {
           loginUserToNative(success.user.id);
@@ -162,7 +170,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (response.ok) {
         const success = data;
         setToken(success.token);
-        setUser(success.user as unknown as AuthenticatedUser);
+        setUser(success.user);
         setNeedsSetup(false);
         localStorage.setItem('auth-token', success.token);
         if (success.user?.id) {
@@ -204,18 +212,20 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   };
 
   const logout = () => {
-    setToken(null);
-    setUser(null);
-    localStorage.removeItem('auth-token');
-
-    logoutUserFromNative();
-
-    // Optional: Call logout endpoint for logging
+    // Fire the endpoint BEFORE dropping the stored token: authenticatedFetch
+    // reads it from localStorage when called, and the server-side
+    // token_version bump is what actually revokes the JWT.
     if (token) {
       api.auth.logout().catch((err) => {
         console.error('Logout endpoint error:', err);
       });
     }
+
+    setToken(null);
+    setUser(null);
+    localStorage.removeItem('auth-token');
+
+    logoutUserFromNative();
   };
 
   const value: AuthContextValue = {

@@ -27,7 +27,7 @@ export interface OpenCodeModelEntry {
   id: string;
   /** Bare modelID without the `opencode/` prefix (what OpenCode itself stores). */
   bareModelId: string;
-  /** Human-readable label, e.g. "Kimi K2.6". */
+  /** Human-readable label, e.g. "Kimi K2.7 Code". */
   name: string;
   /** Upstream lifecycle marker — `'deprecated'` rows can be greyed but still selectable. */
   status: 'alpha' | 'beta' | 'deprecated' | 'active' | 'unknown';

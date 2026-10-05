@@ -4,17 +4,15 @@
 // second backend means every layer above the SDK call needs to speak in
 // provider-neutral vocabulary. This file is the contract:
 //
-//  - `Provider` names the backend (anthropic | openai).
+//  - `Provider` names the backend (anthropic | openai | opencode).
 //  - `ProviderModel` / `ProviderEffort` are opaque per-provider unions —
 //    callers narrow off `Provider` to know which subset is valid.
 //  - `UnifiedMessage` is the discriminated union the streaming loop emits.
-//    Both the Anthropic mapper (`server/services/providers/anthropic/mapMessage.ts`)
-//    and the Codex mapper (`server/services/providers/openai/mapEvent.ts`)
-//    funnel through this shape. Anyone who needs provider-specific fields
-//    reaches into `raw`.
+//    The Anthropic, Codex, and OpenCode mappers funnel through this shape.
+//    Anyone who needs provider-specific fields reaches into `raw`.
 //  - `ProviderCapabilities` is the feature-flag matrix used to skip
-//    Claude-only call paths (AskUserQuestion, thinking deltas, MCP wait)
-//    when a Codex turn is active.
+//    genuinely provider-specific paths while advertising portable ask-user
+//    and MCP support across every harness.
 //
 // Per the plan in docs/tasks/codex-support.md (§ Phase 1), nothing in this
 // file imports the Claude SDK or the Codex SDK; both wrap the world in
@@ -46,13 +44,13 @@ export type ProviderEffort = AnthropicEffort | OpenAIEffort | OpenCodeEffort;
  * breakdown) needs to be skipped on Codex.
  */
 export interface ProviderCapabilities {
-  /** Provider can host an `AskUserQuestion` mid-turn (Claude only in v1). */
+  /** Provider can park and resume a turn for Bottega's user-question flow. */
   supportsAskUserQuestion: boolean;
   /** Provider emits incremental thinking deltas (Claude `stream_event` partials). */
   supportsThinkingDelta: boolean;
   /** Provider supports the live per-tool context-usage breakdown (Claude only). */
   supportsContextUsageBreakdown: boolean;
-  /** Provider honours MCP server config (Claude only in v1; Codex CLI's TOML format is unsupported). */
+  /** Provider accepts Bottega's in-process or loopback remote MCP tools. */
   supportsMcpServers: boolean;
   /** Provider can accept image attachments on user messages (Claude only in v1). */
   supportsImages: boolean;
@@ -67,8 +65,8 @@ export interface ProviderRunOptions {
   /** Working directory for the agent (repo or worktree path). */
   cwd: string;
   /**
-   * Provider-specific model identifier (e.g. `'opus'`, `'gpt-5.5'`,
-   * `'opencode/kimi-k2.6'`). Always required — the orchestrator resolves a
+   * Provider-specific model identifier (e.g. `'opus'`, `'gpt-6.1-sol'`,
+   * `'opencode/kimi-k2.7-code'`). Always required — the orchestrator resolves a
    * concrete model from the chosen settings (start) or the conversation row
    * (resume) before reaching any provider, so a turn never runs on a defaulted
    * or inferred model.
@@ -107,6 +105,7 @@ export type UnifiedMessageType =
   | 'user'
   | 'assistant'
   | 'assistant_thinking'
+  | 'assistant_image'
   | 'tool_use'
   | 'tool_result'
   | 'system'
@@ -157,6 +156,24 @@ export interface UnifiedAssistantThinkingMessage extends UnifiedMessageBase {
   text: string;
 }
 
+/**
+ * An image the model produced natively (Codex's built-in `image_gen` tool).
+ * The provider reports where the bytes landed; the conversation layer copies
+ * them into the conversation's own image store under `fileName` before the
+ * message is broadcast or mirrored, so nothing downstream reads `sourcePath`.
+ */
+export interface UnifiedAssistantImageMessage extends UnifiedMessageBase {
+  type: 'assistant_image';
+  /** Absolute path of the file in the provider's scratch space. Server-only. */
+  sourcePath: string;
+  /** Name the image is stored and served under; satisfies `GENERATED_IMAGE_FILE_NAME`. */
+  fileName: string;
+  mimeType: string;
+  /** Intrinsic pixel size, when the file header gives it. */
+  width?: number | undefined;
+  height?: number | undefined;
+}
+
 export interface UnifiedToolUseMessage extends UnifiedMessageBase {
   type: 'tool_use';
   toolName: string;
@@ -199,6 +216,7 @@ export type UnifiedMessage =
   | UnifiedUserMessage
   | UnifiedAssistantMessage
   | UnifiedAssistantThinkingMessage
+  | UnifiedAssistantImageMessage
   | UnifiedToolUseMessage
   | UnifiedToolResultMessage
   | UnifiedSystemMessage

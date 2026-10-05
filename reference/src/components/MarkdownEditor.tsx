@@ -15,7 +15,7 @@ import React, {
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
-import { Edit2, Save, X, FileText, Eye } from 'lucide-react';
+import { Edit2, Save, X, FileText, Eye, Compass } from 'lucide-react';
 import { Button } from './ui/button';
 import { MicButton } from './MicButton';
 import { cn } from '../lib/utils';
@@ -81,6 +81,7 @@ interface MarkdownEditorProps {
   onSave?: ((content: string) => Promise<SaveResult>) | undefined;
   onEditClick?: (() => void) | undefined;
   onShowClick?: (() => void) | undefined;
+  onExploreClick?: (() => void) | undefined;
   isLoading?: boolean | undefined;
   placeholder?: string | undefined;
   className?: string | undefined;
@@ -92,6 +93,7 @@ function MarkdownEditor({
   onSave,
   onEditClick,
   onShowClick,
+  onExploreClick,
   isLoading = false,
   placeholder = 'No documentation yet. Click Edit to add content.',
   className,
@@ -217,6 +219,12 @@ function MarkdownEditor({
                     Show
                   </Button>
                 )}
+                {onExploreClick && (
+                  <Button variant="outline" size="sm" onClick={onExploreClick}>
+                    <Compass className="w-4 h-4 mr-1" />
+                    Explore
+                  </Button>
+                )}
                 <Button variant="outline" size="sm" onClick={handleEdit}>
                   <Edit2 className="w-4 h-4 mr-1" />
                   Edit
@@ -262,10 +270,17 @@ function MarkdownEditor({
             />
           </div>
         ) : content ? (
-          <div className="prose prose-sm dark:prose-invert max-w-none break-words [overflow-wrap:anywhere]">
-            <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
-              {content}
-            </ReactMarkdown>
+          <div className="relative max-h-[5rem] overflow-hidden md:max-h-none md:overflow-visible">
+            <div className="prose prose-sm dark:prose-invert max-w-none break-words [overflow-wrap:anywhere]">
+              <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+                {content}
+              </ReactMarkdown>
+            </div>
+            {/* Mobile-only fade-out: hints there's more; the header "Show" button opens the full plan. */}
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-background to-transparent md:hidden"
+            />
           </div>
         ) : (
           <div className="text-center text-muted-foreground py-8">

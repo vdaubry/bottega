@@ -3,7 +3,7 @@
 export interface CodexAuthStatusResponse {
   authenticated: boolean;
   status: 'authenticated' | 'missing';
-  method: 'oauth' | 'api_key' | null;
+  method: 'oauth' | null;
   email: string | null;
   tokenFingerprint: string | null;
   reason: string | null;
@@ -33,7 +33,7 @@ export interface CancelCodexAuthResponse {
 export interface PasteCodexAuthResponse {
   authenticated: true;
   status: 'authenticated';
-  method: 'oauth' | 'api_key';
+  method: 'oauth';
   tokenFingerprint: string;
 }
 

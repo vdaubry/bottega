@@ -78,8 +78,9 @@ PR ──(complete-pr → pr_agent_complete)──▶ [TERMINAL]
 
 ### Transitions, precisely
 
-When a run's stream ends, the completion handler
-([`reference/server/services/conversation/agentRunLifecycle.ts`](../reference/server/services/conversation/agentRunLifecycle.ts))
+When a run's stream ends, the completion handler (`onTurnEnded` and
+`handleAgentChaining` in
+[`reference/server/services/tasks/adapter.ts`](../reference/server/services/tasks/adapter.ts))
 does this:
 
 1. Find the agent run linked to the finished conversation.
@@ -155,8 +156,9 @@ when the stream ends:
   message left in the transcript and decides whether to retry. Failures heal
   *inside* the loop instead of dead-ending it.
 
-Read the header comment in
+Read the header comment on `buildAgentRunCompletionHandler` in
 [`agentRunLifecycle.ts`](../reference/server/services/conversation/agentRunLifecycle.ts)
+(the thin dispatcher that hands a finished turn to the task handler above)
 before reimplementing this — the "no `isError` parameter" rule is load-bearing,
 and the obvious "pass success/failure into the handler" design is the wrong one.
 
@@ -237,7 +239,7 @@ core can hardcode a single harness. The contract that step calls is in
 | Concern | File |
 |---|---|
 | Start and own a run | `reference/server/services/agentRunner.ts` |
-| Completion + chaining | `reference/server/services/conversation/agentRunLifecycle.ts` |
+| Completion + chaining | `reference/server/services/tasks/adapter.ts` (`onTurnEnded`, `handleAgentChaining`) |
 | Manual trigger HTTP | `reference/server/routes/agent-runs.ts` |
 | Flags + tables | `reference/server/database/init.sql` |
 | Signalling scripts | `reference/scripts/{complete-plan,complete-workflow,block-workflow,complete-pr}.ts` |

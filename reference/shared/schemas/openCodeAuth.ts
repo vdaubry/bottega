@@ -7,7 +7,7 @@
 
 import { z } from 'zod';
 
-// Zen keys observed in the wild are ~67 chars (the dev box spike sat
+// Zen keys observed in the wild are ~67 chars (the validation spike sat
 // at 67). We allow 20–512 to give margin while still rejecting empty
 // pastes or accidental whole-file dumps.
 export const SetOpenCodeKeyBodySchema = z

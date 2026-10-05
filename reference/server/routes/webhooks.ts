@@ -9,12 +9,20 @@ import express, { type Request, type Response } from 'express';
 import {
   validateGitHubWebhookSignature,
   parseTaskIdFromBranch,
+  parseEpicIdFromBranch,
   hasTriggerMention,
   getConfiguredTrigger,
   triggerPrAgentFromComment,
   triggerPrAgentFromReview,
 } from '../services/webhookService.js';
+import {
+  triggerEpicDeliveryFromComment,
+  triggerEpicDeliveryFromReview,
+} from '../services/epics/deliveryWebhook.js';
 import { runCommand } from '../services/shell.js';
+import { BaseSyncConflictError } from '../services/agentRunner.js';
+import { MissingUserAgentSettingsError } from '../services/agentModelSettings.js';
+import { ProviderCredentialsMissingError } from '../services/credentials/types.js';
 import {
   assertValidPositiveInt,
   assertValidRepoFullName,
@@ -22,6 +30,69 @@ import {
 } from '../services/validators.js';
 
 const router = express.Router();
+
+/**
+ * Who owns the branch a pull request is open from.
+ *
+ * A ticket branch (`task/{id}-…`) resolves to a task and re-enters its agentic
+ * loop through the `pr` agent; the epic feature branch (`epic/{id}-…`) resolves
+ * to an epic and starts its delivery agent on the final pull request. Both
+ * parsers are anchored, so the two can never claim the same branch — and a
+ * branch nobody owns (a hand-made one, a fork) is `null` and ignored.
+ */
+type BranchOwner = { kind: 'task'; taskId: number } | { kind: 'epic'; epicId: number } | null;
+
+function resolveBranchOwner(branchName: string): BranchOwner {
+  const taskId = parseTaskIdFromBranch(branchName);
+  if (taskId !== null) return { kind: 'task', taskId };
+  const epicId = parseEpicIdFromBranch(branchName);
+  if (epicId !== null) return { kind: 'epic', epicId };
+  return null;
+}
+
+/**
+ * Refusals that mean "there is nothing to do with this delivery", not "we
+ * failed". They must answer 200: a 500 makes GitHub retry, and every retry
+ * lands in the same state and is refused again.
+ */
+const BENIGN_TRIGGER_REFUSALS = [
+  'not found',
+  'already completed',
+  'No worktree',
+  'already running',
+  'has no feature branch',
+  'has no owning user',
+];
+
+/**
+ * The one place a failed trigger becomes a response, for both owners and both
+ * event kinds. A missing provider credential or model setting is a
+ * configuration problem the retry cannot fix either, so it acknowledges too.
+ */
+function respondToTriggerFailure(
+  res: Response<unknown>,
+  error: unknown,
+  what: string,
+): Response<unknown> {
+  // The worktree could not be synced with its base branch: the run is already
+  // failed and the task blocked — acknowledge (a 500 would make GitHub retry
+  // into the same conflict).
+  if (error instanceof BaseSyncConflictError) {
+    return res.status(200).json({ status: 'blocked', reason: error.message });
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[Webhook] Failed to trigger ${what}:`, message);
+
+  if (
+    error instanceof MissingUserAgentSettingsError ||
+    error instanceof ProviderCredentialsMissingError ||
+    BENIGN_TRIGGER_REFUSALS.some((refusal) => message.includes(refusal))
+  ) {
+    return res.status(200).json({ status: 'ignored', reason: message });
+  }
+
+  return res.status(500).json({ error: 'Failed to trigger agent', message });
+}
 
 interface GitHubReviewComment {
   body?: string;
@@ -180,12 +251,12 @@ router.post(
           .json({ status: 'ignored', reason: 'could not determine branch' });
       }
 
-      const taskId = parseTaskIdFromBranch(branchName);
-      if (!taskId) {
-        console.log(`[Webhook] Branch ${branchName} does not match task pattern`);
+      const owner = resolveBranchOwner(branchName);
+      if (!owner) {
+        console.log(`[Webhook] Branch ${branchName} belongs to no task or epic`);
         return res
           .status(200)
-          .json({ status: 'ignored', reason: 'branch not in task format' });
+          .json({ status: 'ignored', reason: 'branch not in task or epic format' });
       }
 
       const comments = reviewComments.map((c) => ({
@@ -202,6 +273,31 @@ router.post(
           : null,
       }));
 
+      if (owner.kind === 'epic') {
+        try {
+          const result = await triggerEpicDeliveryFromReview({
+            epicId: owner.epicId,
+            reviewBody: reviewBody || null,
+            reviewAuthor,
+            comments,
+            broadcastToConversationSubscribers:
+              req.app.locals.broadcastToConversationSubscribers,
+            broadcastToEpicSubscribers: req.app.locals.broadcastToEpicSubscribers,
+          });
+          console.log(
+            `[Webhook] Successfully triggered epic delivery for epic ${owner.epicId} from review`,
+          );
+          return res.status(200).json({
+            status: 'triggered',
+            epicId: owner.epicId,
+            conversationId: result.conversationId,
+          });
+        } catch (error) {
+          return respondToTriggerFailure(res, error, 'epic delivery from review');
+        }
+      }
+
+      const { taskId } = owner;
       try {
         const result = await triggerPrAgentFromReview({
           taskId,
@@ -223,24 +319,7 @@ router.post(
           conversationId: result.conversationId,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[Webhook] Failed to trigger PR agent from review:', message);
-
-        if (
-          message.includes('not found') ||
-          message.includes('already completed') ||
-          message.includes('No worktree') ||
-          message.includes('already running')
-        ) {
-          return res.status(200).json({
-            status: 'ignored',
-            reason: message,
-          });
-        }
-
-        return res
-          .status(500)
-          .json({ error: 'Failed to trigger agent', message });
+        return respondToTriggerFailure(res, error, 'PR agent from review');
       }
     }
 
@@ -273,16 +352,38 @@ router.post(
         .json({ status: 'ignored', reason: 'could not determine branch' });
     }
 
-    const taskId = parseTaskIdFromBranch(branchName);
-    if (!taskId) {
-      console.log(`[Webhook] Branch ${branchName} does not match task pattern`);
+    const owner = resolveBranchOwner(branchName);
+    if (!owner) {
+      console.log(`[Webhook] Branch ${branchName} belongs to no task or epic`);
       return res
         .status(200)
-        .json({ status: 'ignored', reason: 'branch not in task format' });
+        .json({ status: 'ignored', reason: 'branch not in task or epic format' });
     }
 
     const prUrl = issue?.html_url;
 
+    if (owner.kind === 'epic') {
+      try {
+        const result = await triggerEpicDeliveryFromComment({
+          epicId: owner.epicId,
+          commentBody,
+          commentAuthor: comment?.user?.login || 'unknown',
+          broadcastToConversationSubscribers:
+            req.app.locals.broadcastToConversationSubscribers,
+          broadcastToEpicSubscribers: req.app.locals.broadcastToEpicSubscribers,
+        });
+        console.log(`[Webhook] Successfully triggered epic delivery for epic ${owner.epicId}`);
+        return res.status(200).json({
+          status: 'triggered',
+          epicId: owner.epicId,
+          conversationId: result.conversationId,
+        });
+      } catch (error) {
+        return respondToTriggerFailure(res, error, 'epic delivery');
+      }
+    }
+
+    const { taskId } = owner;
     try {
       const result = await triggerPrAgentFromComment({
         taskId,
@@ -296,28 +397,13 @@ router.post(
       });
 
       console.log(`[Webhook] Successfully triggered PR agent for task ${taskId}`);
-      res.status(200).json({
+      return res.status(200).json({
         status: 'triggered',
         taskId,
         conversationId: result.conversationId,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error('[Webhook] Failed to trigger PR agent:', message);
-
-      if (
-        message.includes('not found') ||
-        message.includes('already completed') ||
-        message.includes('No worktree') ||
-        message.includes('already running')
-      ) {
-        return res.status(200).json({
-          status: 'ignored',
-          reason: message,
-        });
-      }
-
-      res.status(500).json({ error: 'Failed to trigger agent', message });
+      return respondToTriggerFailure(res, error, 'PR agent');
     }
   },
 );

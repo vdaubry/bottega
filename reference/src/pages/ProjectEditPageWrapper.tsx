@@ -9,6 +9,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Save, Trash2, FolderOpen, AlertTriangle, Archive, Server } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
+import SensitiveAreasField from '../components/SensitiveAreasField';
 import { useTaskContext } from '../contexts/TaskContext';
 import { api } from '../utils/api';
 import type { ProjectRow } from '../../shared/types/db';
@@ -45,9 +46,17 @@ function ProjectEditPageWrapper() {
   const [cleanupResult, setCleanupResult] = useState<CleanupOldCompletedTasksResponse | null>(null);
 
   const [subprojectPath, setSubprojectPath] = useState('');
+  // The non-technical planning guardrail list; blank = off.
+  const [sensitiveAreas, setSensitiveAreas] = useState('');
 
   const [serveSymlinkPath, setServeSymlinkPath] = useState('');
   const [systemdServiceName, setSystemdServiceName] = useState('');
+  // Read-only: who provisions this project's worktrees. Not a setting — it is
+  // a fact about the repo (does it ship a post-checkout hook), shown so a
+  // repo whose worktrees are bare checkouts is visible rather than silent.
+  const [worktreeProvisioning, setWorktreeProvisioning] = useState<'hook' | 'none' | null>(
+    null,
+  );
   const [appUrl, setAppUrl] = useState('');
   const [initialWebServerConfig, setInitialWebServerConfig] = useState<WebServerConfigState>({
     serveSymlinkPath: '',
@@ -88,6 +97,7 @@ function ProjectEditPageWrapper() {
     if (project) {
       setName(project.name || '');
       setSubprojectPath(project.subproject_path || '');
+      setSensitiveAreas(project.sensitive_areas || '');
       setHasChanges(false);
       setError(null);
     }
@@ -104,6 +114,7 @@ function ProjectEditPageWrapper() {
             setServeSymlinkPath(data.serveSymlinkPath || '');
             setSystemdServiceName(data.systemdServiceName || '');
             setAppUrl(data.appUrl || '');
+            setWorktreeProvisioning(data.worktreeProvisioning);
             setInitialWebServerConfig({
               serveSymlinkPath: data.serveSymlinkPath || '',
               systemdServiceName: data.systemdServiceName || '',
@@ -123,11 +134,12 @@ function ProjectEditPageWrapper() {
     if (!project) return;
     const nameChanged = name !== (project.name || '');
     const subprojectChanged = subprojectPath !== (project.subproject_path || '');
+    const sensitiveAreasChanged = sensitiveAreas !== (project.sensitive_areas || '');
     const webServerChanged = serveSymlinkPath !== initialWebServerConfig.serveSymlinkPath ||
       systemdServiceName !== initialWebServerConfig.systemdServiceName ||
       appUrl !== initialWebServerConfig.appUrl;
-    setHasChanges(nameChanged || subprojectChanged || webServerChanged);
-  }, [name, project, subprojectPath, serveSymlinkPath, systemdServiceName, appUrl, initialWebServerConfig]);
+    setHasChanges(nameChanged || subprojectChanged || sensitiveAreasChanged || webServerChanged);
+  }, [name, project, subprojectPath, sensitiveAreas, serveSymlinkPath, systemdServiceName, appUrl, initialWebServerConfig]);
 
   // Handle save
   const handleSave = useCallback(async () => {
@@ -145,6 +157,8 @@ function ProjectEditPageWrapper() {
       const result = await updateProject(project.id, {
         name: name.trim(),
         subprojectPath: subprojectPath.trim() || undefined,
+        // Blank clears the list: that is how the guardrail is switched off.
+        sensitiveAreas: sensitiveAreas.trim() || null,
       });
 
       if (!result.success) {
@@ -177,7 +191,7 @@ function ProjectEditPageWrapper() {
     } finally {
       setIsSaving(false);
     }
-  }, [project, name, subprojectPath, serveSymlinkPath, systemdServiceName, appUrl, initialWebServerConfig, updateProject, navigate, projectId]);
+  }, [project, name, subprojectPath, sensitiveAreas, serveSymlinkPath, systemdServiceName, appUrl, initialWebServerConfig, updateProject, navigate, projectId]);
 
   // Handle delete
   const handleDelete = useCallback(async () => {
@@ -351,6 +365,13 @@ function ProjectEditPageWrapper() {
             </div>
           </div>
 
+          {/* Sensitive areas — the non-technical planning guardrail */}
+          <SensitiveAreasField
+            value={sensitiveAreas}
+            onChange={setSensitiveAreas}
+            disabled={isSaving}
+          />
+
           {/* Web Server Configuration */}
           <div className="pt-6 border-t border-border">
             <div className="space-y-4">
@@ -389,9 +410,28 @@ function ProjectEditPageWrapper() {
                   Web Server Switching
                 </h4>
                 <p className="text-sm text-muted-foreground mb-4">
-                  Configure how to switch between worktrees for live testing. When a task uses a worktree,
-                  you can switch the web server to serve from that worktree's directory.
+                  Configure how to switch between worktrees for live testing. You can serve a
+                  task&apos;s worktree, an epic&apos;s feature branch, or the main checkout.
                 </p>
+
+                {/* A worktree is only servable if something fills in the files git
+                    does not track. That is the project's job — via a post-checkout
+                    hook, which git runs inside `git worktree add` for every
+                    worktree, whatever the stack. */}
+                {worktreeProvisioning === 'none' ? (
+                  <p className="text-sm rounded border border-yellow-500/40 bg-yellow-500/10 p-2 text-yellow-700 dark:text-yellow-400">
+                    <strong>No worktree provisioning hook.</strong> This repository has no
+                    executable <code>post-checkout</code> hook, so new worktrees are bare
+                    checkouts: git-tracked files only — no <code>.env</code>, no installed
+                    dependencies. If the app needs those to run, add a hook to the repo; git
+                    runs it inside <code>git worktree add</code>.
+                  </p>
+                ) : worktreeProvisioning === 'hook' ? (
+                  <p className="text-sm text-muted-foreground">
+                    Worktrees are provisioned by this repository&apos;s own{' '}
+                    <code>post-checkout</code> hook.
+                  </p>
+                ) : null}
               </div>
 
               {/* Symlink Path */}

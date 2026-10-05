@@ -19,12 +19,14 @@ export interface ActiveSession {
   // without re-querying the DB for every check.
   conversationId: number;
   taskId: number | null;
+  epicId: number | null;
   projectId: number | null;
   userId: number | null;
 }
 
 export interface ActiveStreamingSession {
   taskId?: number | null | undefined;
+  epicId?: number | null | undefined;
   conversationId: number;
 }
 
@@ -49,3 +51,7 @@ export const activeStreamingSessions = new Map<string, ActiveStreamingSession>()
 // one AskUserQuestion can be pending per conversation — the SDK pauses
 // execution at a single callback per query.
 export const pendingAskUserQuestions = new Map<number, PendingAskUserQuestion>();
+
+// A custom ask_user tool ends the current provider turn deliberately. The
+// streaming loops consume this marker and leave the linked agent run running.
+export const deferredQuestionConversations = new Set<number>();

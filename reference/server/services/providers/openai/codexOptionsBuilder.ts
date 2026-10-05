@@ -52,11 +52,14 @@ function normalizeEffort(effort: string | null | undefined): ModelReasoningEffor
  */
 export function buildCodexThreadOptions(options: ProviderRunOptions): ThreadOptions {
   const sandboxAndApproval = mapPermissionModeToCodexOptions(options.permissionMode);
+  const deniesNativeWrites = (options.disallowedTools ?? []).some((tool) =>
+    ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool),
+  );
 
   const out: ThreadOptions = {
     workingDirectory: options.cwd,
     skipGitRepoCheck: true,
-    sandboxMode: sandboxAndApproval.sandboxMode,
+    sandboxMode: deniesNativeWrites ? 'read-only' : sandboxAndApproval.sandboxMode,
     approvalPolicy: sandboxAndApproval.approvalPolicy,
     // Always explicit — `model` is required and validated upstream (the
     // create-conversation schema and the agent-settings validator both gate

@@ -6,6 +6,7 @@
  * - Assistant messages (with ClaudeLogo, Markdown rendering)
  * - Tool messages (expandable with parameters/results)
  * - Thinking messages (collapsible purple box)
+ * - Generated images (thumbnail that opens the full-size viewer)
  */
 
 import { memo, type ReactNode } from 'react';
@@ -14,13 +15,16 @@ import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import ClaudeLogo from './ClaudeLogo';
 import TodoList from './TodoList';
+import GeneratedImage from './GeneratedImage';
 import AskUserQuestionCard from './AskUserQuestion/AskUserQuestionCard';
 import type {
   Question,
   ToolResultContent,
 } from './AskUserQuestion/answerUtils';
 import type { AskWidgetState } from './AskUserQuestion/derivedState';
+import { isAskUserToolName } from './AskUserQuestion/toolName';
 import type { TodoItem } from './TodoList';
+import { api } from '../utils/api';
 
 interface UserDisplayMessage {
   type: 'user';
@@ -50,11 +54,21 @@ interface ToolDisplayMessage {
   timestamp: string;
 }
 
+export interface ImageDisplayMessage {
+  type: 'image';
+  /** Name in the conversation's image store. */
+  fileName: string;
+  width?: number | undefined;
+  height?: number | undefined;
+  timestamp: string;
+}
+
 export type DisplayMessage =
   | UserDisplayMessage
   | AssistantDisplayMessage
   | ThinkingDisplayMessage
-  | ToolDisplayMessage;
+  | ToolDisplayMessage
+  | ImageDisplayMessage;
 
 interface CodeBlockProps {
   children?: ReactNode | undefined;
@@ -139,6 +153,8 @@ const markdownComponents: Components = {
 
 export interface MessageComponentProps {
   message: DisplayMessage;
+  /** The conversation being shown — generated images are served through it. */
+  conversationId?: number | undefined;
   isGrouped?: boolean | undefined;
   askWidgetState?: AskWidgetState | null | undefined;
   onOpenAskUserPanel?: ((toolId: string, questions: Question[]) => void) | undefined;
@@ -154,7 +170,7 @@ interface ParsedAskUserQuestionInput {
 
 // Message component for rendering individual messages
 const MessageComponent = memo<MessageComponentProps>(
-  ({ message, isGrouped, askWidgetState, onOpenAskUserPanel }) => {
+  ({ message, conversationId, isGrouped, askWidgetState, onOpenAskUserPanel }) => {
     if (message.type === 'user') {
       return (
         <div className="chat-message user flex justify-end px-3 sm:px-0">
@@ -231,7 +247,7 @@ const MessageComponent = memo<MessageComponentProps>(
       const todos = isTodoWrite ? parsedInput.todos : undefined;
 
       // Special rendering for AskUserQuestion tool
-      const isAskUserQuestion = message.toolName === 'AskUserQuestion';
+      const isAskUserQuestion = isAskUserToolName(message.toolName);
       const questions = isAskUserQuestion ? parsedInput.questions : undefined;
 
       if (isAskUserQuestion && questions && questions.length > 0) {
@@ -313,6 +329,20 @@ const MessageComponent = memo<MessageComponentProps>(
               </details>
             )}
           </div>
+        </div>
+      );
+    }
+
+    // Generated image
+    if (message.type === 'image') {
+      if (conversationId == null) return null;
+      return (
+        <div className="chat-message image px-3 sm:px-0">
+          <GeneratedImage
+            src={api.conversations.imageUrl(conversationId, message.fileName)}
+            width={message.width}
+            height={message.height}
+          />
         </div>
       );
     }

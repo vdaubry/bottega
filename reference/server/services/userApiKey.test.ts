@@ -120,6 +120,22 @@ describe('userApiKey', () => {
       expect(findUserByApiKey(key, db)).toBeNull();
     });
 
+    it('lets a locked database throw out — the auth boundary maps SQLITE_BUSY to a 503', () => {
+      // The statement itself is what throws when another process holds the
+      // file past the busy timeout; nothing in here may swallow it, or the
+      // caller could not tell "no such key" from "could not look".
+      const locked = {
+        prepare: () => ({
+          get: () => {
+            throw new Database.SqliteError('database is locked', 'SQLITE_BUSY');
+          },
+        }),
+      } as unknown as import('better-sqlite3').Database;
+      expect(() => findUserByApiKey(`${API_KEY_PREFIX}deadbeef`, locked)).toThrow(
+        Database.SqliteError,
+      );
+    });
+
     it('updates api_key_last_used_at on successful lookup', () => {
       const userId = seedUser(db);
       const key = generateApiKey(userId, db);
